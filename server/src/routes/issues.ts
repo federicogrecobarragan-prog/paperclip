@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Transform } from "node:stream";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -91,6 +92,7 @@ import {
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   isInlineAttachmentContentType,
+  isAllowedContentType,
   normalizeIssueAttachmentMaxBytes,
   normalizeContentType,
   SVG_CONTENT_TYPE,
@@ -1103,10 +1105,65 @@ export function issueRoutes(
   }
 
   function withContentPath<T extends { id: string }>(attachment: T) {
+    const contentPath = `/api/attachments/${attachment.id}/content`;
     return {
       ...attachment,
-      contentPath: `/api/attachments/${attachment.id}/content`,
+      contentPath,
+      openPath: contentPath,
+      downloadPath: `${contentPath}?download=1`,
     };
+  }
+
+  type ParsedAttachmentRange =
+    | { kind: "none" }
+    | { kind: "invalid" }
+    | { kind: "range"; start: number; end: number };
+
+  function parseAttachmentRangeHeader(raw: string | undefined, contentLength: number): ParsedAttachmentRange {
+    if (!raw) return { kind: "none" };
+    if (!Number.isSafeInteger(contentLength) || contentLength <= 0) return { kind: "invalid" };
+
+    const prefix = "bytes=";
+    if (!raw.toLowerCase().startsWith(prefix)) return { kind: "invalid" };
+    const spec = raw.slice(prefix.length).trim();
+    if (!spec || spec.includes(",")) return { kind: "invalid" };
+
+    const [startRaw, endRaw] = spec.split("-", 2);
+    if (endRaw === undefined) return { kind: "invalid" };
+
+    if (startRaw === "") {
+      const suffixLength = Number.parseInt(endRaw, 10);
+      if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return { kind: "invalid" };
+      const start = Math.max(contentLength - suffixLength, 0);
+      return { kind: "range", start, end: contentLength - 1 };
+    }
+
+    const start = Number.parseInt(startRaw, 10);
+    if (!Number.isSafeInteger(start) || start < 0 || start >= contentLength) return { kind: "invalid" };
+    const end = endRaw === "" ? contentLength - 1 : Number.parseInt(endRaw, 10);
+    if (!Number.isSafeInteger(end) || end < start) return { kind: "invalid" };
+    return { kind: "range", start, end: Math.min(end, contentLength - 1) };
+  }
+
+  function createByteRangeStream(start: number, end: number) {
+    let offset = 0;
+    return new Transform({
+      transform(chunk: Buffer | string, _encoding, callback) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const chunkStart = offset;
+        const chunkEnd = offset + buffer.length - 1;
+        offset += buffer.length;
+
+        if (chunkEnd < start || chunkStart > end) {
+          callback();
+          return;
+        }
+
+        const sliceStart = Math.max(start - chunkStart, 0);
+        const sliceEnd = Math.min(end - chunkStart + 1, buffer.length);
+        callback(null, buffer.subarray(sliceStart, sliceEnd));
+      },
+    });
   }
 
   function parseBooleanQuery(value: unknown) {
@@ -6081,6 +6138,10 @@ export function issueRoutes(
       res.status(422).json({ error: "Attachment is empty" });
       return;
     }
+    if (!isAllowedContentType(contentType)) {
+      res.status(422).json({ error: `Unsupported attachment content type: ${contentType}` });
+      return;
+    }
 
     const parsedMeta = createIssueAttachmentMetadataSchema.safeParse(req.body ?? {});
     if (!parsedMeta.success) {
@@ -6139,22 +6200,49 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, attachment.companyId);
 
+    const contentLength = attachment.byteSize;
+    const range = parseAttachmentRangeHeader(
+      typeof req.headers.range === "string" ? req.headers.range : undefined,
+      contentLength,
+    );
+    res.setHeader("Accept-Ranges", "bytes");
+    if (range.kind === "invalid") {
+      res.setHeader("Content-Range", `bytes */${contentLength}`);
+      res.status(416).end();
+      return;
+    }
+
     const object = await storage.getObject(attachment.companyId, attachment.objectKey);
     const responseContentType = normalizeContentType(attachment.contentType || object.contentType);
     res.setHeader("Content-Type", responseContentType);
-    res.setHeader("Content-Length", String(attachment.byteSize || object.contentLength || 0));
     res.setHeader("Cache-Control", "private, max-age=60");
     res.setHeader("X-Content-Type-Options", "nosniff");
     if (responseContentType === SVG_CONTENT_TYPE) {
       res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
     }
     const filename = attachment.originalFilename ?? "attachment";
-    const disposition = isInlineAttachmentContentType(responseContentType) ? "inline" : "attachment";
+    const disposition = parseBooleanQuery(req.query.download)
+      ? "attachment"
+      : isInlineAttachmentContentType(responseContentType) ? "inline" : "attachment";
     res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
 
     object.stream.on("error", (err) => {
       next(err);
     });
+    if (range.kind === "range") {
+      const rangeLength = range.end - range.start + 1;
+      res.status(206);
+      res.setHeader("Content-Length", String(rangeLength));
+      res.setHeader("Content-Range", `bytes ${range.start}-${range.end}/${contentLength}`);
+      const rangeStream = createByteRangeStream(range.start, range.end);
+      rangeStream.on("error", (err) => {
+        next(err);
+      });
+      object.stream.pipe(rangeStream).pipe(res);
+      return;
+    }
+
+    res.setHeader("Content-Length", String(contentLength || object.contentLength || 0));
     object.stream.pipe(res);
   });
 

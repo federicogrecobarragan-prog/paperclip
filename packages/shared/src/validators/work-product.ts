@@ -29,6 +29,18 @@ export const issueWorkProductReviewStateSchema = z.enum([
   "changes_requested",
 ]);
 
+export const attachmentArtifactWorkProductMetadataSchema = z.object({
+  attachmentId: z.string().uuid(),
+  contentType: z.string().min(1),
+  byteSize: z.number().int().nonnegative(),
+  contentPath: z.string().min(1),
+  openPath: z.string().min(1),
+  downloadPath: z.string().min(1),
+  originalFilename: z.string().optional().nullable(),
+});
+
+export type AttachmentArtifactWorkProductMetadata = z.infer<typeof attachmentArtifactWorkProductMetadataSchema>;
+
 export const createIssueWorkProductSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   executionWorkspaceId: z.string().uuid().optional().nullable(),
