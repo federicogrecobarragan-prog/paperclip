@@ -13,6 +13,9 @@ coverage/
 data/
 .paperclip/
 .pnpm-store/
+
+# La Colmena: notas de ops locales (runbooks F0 con paths de máquina; viven en el vault)
+notas-colmena/
 tmp-*
 cli/tmp/
 
