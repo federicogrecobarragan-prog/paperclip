@@ -1017,6 +1017,33 @@ export async function startServer(): Promise<StartedServer> {
         databaseBackupDir: config.databaseBackupDir,
       });
 
+      // La Colmena: aviso anti-PAYG. En modo subscription-only NO debería haber
+      // ninguna API key de facturación en el entorno (los adapters caen a PAYG
+      // si la key está presente). Es advisory (no aborta el arranque).
+      if (process.env.PAPERCLIP_SUBSCRIPTION_ONLY === "true") {
+        const paygEnvKeys = [
+          "ANTHROPIC_API_KEY",
+          "OPENAI_API_KEY",
+          "CURSOR_API_KEY",
+          "GEMINI_API_KEY",
+          "GOOGLE_API_KEY",
+          "XAI_API_KEY",
+          "OPENROUTER_API_KEY",
+          "ANTHROPIC_BEDROCK_BASE_URL",
+        ];
+        const leakedPaygKeys = paygEnvKeys.filter(
+          (key) => (process.env[key]?.trim().length ?? 0) > 0,
+        );
+        if (leakedPaygKeys.length > 0) {
+          logger.error(
+            { leakedPaygKeys },
+            "PAPERCLIP_SUBSCRIPTION_ONLY=true but PAYG provider key(s) are present in the environment — agents could bill pay-as-you-go. Unset them to stay on subscription/free auth.",
+          );
+        } else {
+          logger.info("Subscription-only mode: no PAYG provider keys detected in the environment.");
+        }
+      }
+
       const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
       if (boardClaimUrl) {
         const red = "\x1b[41m\x1b[30m";

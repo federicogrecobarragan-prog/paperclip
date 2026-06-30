@@ -7,6 +7,7 @@ import {
   budgetPolicies,
   companies,
   costEvents,
+  heartbeatRuns,
   projects,
 } from "@paperclipai/db";
 import type {
@@ -51,6 +52,50 @@ function currentUtcMonthWindow(now = new Date()) {
   const start = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
   const end = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0, 0));
   return { start, end };
+}
+
+// La Colmena — guardrail anti-runaway: cap de nº de runs por ventana UTC.
+// El hard-stop de dinero (billed_cents) es decorativo cuando los modelos corren
+// por suscripción/free ($0 reportado), así que limitamos por cantidad de runs.
+function currentUtcHourWindow(now = new Date()) {
+  const start = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), 0, 0, 0),
+  );
+  return { start, end: new Date(start.getTime() + 3_600_000) };
+}
+
+function currentUtcDayWindow(now = new Date()) {
+  const start = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0),
+  );
+  return { start, end: new Date(start.getTime() + 86_400_000) };
+}
+
+function readRunRateCaps() {
+  const perHour = Math.max(0, Number(process.env.PAPERCLIP_MAX_RUNS_PER_HOUR) || 0);
+  const perDay = Math.max(0, Number(process.env.PAPERCLIP_MAX_RUNS_PER_DAY) || 0);
+  return { perHour, perDay };
+}
+
+async function countAgentRunsStartedInWindow(
+  db: Db,
+  companyId: string,
+  agentId: string,
+  start: Date,
+  end: Date,
+) {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        gte(heartbeatRuns.startedAt, start),
+        lt(heartbeatRuns.startedAt, end),
+      ),
+    );
+  return Number(row?.n ?? 0);
 }
 
 function resolveWindow(windowKind: BudgetWindowKind, now = new Date()) {
@@ -751,6 +796,35 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
               ? "Company is paused because its budget hard-stop was reached."
               : "Company is paused and cannot start new work.",
         };
+      }
+
+      // La Colmena — cap anti-runaway por nº de runs (ventana UTC). Cuenta runs
+      // que efectivamente arrancaron (startedAt) en la ventana; bloquea el wake
+      // siguiente al cruzar el tope. 0 = desactivado (comportamiento original).
+      const runCaps = readRunRateCaps();
+      if (runCaps.perHour > 0) {
+        const { start, end } = currentUtcHourWindow();
+        const used = await countAgentRunsStartedInWindow(db, companyId, agentId, start, end);
+        if (used >= runCaps.perHour) {
+          return {
+            scopeType: "agent" as const,
+            scopeId: agentId,
+            scopeName: agent.name,
+            reason: `Agent hit the run-rate cap (${used}/${runCaps.perHour} runs this UTC hour). It resumes next hour.`,
+          };
+        }
+      }
+      if (runCaps.perDay > 0) {
+        const { start, end } = currentUtcDayWindow();
+        const used = await countAgentRunsStartedInWindow(db, companyId, agentId, start, end);
+        if (used >= runCaps.perDay) {
+          return {
+            scopeType: "agent" as const,
+            scopeId: agentId,
+            scopeName: agent.name,
+            reason: `Agent hit the run-rate cap (${used}/${runCaps.perDay} runs this UTC day). It resumes tomorrow (UTC).`,
+          };
+        }
       }
 
       const companyPolicy = await db
