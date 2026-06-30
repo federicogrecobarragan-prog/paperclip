@@ -93,6 +93,16 @@ export function linkSdkInto(packageDir) {
     if (error?.code !== "ENOENT") throw error;
   }
 
-  symlinkSync(relativeSdkDir, linkTarget, "dir");
+  try {
+    symlinkSync(relativeSdkDir, linkTarget, "dir");
+  } catch (error) {
+    // Windows without Developer Mode/admin cannot create "dir" symlinks (EPERM).
+    // Junctions require no elevation but need an absolute target.
+    if (error?.code === "EPERM") {
+      symlinkSync(sdkDir, linkTarget, "junction");
+    } else {
+      throw error;
+    }
+  }
   return true;
 }
