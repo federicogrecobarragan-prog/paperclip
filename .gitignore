@@ -60,3 +60,6 @@ tests/release-smoke/playwright-report/
 .superpowers/
 .claude/worktrees/
 .herenow
+
+# Graphify — el grafo generado vive en el vault, no en el repo
+graphify-out/
