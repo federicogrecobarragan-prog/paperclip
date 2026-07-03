@@ -747,6 +747,44 @@ export async function resolveExecutionRunAdapterConfig(input: {
       secretKeys.add(key);
     }
   }
+  // La Colmena guardrail fase-2: hard-block anti-PAYG sobre el env FINAL del run
+  // (config del agente + environment + project + routine + secrets ya resueltos).
+  // El check de arranque en index.ts solo cubre process.env y es advisory; este
+  // aborta el run ANTES de lanzar el adapter si aparece una key de facturación.
+  if (process.env.PAPERCLIP_SUBSCRIPTION_ONLY === "true") {
+    const PAYG_ENV_KEYS = [
+      "ANTHROPIC_API_KEY",
+      "OPENAI_API_KEY",
+      "CURSOR_API_KEY",
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "XAI_API_KEY",
+      "OPENROUTER_API_KEY",
+      "ANTHROPIC_BEDROCK_BASE_URL",
+    ];
+    const finalEnv = parseObject(resolvedConfig.env) as Record<string, unknown>;
+    const blockedPaygKeys = PAYG_ENV_KEYS.filter((key) => {
+      const value = finalEnv[key];
+      return typeof value === "string" && value.trim().length > 0;
+    });
+    if (blockedPaygKeys.length > 0) {
+      throw new ConfigurationIncompleteFailure(
+        `subscription-only mode: PAYG provider key(s) blocked in run env: ${blockedPaygKeys.join(", ")}. ` +
+          "Remove them from the agent adapterConfig.env / environment / project / routine bindings to run on subscription auth.",
+        {
+          configurationIncomplete: {
+            reason: "payg_key_blocked",
+            companyId: input.companyId,
+            agentId: input.agentId ?? null,
+            issueId: input.issueId ?? null,
+            projectId: input.projectId ?? null,
+            routineId: input.routineId ?? null,
+            missingBindings: blockedPaygKeys.map((key) => ({ envKey: key })),
+          },
+        },
+      );
+    }
+  }
   return {
     resolvedConfig,
     secretKeys,
