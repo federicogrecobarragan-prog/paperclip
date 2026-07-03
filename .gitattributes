@@ -1,0 +1,4 @@
+# La Colmena: los archivos de catalogo llevan hash sha256 pineado sobre bytes LF —
+# la conversion CRLF de Windows rompe install-catalog (422 pinned hash mismatch).
+packages/skills-catalog/catalog/** text eol=lf
+packages/teams-catalog/catalog/** text eol=lf
