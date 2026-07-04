@@ -454,6 +454,11 @@ describe("IssueChatThread", () => {
     const execCommand = vi.fn(() => true);
     const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
     const originalExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
+    const originalSecureContext = Object.getOwnPropertyDescriptor(window, "isSecureContext");
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: false,
+    });
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText: clipboardWrite },
@@ -502,7 +507,7 @@ describe("IssueChatThread", () => {
         await Promise.resolve();
       });
 
-      expect(clipboardWrite).toHaveBeenCalledWith("Copy this comment");
+      expect(clipboardWrite).not.toHaveBeenCalled();
       expect(execCommand).toHaveBeenCalledWith("copy");
 
       act(() => {
@@ -520,6 +525,12 @@ describe("IssueChatThread", () => {
       } else {
         // @ts-expect-error test cleanup for optional browser API
         delete document.execCommand;
+      }
+      if (originalSecureContext) {
+        Object.defineProperty(window, "isSecureContext", originalSecureContext);
+      } else {
+        // @ts-expect-error test cleanup for optional browser API
+        delete window.isSecureContext;
       }
     }
   });
@@ -3453,6 +3464,8 @@ describe("IssueChatThread", () => {
               adapterType: "codex_local",
               currentStatusMessage: "Syncing git worktree to sandbox",
               currentStatusUpdatedAt: "2026-04-06T12:00:05.000Z",
+              currentToolName: "bash",
+              lastEventAt: new Date(Date.now() - 2000).toISOString(),
             }}
             onAdd={async () => {}}
             enableLiveTranscriptPolling={false}
@@ -3462,8 +3475,9 @@ describe("IssueChatThread", () => {
     });
 
     expect(container.textContent).toContain("Working...");
-    expect(container.textContent).toContain("Syncing git worktree to sandbox");
-    expect(container.querySelector('[title="Syncing git worktree to sandbox"]')).not.toBeNull();
+    expect(container.textContent).toContain("Using bash");
+    expect(container.textContent).not.toContain("last activity");
+    expect(container.textContent).toMatch(/\d+ seconds? ago/);
 
     act(() => {
       root.unmount();

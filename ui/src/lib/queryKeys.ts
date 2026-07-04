@@ -161,6 +161,10 @@ export const queryKeys = {
   environments: {
     list: (companyId: string) => ["environments", companyId] as const,
     capabilities: (companyId: string) => ["environment-capabilities", companyId] as const,
+    customImageTemplate: (environmentId: string) =>
+      ["environments", environmentId, "custom-image-template"] as const,
+    customImageSetupSession: (sessionId: string) =>
+      ["environment-custom-image-setup-sessions", sessionId] as const,
   },
   projects: {
     list: (companyId: string) => ["projects", companyId] as const,

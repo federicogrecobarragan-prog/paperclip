@@ -33,11 +33,13 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
   feedbackService,
   backfillPrincipalAccessCompatibility,
   bootstrapExecutionPolicyFromEnv,
+  environmentCustomImageService,
   heartbeatService,
   instanceSettingsService,
   reconcileCloudUpstreamRunsOnStartup,
@@ -699,6 +701,9 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
   
+  setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
+    pluginWorkerManager,
+  });
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
@@ -775,6 +780,7 @@ export async function startServer(): Promise<StartedServer> {
 
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
@@ -818,10 +824,10 @@ export async function startServer(): Promise<StartedServer> {
       }
 
       const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
-      if (issueGraphReconciled.escalationsCreated > 0) {
+      if (issueGraphReconciled.escalationsCreated > 0 || issueGraphReconciled.dependencyWakesHealed > 0) {
         logger.warn(
           { ...issueGraphReconciled },
-          "startup issue-graph liveness reconciliation created escalations",
+          "startup issue-graph liveness reconciliation changed issue graph state",
         );
       }
 
@@ -846,6 +852,11 @@ export async function startServer(): Promise<StartedServer> {
       const reviewed = await heartbeat.reconcileProductivityReviews();
       if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
         logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+      }
+
+      const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
+      if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
+        logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
       }
     })().catch((err) => {
       logger.error({ err }, "startup heartbeat recovery failed");
@@ -881,6 +892,17 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
         });
+
+      void environmentCustomImages
+        .cleanupExpiredSetupSessions()
+        .then((result) => {
+          if (result.timedOut > 0 || result.failed > 0) {
+            logger.warn({ ...result }, "environment customImage setup cleanup changed sessions");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "environment customImage setup cleanup failed");
+        });
   
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
       // persisted queued work is still being driven forward.
@@ -906,8 +928,8 @@ export async function startServer(): Promise<StartedServer> {
         })
         .then(async () => {
           const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-          if (reconciled.escalationsCreated > 0) {
-            logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation created escalations");
+          if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
+            logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
           }
         })
         .then(async () => {
