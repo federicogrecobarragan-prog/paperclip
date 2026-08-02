@@ -37,6 +37,11 @@ interface SpawnTarget {
   args: string[];
   cwd?: string;
   cleanup?: () => Promise<void>;
+  /**
+   * Set when `args` is an already-quoted command line that must reach the child
+   * byte for byte. Only the Windows cmd.exe wrapper path builds one.
+   */
+  windowsVerbatimArguments?: boolean;
 }
 
 type RemoteExecutionSpec = SshRemoteExecutionSpec;
@@ -1958,10 +1963,31 @@ export async function resolveCommandForLogs(
   return (await resolveCommandPath(command, cwd, env)) ?? command;
 }
 
+/**
+ * Quote one argument for a command line handed to `cmd.exe /d /s /c` verbatim.
+ *
+ * The result has to survive two different parsers: cmd.exe's tokenizer, which
+ * only understands `"` and treats `\` as an ordinary character, and the target
+ * program's `CommandLineToArgvW`, which uses the MSVCRT backslash rules. Hence:
+ *
+ * - Embedded quotes are doubled (`""`) rather than backslash-escaped. `""` leaves
+ *   cmd.exe's quote state balanced, so `&`/`|`/`>` after a quote stay inert, and
+ *   `CommandLineToArgvW` still reads `""` inside a quoted run as a literal quote.
+ *   Using `\"` here desynchronizes cmd.exe and lets metacharacters escape the
+ *   argument.
+ * - A trailing run of backslashes is doubled, because `CommandLineToArgvW` reads
+ *   the resulting `\"` as an escaped literal quote — the argument would never
+ *   close and would swallow the argument after it.
+ *
+ * Known limits of routing through cmd.exe: `%VAR%` is still expanded by the batch
+ * layer, and a backslash placed directly before an embedded quote cannot be
+ * represented for both parsers at once.
+ */
 function quoteForCmd(arg: string) {
   if (!arg.length) return '""';
   const escaped = arg.replace(/"/g, '""');
-  return /[\s"&<>|^()]/.test(escaped) ? `"${escaped}"` : escaped;
+  if (!/[\s"&<>|^()]/.test(escaped)) return escaped;
+  return `"${escaped.replace(/(\\+)$/, "$1$1")}"`;
 }
 
 export function sanitizeSshRemoteEnv(
@@ -2020,9 +2046,15 @@ async function resolveSpawnTarget(
     // ComSpec to PowerShell, which breaks cmd-specific flags like /d /s /c.
     const shell = resolveWindowsCmdShell(env);
     const commandLine = [quoteForCmd(executable), ...args.map(quoteForCmd)].join(" ");
+    // The command line is already quoted, so it has to reach cmd.exe unchanged.
+    // Without windowsVerbatimArguments libuv re-quotes it with MSVCRT rules and
+    // cmd.exe then sees our quotes as literal `\"`, which splits apart every
+    // argument containing whitespace. The extra outer quotes are the pair that
+    // `/s` strips; they are also what makes an executable path with a space work.
     return {
       command: shell,
-      args: ["/d", "/s", "/c", commandLine],
+      args: ["/d", "/s", "/c", `"${commandLine}"`],
+      windowsVerbatimArguments: true,
     };
   }
 
@@ -2861,6 +2893,7 @@ export async function runChildProcess(
           env: mergedEnv,
           detached: process.platform !== "win32",
           shell: false,
+          windowsVerbatimArguments: target.windowsVerbatimArguments ?? false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
