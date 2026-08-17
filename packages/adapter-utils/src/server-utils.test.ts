@@ -1771,3 +1771,97 @@ describe("appendWithByteCap", () => {
     expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(7);
   });
 });
+
+// Regression coverage for the Windows `.cmd`/`.bat` spawn path. Agents on Windows
+// are launched through shims (`claude.cmd`, `codex.cmd`), so every argument has to
+// cross cmd.exe's tokenizer *and* the target program's CommandLineToArgvW.
+// Arguments used to arrive split apart because the pre-built command line was
+// re-quoted by libuv before cmd.exe ever saw it.
+describe("runChildProcess on the Windows .cmd wrapper path", () => {
+  const runOnWindows = process.platform === "win32" ? it : it.skip;
+
+  async function writeShim(dir: string) {
+    const shimPath = path.join(dir, "shim.cmd");
+    await fs.writeFile(
+      path.join(dir, "dump-argv.cjs"),
+      "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n",
+      "utf8",
+    );
+    await fs.writeFile(shimPath, `@echo off\r\n"${process.execPath}" "%~dp0dump-argv.cjs" %*\r\n`, "utf8");
+    return shimPath;
+  }
+
+  async function spawnShimWithArgs(args: string[]) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pc-cmd-quote-"));
+    try {
+      const shimPath = await writeShim(dir);
+      return await runChildProcess(randomUUID(), shimPath, args, {
+        cwd: dir,
+        env: {},
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  runOnWindows("keeps an argument containing whitespace as a single argument", async () => {
+    const args = ["--add-dir", "C:\\ruta con espacio", "--next"];
+
+    const result = await spawnShimWithArgs(args);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(args);
+  });
+
+  // The LAC-567 case: whitespace *and* a trailing backslash. CommandLineToArgvW
+  // reads the resulting `\"` as an escaped literal quote, so the argument never
+  // closes and swallows the one after it.
+  runOnWindows("does not merge a trailing-backslash argument into the next one", async () => {
+    const args = ["--add-dir", "C:\\ruta con espacio\\", "--next"];
+
+    const result = await spawnShimWithArgs(args);
+
+    expect(result.exitCode).toBe(0);
+    const received = JSON.parse(result.stdout) as string[];
+    expect(received).toHaveLength(3);
+    expect(received[2]).toBe("--next");
+    expect(received).toEqual(args);
+  });
+
+  // `""` keeps cmd.exe's quote state balanced. Backslash-escaping the quote
+  // instead desynchronizes cmd.exe and lets `&`/`|`/`>` break out of the argument.
+  runOnWindows("keeps cmd metacharacters inert inside an argument", async () => {
+    const args = ["--msg", 'x " & echo PWNED > pwned.txt', "--next"];
+
+    const result = await spawnShimWithArgs(args);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(args);
+  });
+
+  runOnWindows("passes arguments through a shim whose own path contains a space", async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pc-cmd-quote-parent-"));
+    const dir = path.join(parent, "dir con espacio");
+    await fs.mkdir(dir, { recursive: true });
+    const args = ["--flag", "value"];
+
+    try {
+      const shimPath = await writeShim(dir);
+      const result = await runChildProcess(randomUUID(), shimPath, args, {
+        cwd: dir,
+        env: {},
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual(args);
+    } finally {
+      await fs.rm(parent, { recursive: true, force: true });
+    }
+  });
+});
