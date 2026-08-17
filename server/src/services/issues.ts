@@ -1371,6 +1371,7 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "no_comment_streak",
   "long_active_duration",
   "high_churn",
+  "stalled_infrastructure",
 ];
 
 function lowTrustBoundaryIssueCondition(
