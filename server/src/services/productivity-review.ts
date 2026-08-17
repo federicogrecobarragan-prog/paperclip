@@ -41,7 +41,11 @@ export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review e
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
+type ProductivityReviewTrigger =
+  | "no_comment_streak"
+  | "long_active_duration"
+  | "high_churn"
+  | "stalled_infrastructure";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -183,10 +187,11 @@ function choosePrimaryTrigger(input: {
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
+  stalledInfrastructure: boolean;
 }): ProductivityReviewTrigger | null {
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
-  if (input.longActive) return "long_active_duration";
+  if (input.longActive) return input.stalledInfrastructure ? "stalled_infrastructure" : "long_active_duration";
   return null;
 }
 
@@ -197,7 +202,22 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 function formatTrigger(trigger: ProductivityReviewTrigger) {
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
+  if (trigger === "stalled_infrastructure") return "Stalled infrastructure (zero-usage failed runs)";
   return "Long active duration";
+}
+
+function runHasUsageActivity(run: HeartbeatRunRow) {
+  const usage = run.usageJson;
+  if (!usage || typeof usage !== "object") return false;
+  return Object.values(usage).some((value) => typeof value === "number" && value > 0);
+}
+
+// All sampled runs are terminal failures with no token usage and no cost: the assigned
+// agent never got meaningful runtime, so this looks like a broken adapter/credential,
+// not unproductive work. See LAC-811.
+function isStalledInfrastructure(runs: HeartbeatRunRow[], costCents: number) {
+  if (runs.length === 0 || costCents !== 0) return false;
+  return runs.every((run) => run.status === "failed" && !runHasUsageActivity(run));
 }
 
 export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: EnqueueWakeup }) {
@@ -482,12 +502,19 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
+    const stalledInfrastructure = longActive && isStalledInfrastructure(latestRuns, costRow.costCents);
+    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn, stalledInfrastructure });
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
+    if (stalledInfrastructure) {
+      const errorCodes = [...new Set(latestRuns.map((run) => run.errorCode).filter((code): code is string => Boolean(code)))];
+      triggerReasons.push(
+        `${latestRuns.length} sampled runs all failed with zero token usage and $0 cost${errorCodes.length > 0 ? ` (error codes: ${errorCodes.join(", ")})` : ""} — suspect a broken adapter/credential, not agent productivity`,
+      );
+    }
     if (highChurn) {
       triggerReasons.push(
         `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
@@ -570,8 +597,23 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const usage = evidence.usageSamples.length > 0
       ? evidence.usageSamples.map((sample) => `- \`${sample.runId}\`: \`${JSON.stringify(sample.usageJson).slice(0, 500)}\``).join("\n")
       : "- no usage payloads on sampled runs";
+    const summaryLine = evidence.trigger === "stalled_infrastructure"
+      ? "Paperclip detected zero-usage failed runs on an assigned issue — suspect a broken adapter/credential, not agent unproductivity."
+      : "Paperclip detected an unusual productivity/progression pattern on an assigned issue.";
+    const managerDecision = evidence.trigger === "stalled_infrastructure"
+      ? [
+        "- All sampled runs failed with zero token usage and $0 cost — this looks like a runtime/adapter outage (e.g. a broken host credential), not agent unproductivity.",
+        "- Check the assigned agent's adapter/credential health before treating this as a productivity issue.",
+        "- If a `stranded_assigned_issue` recovery action is already open on the source issue, prefer that path over rerouting or decomposing the work.",
+        "- Once the runtime issue is fixed, close this review and let the agent resume; only consider reroute/decompose if failures persist with a healthy runtime.",
+      ]
+      : [
+        "- Close as productive if this pattern is expected.",
+        "- Continue with a snooze window if the current work should keep running without repeat review spam.",
+        "- Request decomposition, reroute, block with an unblock owner, or stop/cancel the source work if the work is inefficient.",
+      ];
     return [
-      "Paperclip detected an unusual productivity/progression pattern on an assigned issue.",
+      summaryLine,
       "",
       "## Source",
       "",
@@ -614,9 +656,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       "## Manager Decision",
       "",
-      "- Close as productive if this pattern is expected.",
-      "- Continue with a snooze window if the current work should keep running without repeat review spam.",
-      "- Request decomposition, reroute, block with an unblock owner, or stop/cancel the source work if the work is inefficient.",
+      ...managerDecision,
     ].join("\n");
   }
 

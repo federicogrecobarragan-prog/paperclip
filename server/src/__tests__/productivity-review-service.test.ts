@@ -360,6 +360,63 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  it("classifies a long-active issue with only zero-usage failed runs as stalled infrastructure, not productivity", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 9 * 60 * 60 * 1000),
+    });
+    const failureCodes = [
+      "claude_transient_upstream",
+      "claude_transient_upstream",
+      "claude_transient_upstream",
+      "claude_transient_upstream",
+      "claude_auth_required",
+      "claude_auth_required",
+      "claude_auth_required",
+      "claude_auth_required",
+    ];
+    await db.insert(heartbeatRuns).values(
+      failureCodes.map((errorCode, index) => {
+        const createdAt = new Date(now.getTime() - index * 30 * 60_000);
+        return {
+          id: randomUUID(),
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          status: "failed",
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          startedAt: createdAt,
+          finishedAt: new Date(createdAt.getTime() + 5_000),
+          errorCode,
+          usageJson: null,
+          contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+          createdAt,
+          updatedAt: createdAt,
+        };
+      }),
+    );
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const hold = await service.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `stalled_infrastructure`");
+    expect(review?.description).toContain("suspect a broken adapter/credential, not agent productivity");
+    expect(review?.description).toContain("claude_transient_upstream");
+    expect(review?.description).toContain("claude_auth_required");
+    expect(review?.description).toContain("runtime/adapter outage");
+    expect(review?.priority).toBe("high");
+    expect(hold.held).toBe(false);
+  });
+
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
