@@ -75,4 +75,43 @@ describe("errorHandler", () => {
     expect(res.err).toBe(err);
     expect(res.__errorContext?.error?.message).toBe("db exploded");
   });
+
+  it("logs recursive database error causes without exposing them in the HTTP response", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const pgError = Object.assign(new Error("invalid byte sequence for encoding UTF8: 0x00"), {
+      code: "22021",
+      detail: "String contains a NUL byte",
+      constraint: "issue_comments_body_check",
+    });
+    const err = new Error("Failed query: insert into issue_comments", { cause: pgError });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.__errorContext?.error?.cause).toMatchObject({
+      message: "invalid byte sequence for encoding UTF8: 0x00",
+      code: "22021",
+      detail: "String contains a NUL byte",
+      constraint: "issue_comments_body_check",
+    });
+    expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
+    expect(JSON.stringify((res.json as ReturnType<typeof vi.fn>).mock.calls)).not.toContain("22021");
+  });
+
+  it("caps recursive error cause logging", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    let err: Error = new Error("deepest");
+    for (let index = 0; index < 8; index += 1) {
+      err = new Error(`wrapper-${index}`, { cause: err });
+    }
+
+    errorHandler(err, req, res, next);
+
+    let context = res.__errorContext?.error;
+    while (context?.cause && !context.cause.truncated) context = context.cause;
+    expect(context?.cause).toEqual({ message: "Error cause chain truncated", truncated: true });
+  });
 });

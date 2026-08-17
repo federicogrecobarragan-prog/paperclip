@@ -6,12 +6,93 @@ import { getTelemetryClient } from "../telemetry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 
 export interface ErrorContext {
-  error: { message: string; stack?: string; name?: string; details?: unknown; raw?: unknown };
+  error: ErrorContextEntry;
   method: string;
   url: string;
   reqBody?: unknown;
   reqParams?: unknown;
   reqQuery?: unknown;
+}
+
+interface ErrorContextEntry {
+  message: string;
+  stack?: string;
+  name?: string;
+  details?: unknown;
+  raw?: unknown;
+  code?: string | number;
+  detail?: string;
+  constraint?: string;
+  schema?: string;
+  table?: string;
+  column?: string;
+  dataType?: string;
+  severity?: string;
+  hint?: string;
+  where?: string;
+  position?: string | number;
+  routine?: string;
+  cause?: ErrorContextEntry;
+  truncated?: boolean;
+}
+
+const MAX_ERROR_CAUSE_DEPTH = 5;
+const ERROR_CONTEXT_FIELDS = [
+  "code",
+  "detail",
+  "constraint",
+  "schema",
+  "table",
+  "column",
+  "dataType",
+  "severity",
+  "hint",
+  "where",
+  "position",
+  "routine",
+] as const;
+
+function readErrorProperty(value: object, key: string): unknown {
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function isLoggableScalar(value: unknown): value is string | number {
+  return typeof value === "string" || typeof value === "number";
+}
+
+function serializeErrorContext(error: unknown, depth = 0): ErrorContextEntry {
+  const errorObject = error !== null && typeof error === "object" ? error : null;
+  const message = errorObject ? readErrorProperty(errorObject, "message") : undefined;
+  const stack = errorObject ? readErrorProperty(errorObject, "stack") : undefined;
+  const name = errorObject ? readErrorProperty(errorObject, "name") : undefined;
+  const result: ErrorContextEntry = {
+    message: typeof message === "string" ? message : String(error),
+    ...(typeof stack === "string" ? { stack } : {}),
+    ...(typeof name === "string" ? { name } : {}),
+    ...(!errorObject ? { raw: error } : {}),
+  };
+
+  if (!errorObject) return result;
+
+  for (const field of ERROR_CONTEXT_FIELDS) {
+    const value = readErrorProperty(errorObject, field);
+    if (isLoggableScalar(value)) {
+      Object.assign(result, { [field]: value });
+    }
+  }
+
+  const cause = readErrorProperty(errorObject, "cause");
+  if (cause !== undefined) {
+    result.cause = depth >= MAX_ERROR_CAUSE_DEPTH
+      ? { message: "Error cause chain truncated", truncated: true }
+      : serializeErrorContext(cause, depth + 1);
+  }
+
+  return result;
 }
 
 function attachErrorContext(
@@ -47,7 +128,7 @@ export function errorHandler(
       attachErrorContext(
         req,
         res,
-        { message: err.message, stack: err.stack, name: err.name, details: err.details },
+        { ...serializeErrorContext(err), details: err.details },
         err,
       );
       const tc = getTelemetryClient();
@@ -71,8 +152,8 @@ export function errorHandler(
     req,
     res,
     err instanceof Error
-      ? { message: err.message, stack: err.stack, name: err.name }
-      : { message: String(err), raw: err, stack: rootError.stack, name: rootError.name },
+      ? serializeErrorContext(err)
+      : { ...serializeErrorContext(err), raw: err, stack: rootError.stack, name: rootError.name },
     rootError,
   );
 

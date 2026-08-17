@@ -139,6 +139,18 @@ describe("issue validators", () => {
     expect(parsed.body).toBe("Progress update\n\nNext action.");
   });
 
+  it("strips NUL characters from persisted issue comment bodies", () => {
+    const parsed = addIssueCommentSchema.parse({
+      body: "Progress\u0000 update\u0000.",
+    });
+
+    expect(parsed.body).toBe("Progress update.");
+  });
+
+  it("rejects issue comment bodies that contain only NUL characters", () => {
+    expect(addIssueCommentSchema.safeParse({ body: "\u0000\u0000" }).success).toBe(false);
+  });
+
   it("accepts structured issue comment presentation and metadata", () => {
     const parsed = addIssueCommentSchema.parse({
       body: "Paperclip needs a disposition before this issue can continue.",
@@ -202,6 +214,15 @@ describe("issue validators", () => {
     });
 
     expect(response.summaryMarkdown).toBe("Summary\n\nNext action");
+    expect(document.body).toBe("# Plan\n\nShip it");
+  });
+
+  it("strips NUL characters from persisted issue document bodies", () => {
+    const document = upsertIssueDocumentSchema.parse({
+      format: "markdown",
+      body: "# Pl\u0000an\n\nShip it\u0000",
+    });
+
     expect(document.body).toBe("# Plan\n\nShip it");
   });
 

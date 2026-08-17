@@ -8,3 +8,9 @@ export function normalizeEscapedLineBreaks(value: string): string {
 }
 
 export const multilineTextSchema = z.string().transform(normalizeEscapedLineBreaks);
+
+export function stripNulCharacters(value: string): string {
+  return value.replace(/\u0000/g, "");
+}
+
+export const persistedMultilineTextSchema = multilineTextSchema.transform(stripNulCharacters);
