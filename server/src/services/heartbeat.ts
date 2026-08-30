@@ -190,6 +190,12 @@ import {
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
+  normalizeAdapterExecutionResultForPersistence,
+  sanitizeHeartbeatPersistenceRecord,
+  sanitizeHeartbeatPersistenceText,
+  sanitizeHeartbeatPersistenceValue,
+} from "./heartbeat-persistence-safety.js";
+import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
   type RuntimeStatusUpdate,
@@ -1692,9 +1698,10 @@ function appendExcerpt(prev: string, chunk: string) {
 }
 
 function truncateRunEventString(value: string) {
-  if (value.length <= MAX_RUN_EVENT_PAYLOAD_STRING_CHARS) return value;
-  const omittedChars = value.length - MAX_RUN_EVENT_PAYLOAD_STRING_CHARS;
-  return `${value.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
+  const sanitized = sanitizeHeartbeatPersistenceText(value);
+  if (sanitized.length <= MAX_RUN_EVENT_PAYLOAD_STRING_CHARS) return sanitized;
+  const omittedChars = sanitized.length - MAX_RUN_EVENT_PAYLOAD_STRING_CHARS;
+  return `${sanitized.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
 }
 
 function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>): unknown {
@@ -1761,7 +1768,8 @@ function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>
 }
 
 export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, unknown>): Record<string, unknown> {
-  const bounded = boundRunEventValue(payload, 0, new WeakSet());
+  const persistenceSafePayload = sanitizeHeartbeatPersistenceRecord(payload);
+  const bounded = boundRunEventValue(persistenceSafePayload, 0, new WeakSet());
   return parseObject(bounded) ?? { _truncated: true };
 }
 
@@ -1772,7 +1780,9 @@ function redactInlineBase64ImageData(chunk: string) {
 }
 
 export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
+  const normalized = sanitizeHeartbeatPersistenceText(
+    redactSensitiveText(redactInlineBase64ImageData(chunk)),
+  );
   if (normalized.length <= maxChars) return normalized;
 
   const headChars = Math.max(0, Math.floor(maxChars * 0.6));
@@ -6141,14 +6151,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return ensured;
   }
 
+  function sanitizeHeartbeatRunPatch(
+    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+  ): Partial<typeof heartbeatRuns.$inferInsert> | undefined {
+    if (!patch) return patch;
+    const sanitized = { ...patch };
+    for (const [key, value] of Object.entries(sanitized)) {
+      if (typeof value === "string") {
+        (sanitized as Record<string, unknown>)[key] = sanitizeHeartbeatPersistenceText(value);
+      }
+    }
+    for (const key of ["usageJson", "resultJson", "contextSnapshot"] as const) {
+      const value = sanitized[key];
+      if (value !== null && value !== undefined) {
+        sanitized[key] = sanitizeHeartbeatPersistenceRecord(value);
+      }
+    }
+    return sanitized;
+  }
+
+  function sanitizeWakeupPatch(
+    patch: Partial<typeof agentWakeupRequests.$inferInsert> | undefined,
+  ): Partial<typeof agentWakeupRequests.$inferInsert> | undefined {
+    if (!patch) return patch;
+    const sanitized = { ...patch };
+    for (const [key, value] of Object.entries(sanitized)) {
+      if (typeof value === "string") {
+        (sanitized as Record<string, unknown>)[key] = sanitizeHeartbeatPersistenceText(value);
+      }
+    }
+    if (sanitized.payload !== null && sanitized.payload !== undefined) {
+      sanitized.payload = sanitizeHeartbeatPersistenceRecord(sanitized.payload);
+    }
+    return sanitized;
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    const sanitizedPatch = sanitizeHeartbeatRunPatch(patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -6183,9 +6229,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    const sanitizedPatch = sanitizeHeartbeatRunPatch(patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -6220,6 +6267,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
 
     return { run: current, updated: false as const };
+  }
+
+  async function setTerminalRunStatusIfRunning(
+    runId: string,
+    status: "succeeded" | "failed" | "cancelled" | "timed_out",
+    patch: Partial<typeof heartbeatRuns.$inferInsert>,
+  ) {
+    try {
+      return await setRunStatusIfRunning(runId, status, patch);
+    } catch {
+      logger.warn(
+        { runId, status },
+        "primary terminal heartbeat persistence failed; retrying with bounded sanitized fallback",
+      );
+      const safeError = typeof patch.error === "string"
+        ? sanitizeHeartbeatPersistenceText(patch.error)
+        : null;
+      return setRunStatusIfRunning(runId, status, {
+        finishedAt: patch.finishedAt instanceof Date ? patch.finishedAt : new Date(),
+        error: status === "succeeded" ? null : safeError,
+        errorCode: typeof patch.errorCode === "string"
+          ? sanitizeHeartbeatPersistenceText(patch.errorCode)
+          : status === "succeeded" ? null : "terminal_persistence_fallback",
+        exitCode: typeof patch.exitCode === "number" ? patch.exitCode : null,
+        signal: typeof patch.signal === "string"
+          ? sanitizeHeartbeatPersistenceText(patch.signal)
+          : null,
+        resultJson: {
+          persistenceFallback: true,
+          originalTerminalStatus: status,
+        },
+        stdoutExcerpt: null,
+        stderrExcerpt: null,
+      });
+    }
   }
 
   function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
@@ -6266,9 +6348,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch?: Partial<typeof agentWakeupRequests.$inferInsert>,
   ) {
     if (!wakeupRequestId) return;
+    const sanitizedPatch = sanitizeWakeupPatch(patch);
     await db
       .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
@@ -6737,7 +6820,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+      ? sanitizeHeartbeatPersistenceText(
+          redactCurrentUserText(event.message, currentUserRedactionOptions),
+        )
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)
@@ -10694,6 +10779,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let seq = 1;
     let handle: RunLogHandle | null = null;
+    let terminalOutcomePersisted: RunSessionOutcome | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
     let outputSeq = Number(run.lastOutputSeq ?? 0);
@@ -10814,17 +10900,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+        const safeStream: "stdout" | "stderr" = stream === "stdout" ? "stdout" : "stderr";
+        const safeChunkValue = sanitizeHeartbeatPersistenceValue(chunk);
+        const safeChunk = typeof safeChunkValue === "string"
+          ? safeChunkValue
+          : "[paperclip omitted non-string adapter log chunk]";
         const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
+          redactCurrentUserText(safeChunk, currentUserRedactionOptions),
         );
-        if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
-        if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
+        if (safeStream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
+        if (safeStream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         const ts = new Date().toISOString();
 
         let appendedBytes = 0;
         if (handle) {
           appendedBytes = await runLogStore.append(handle, {
-            stream,
+            stream: safeStream,
             chunk: sanitizedChunk,
             ts,
           });
@@ -10834,7 +10925,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outputProgressState.pending = {
           at: new Date(ts),
           seq: outputSeq,
-          stream,
+          stream: safeStream,
           bytes: persistedLogBytes,
         };
         await flushOutputProgress();
@@ -10874,7 +10965,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             agentId: run.agentId,
             issueId,
             ts,
-            stream,
+            stream: safeStream,
             chunk: payloadChunk,
             truncated: payloadChunk.length !== sanitizedChunk.length,
           },
@@ -10968,10 +11059,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
       const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
-        if (meta.env && secretKeys.size > 0) {
+        const safeMeta = sanitizeHeartbeatPersistenceRecord(meta);
+        const safeEnv = parseObject(safeMeta.env);
+        if (Object.keys(safeEnv).length > 0 && secretKeys.size > 0) {
           for (const key of secretKeys) {
-            if (key in meta.env) meta.env[key] = "***REDACTED***";
+            if (key in safeEnv) safeEnv[key] = "***REDACTED***";
           }
+          safeMeta.env = safeEnv;
         }
         const modelProfileMetadata = modelProfileRunMetadata(modelProfileApplication);
         await appendRunEvent(currentRun, seq++, {
@@ -10980,7 +11074,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           level: "info",
           message: "adapter invocation",
           payload: {
-            ...(meta as unknown as Record<string, unknown>),
+            ...safeMeta,
             ...(modelProfileMetadata ? { modelProfile: modelProfileMetadata } : {}),
           },
         });
@@ -11165,9 +11259,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
-      let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
+      let adapterResult: AdapterExecutionResult;
       try {
-        adapterResult = await adapter.execute({
+        const rawAdapterResult = await adapter.execute({
           runId: run.id,
           agent,
           runtime: runtimeForAdapter,
@@ -11195,6 +11289,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           authToken: authToken ?? undefined,
         });
+        adapterResult = normalizeAdapterExecutionResultForPersistence(rawAdapterResult);
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
         // barrier so dependents that share this executionWorkspace can wake.
@@ -11380,7 +11475,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
-      const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
+      const persistedRunWrite = await setTerminalRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
         errorCode: runErrorCode,
@@ -11406,6 +11501,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return;
       }
+      terminalOutcomePersisted = outcome;
 
       let persistedRun = persistedRunWrite.run;
       if (persistedRun) {
@@ -11601,6 +11697,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
       );
     } catch (err) {
+      if (terminalOutcomePersisted) {
+        logger.warn(
+          { runId, outcome: terminalOutcomePersisted },
+          "best-effort post-terminal heartbeat publication failed; persisted terminal outcome remains authoritative",
+        );
+        await finalizeAgentStatus(
+          agent.id,
+          terminalOutcomePersisted,
+          terminalOutcomePersisted === "succeeded" ? null : "Post-terminal publication failed",
+        ).catch(() => undefined);
+        return;
+      }
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
@@ -11627,7 +11735,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
-      const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
+      const failedRunWrite = await setTerminalRunStatusIfRunning(run.id, "failed", {
         error: message,
         errorCode: failureErrorCode,
         finishedAt: new Date(),
@@ -11719,7 +11827,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             workspaceValidationSetupFailure?.code ?? configurationIncompleteSetupFailure?.code ?? "setup_failed";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
-          const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
+          const setupFailureWrite = await setTerminalRunStatusIfRunning(runId, "failed", {
             error: message,
             errorCode: setupFailureErrorCode,
             finishedAt: new Date(),
@@ -12552,11 +12660,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
-    const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
-    const reason = opts.reason ?? null;
-    const payload = opts.payload ?? null;
+    const contextSnapshot = sanitizeHeartbeatPersistenceRecord(opts.contextSnapshot ?? {});
+    const reason = typeof opts.reason === "string"
+      ? sanitizeHeartbeatPersistenceText(opts.reason)
+      : null;
+    const payload = opts.payload ? sanitizeHeartbeatPersistenceRecord(opts.payload) : null;
+    const requestedByActorId = typeof opts.requestedByActorId === "string"
+      ? sanitizeHeartbeatPersistenceText(opts.requestedByActorId)
+      : null;
+    const idempotencyKey = typeof opts.idempotencyKey === "string"
+      ? sanitizeHeartbeatPersistenceText(opts.idempotencyKey)
+      : null;
     const {
-      contextSnapshot: enrichedContextSnapshot,
+      contextSnapshot: rawEnrichedContextSnapshot,
       issueIdFromPayload,
       taskKey,
       wakeCommentId,
@@ -12567,6 +12683,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggerDetail,
       payload,
     });
+    const enrichedContextSnapshot = sanitizeHeartbeatPersistenceRecord(rawEnrichedContextSnapshot);
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
     const agent = await getAgent(agentId);
@@ -12576,19 +12693,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
+      const sanitizedPatch = sanitizeWakeupPatch(patch);
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
         source,
         triggerDetail,
-        reason: skipReason,
+        reason: sanitizeHeartbeatPersistenceText(skipReason),
         payload,
         status: "skipped",
         requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
+        requestedByActorId,
+        idempotencyKey,
         finishedAt: new Date(),
-        ...patch,
+        ...sanitizedPatch,
       });
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
@@ -12735,7 +12853,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           contextSnapshot: enrichedContextSnapshot,
           requestedByActorType: opts.requestedByActorType,
-          requestedByActorId: opts.requestedByActorId,
+          requestedByActorId,
         });
 
         if (!treeHoldInteractionWake) {
@@ -12807,8 +12925,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload,
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
@@ -13063,8 +13181,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
@@ -13125,8 +13243,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               status: "coalesced",
               coalescedCount: 1,
               requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
+              requestedByActorId,
+              idempotencyKey,
               runId: mergedRun.id,
               finishedAt: new Date(),
             });
@@ -13191,8 +13309,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               payload: deferredPayload,
               status: "deferred_issue_execution",
               requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
+              requestedByActorId,
+              idempotencyKey,
             });
 
             return { kind: "deferred" as const };
@@ -13218,8 +13336,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
             finishedAt: now,
           });
           if (source === "timer") {
@@ -13245,8 +13363,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload,
             status: "queued",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -13360,8 +13478,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: "coalesced",
         coalescedCount: 1,
         requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
+        requestedByActorId,
+        idempotencyKey,
         runId: mergedRun.id,
         finishedAt: new Date(),
       });
@@ -13392,8 +13510,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           status: "skipped",
           requestedByActorType: opts.requestedByActorType ?? null,
-          requestedByActorId: opts.requestedByActorId ?? null,
-          idempotencyKey: opts.idempotencyKey ?? null,
+          requestedByActorId,
+          idempotencyKey,
           finishedAt: now,
         });
         if (source === "timer") {
@@ -13419,8 +13537,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload,
           status: "queued",
           requestedByActorType: opts.requestedByActorType ?? null,
-          requestedByActorId: opts.requestedByActorId ?? null,
-          idempotencyKey: opts.idempotencyKey ?? null,
+          requestedByActorId,
+          idempotencyKey,
         })
         .returning()
         .then((rows) => rows[0]);

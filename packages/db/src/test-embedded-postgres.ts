@@ -36,6 +36,10 @@ let embeddedPostgresSupportPromise: Promise<EmbeddedPostgresTestSupport> | null 
 
 const DEFAULT_PAPERCLIP_EMBEDDED_POSTGRES_PORT = 54329;
 
+function getExternalTestDatabaseUrl(): string | null {
+  return process.env.PAPERCLIP_TEST_DATABASE_URL?.trim() || null;
+}
+
 function getReservedTestPorts(): Set<number> {
   const configuredPorts = [
     DEFAULT_PAPERCLIP_EMBEDDED_POSTGRES_PORT,
@@ -137,6 +141,7 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
 }
 
 export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgresTestSupport> {
+  if (getExternalTestDatabaseUrl()) return { supported: true };
   if (!embeddedPostgresSupportPromise) {
     embeddedPostgresSupportPromise = probeEmbeddedPostgresSupport();
   }
@@ -146,6 +151,15 @@ export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgres
 export async function startEmbeddedPostgresTestDatabase(
   tempDirPrefix: string,
 ): Promise<EmbeddedPostgresTestDatabase> {
+  const externalTestDatabaseUrl = getExternalTestDatabaseUrl();
+  if (externalTestDatabaseUrl) {
+    await applyPendingMigrations(externalTestDatabaseUrl);
+    return {
+      connectionString: externalTestDatabaseUrl,
+      cleanup: async () => {},
+    };
+  }
+
   let dataDir: string | null = null;
   let instance: EmbeddedPostgresInstance | null = null;
 
