@@ -38,4 +38,11 @@ describe("compactRunLogChunk", () => {
     expect(compacted).not.toContain("paperclip-json-secret");
     expect(compacted).not.toContain("paperclip-flag-secret");
   });
+
+  it("replaces PostgreSQL-incompatible U+0000 before log persistence", () => {
+    const compacted = compactRunLogChunk("stdout\u0000stderr");
+
+    expect(compacted).toBe("stdout\uFFFDstderr");
+    expect(compacted).not.toContain("\u0000");
+  });
 });

@@ -6199,27 +6199,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .returning()
       .then((rows) => rows[0] ?? null);
 
-    if (updated) {
-      if (isHeartbeatRunTerminalStatus(updated.status)) {
-        clearHeartbeatRunRuntimeStatus(updated.id);
-      }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: {
-          runId: updated.id,
-          agentId: updated.agentId,
-          status: updated.status,
-          invocationSource: updated.invocationSource,
-          triggerDetail: updated.triggerDetail,
-          error: updated.error ?? null,
-          errorCode: updated.errorCode ?? null,
-          startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
-          finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
-        },
-      });
-      publishRunLifecyclePluginEvent(updated);
-    }
+    if (updated) publishRunStatusUpdate(updated);
 
     return updated;
   }
@@ -6228,6 +6208,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    options: { publish?: boolean } = {},
   ) {
     const sanitizedPatch = sanitizeHeartbeatRunPatch(patch);
     const updated = await db
@@ -6241,22 +6222,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (isHeartbeatRunTerminalStatus(updated.status)) {
         clearHeartbeatRunRuntimeStatus(updated.id);
       }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: {
-          runId: updated.id,
-          agentId: updated.agentId,
-          status: updated.status,
-          invocationSource: updated.invocationSource,
-          triggerDetail: updated.triggerDetail,
-          error: updated.error ?? null,
-          errorCode: updated.errorCode ?? null,
-          startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
-          finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
-        },
-      });
-      publishRunLifecyclePluginEvent(updated);
+      if (options.publish !== false) publishRunStatusUpdate(updated);
       return { run: updated, updated: true as const };
     }
 
@@ -6274,8 +6240,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: "succeeded" | "failed" | "cancelled" | "timed_out",
     patch: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    let persisted: Awaited<ReturnType<typeof setRunStatusIfRunning>>;
     try {
-      return await setRunStatusIfRunning(runId, status, patch);
+      persisted = await setRunStatusIfRunning(runId, status, patch, { publish: false });
     } catch {
       logger.warn(
         { runId, status },
@@ -6284,7 +6251,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const safeError = typeof patch.error === "string"
         ? sanitizeHeartbeatPersistenceText(patch.error)
         : null;
-      return setRunStatusIfRunning(runId, status, {
+      persisted = await setRunStatusIfRunning(runId, status, {
         finishedAt: patch.finishedAt instanceof Date ? patch.finishedAt : new Date(),
         error: status === "succeeded" ? null : safeError,
         errorCode: typeof patch.errorCode === "string"
@@ -6300,8 +6267,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
         stdoutExcerpt: null,
         stderrExcerpt: null,
-      });
+      }, { publish: false });
     }
+
+    if (persisted.updated && persisted.run) {
+      try {
+        publishRunStatusUpdate(persisted.run);
+      } catch (err) {
+        logger.warn(
+          { err, runId, status },
+          "best-effort terminal heartbeat publication failed after persisted CAS",
+        );
+      }
+    }
+    return persisted;
+  }
+
+  function publishRunStatusUpdate(run: typeof heartbeatRuns.$inferSelect) {
+    if (isHeartbeatRunTerminalStatus(run.status)) {
+      clearHeartbeatRunRuntimeStatus(run.id);
+    }
+    publishLiveEvent({
+      companyId: run.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: run.id,
+        agentId: run.agentId,
+        status: run.status,
+        invocationSource: run.invocationSource,
+        triggerDetail: run.triggerDetail,
+        error: run.error ?? null,
+        errorCode: run.errorCode ?? null,
+        startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+        finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
+      },
+    });
+    publishRunLifecyclePluginEvent(run);
   }
 
   function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {

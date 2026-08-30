@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import postgres from "postgres";
 import { applyPendingMigrations, ensurePostgresDatabase } from "./client.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 
@@ -38,6 +40,92 @@ const DEFAULT_PAPERCLIP_EMBEDDED_POSTGRES_PORT = 54329;
 
 function getExternalTestDatabaseUrl(): string | null {
   return process.env.PAPERCLIP_TEST_DATABASE_URL?.trim() || null;
+}
+
+const EXPLICIT_TEST_DATABASE_NAME = /(^|[_-])(test|testing|ci|tmp|temp|ephemeral)([_-]|$)/i;
+
+export function validateExternalTestDatabaseUrl(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("PAPERCLIP_TEST_DATABASE_URL must be a valid PostgreSQL URL");
+  }
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+    throw new Error("PAPERCLIP_TEST_DATABASE_URL must use the postgres or postgresql protocol");
+  }
+  const databaseName = decodeURIComponent(parsed.pathname.replace(/^\//, ""));
+  if (!databaseName || databaseName.includes("/") || !EXPLICIT_TEST_DATABASE_NAME.test(databaseName)) {
+    throw new Error(
+      "PAPERCLIP_TEST_DATABASE_URL must name an unmistakable test database " +
+      "(for example paperclip_test); refusing to migrate a shared or production-looking destination",
+    );
+  }
+  return parsed;
+}
+
+function quoteDatabaseIdentifier(value: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/.test(value)) throw new Error("Unsafe generated test database name");
+  return `"${value}"`;
+}
+
+function databaseUrl(base: URL, databaseName: string): string {
+  const result = new URL(base.toString());
+  result.pathname = `/${databaseName}`;
+  return result.toString();
+}
+
+async function dropExternalTestDatabase(adminUrl: string, databaseName: string): Promise<void> {
+  const sql = postgres(adminUrl, { max: 1, onnotice: () => {} });
+  try {
+    const quotedDatabaseName = quoteDatabaseIdentifier(databaseName);
+    await sql.unsafe(`DROP DATABASE IF EXISTS ${quotedDatabaseName} WITH (FORCE)`);
+    const remaining = await sql<{ exists: boolean }[]>`
+      SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = ${databaseName}) AS exists
+    `;
+    if (remaining[0]?.exists) {
+      throw new Error("External PostgreSQL test database cleanup could not be verified");
+    }
+  } finally {
+    await sql.end();
+  }
+}
+
+async function startExternalPostgresTestDatabase(rawUrl: string): Promise<EmbeddedPostgresTestDatabase> {
+  const baseUrl = validateExternalTestDatabaseUrl(rawUrl);
+  const databaseName = `paperclip_test_${randomUUID().replaceAll("-", "")}`;
+  const adminUrl = baseUrl.toString();
+  const sql = postgres(adminUrl, { max: 1, onnotice: () => {} });
+  try {
+    await sql.unsafe(`CREATE DATABASE ${quoteDatabaseIdentifier(databaseName)}`);
+  } finally {
+    await sql.end();
+  }
+
+  const connectionString = databaseUrl(baseUrl, databaseName);
+  try {
+    await applyPendingMigrations(connectionString);
+  } catch (error) {
+    try {
+      await dropExternalTestDatabase(adminUrl, databaseName);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "External PostgreSQL test database migration failed and cleanup could not be verified",
+      );
+    }
+    throw error;
+  }
+
+  let cleaned = false;
+  return {
+    connectionString,
+    cleanup: async () => {
+      if (cleaned) return;
+      await dropExternalTestDatabase(adminUrl, databaseName);
+      cleaned = true;
+    },
+  };
 }
 
 function getReservedTestPorts(): Set<number> {
@@ -141,7 +229,11 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
 }
 
 export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgresTestSupport> {
-  if (getExternalTestDatabaseUrl()) return { supported: true };
+  const externalTestDatabaseUrl = getExternalTestDatabaseUrl();
+  if (externalTestDatabaseUrl) {
+    validateExternalTestDatabaseUrl(externalTestDatabaseUrl);
+    return { supported: true };
+  }
   if (!embeddedPostgresSupportPromise) {
     embeddedPostgresSupportPromise = probeEmbeddedPostgresSupport();
   }
@@ -153,11 +245,7 @@ export async function startEmbeddedPostgresTestDatabase(
 ): Promise<EmbeddedPostgresTestDatabase> {
   const externalTestDatabaseUrl = getExternalTestDatabaseUrl();
   if (externalTestDatabaseUrl) {
-    await applyPendingMigrations(externalTestDatabaseUrl);
-    return {
-      connectionString: externalTestDatabaseUrl,
-      cleanup: async () => {},
-    };
+    return startExternalPostgresTestDatabase(externalTestDatabaseUrl);
   }
 
   let dataDir: string | null = null;

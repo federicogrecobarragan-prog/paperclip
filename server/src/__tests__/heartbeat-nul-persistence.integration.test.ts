@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -10,6 +10,8 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueRelations,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -87,16 +89,36 @@ async function waitForPostTerminalState(
   return { runtimeState, sessions };
 }
 
+async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fn()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return fn();
+}
+
 describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let releaseBlockedFollowUps: (() => void) | null = null;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-nul-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
-  afterEach(() => {
+  afterEach(async () => {
+    releaseBlockedFollowUps?.();
+    releaseBlockedFollowUps = null;
+    await waitForCondition(async () => {
+      const active = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.status, ["queued", "running"]));
+      return active.length === 0;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 250));
     vi.clearAllMocks();
     vi.restoreAllMocks();
   });
@@ -122,7 +144,11 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
       status: "idle",
       adapterType: "http",
       adapterConfig: {},
-      runtimeConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          maxConcurrentRuns: 1,
+        },
+      },
       permissions: {},
     });
     return { companyId, agentId };
@@ -192,18 +218,23 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(sessions).toHaveLength(1);
   });
 
-  it("keeps a persisted terminal outcome authoritative when a later publication throws", async () => {
+  it("fails the full run when a known optional field is accessor-backed without executing it", async () => {
     const { agentId } = await seedAgent();
-    mockAdapterExecute.mockResolvedValueOnce({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      summary: "terminal persisted",
-      provider: "test",
-      model: "test-model",
-    });
-    vi.spyOn(activityLogService, "publishPluginDomainEvent").mockImplementation((event) => {
-      if (event.eventType === "agent.run.finished") throw new Error("simulated post-commit publication failure");
+    let getterCalls = 0;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const result: Record<string, unknown> = {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+      };
+      Object.defineProperty(result, "errorMessage", {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return null;
+        },
+      });
+      return result;
     });
     const heartbeat = heartbeatService(db);
 
@@ -213,11 +244,226 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     });
     expect(queued).toBeTruthy();
     const terminal = await waitForTerminalRun(heartbeat, queued!.id);
-    await heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 });
+    const [wakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+
+    expect(getterCalls).toBe(0);
+    expect(terminal?.status).toBe("failed");
+    expect(terminal?.error).toContain("errorMessage must be a data property");
+    expect(wakeup?.status).toBe("failed");
+    expect(wakeup?.status).not.toBe("completed");
+  });
+
+  it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization when publication throws", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const dependentAgentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const dependentIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: dependentAgentId,
+      companyId,
+      name: "DependentAdapter",
+      role: "test",
+      status: "idle",
+      adapterType: "http",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Terminal publication blocker",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+      },
+      {
+        id: dependentIssueId,
+        companyId,
+        title: "Terminal publication dependent",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: dependentAgentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: dependentIssueId,
+      type: "blocks",
+    });
+
+    let firstRunStarted!: () => void;
+    const firstRunStartedPromise = new Promise<void>((resolve) => {
+      firstRunStarted = resolve;
+    });
+    let finishFirstRun!: () => void;
+    const firstRunCanFinish = new Promise<void>((resolve) => {
+      finishFirstRun = resolve;
+    });
+    let finishFollowUpRuns!: () => void;
+    const followUpRunsCanFinish = new Promise<void>((resolve) => {
+      finishFollowUpRuns = resolve;
+    });
+    releaseBlockedFollowUps = finishFollowUpRuns;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      firstRunStarted();
+      await firstRunCanFinish;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "terminal persisted",
+        provider: "test",
+        model: "test-model",
+        sessionId: "terminal-session",
+      };
+    });
+    mockAdapterExecute.mockImplementation(async () => {
+      await followUpRunsCanFinish;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "follow-up completed",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    vi.spyOn(activityLogService, "publishPluginDomainEvent").mockImplementation((event) => {
+      if (event.eventType === "agent.run.finished") throw new Error("simulated post-commit publication failure");
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockerIssueId },
+      contextSnapshot: {
+        issueId: blockerIssueId,
+        taskKey: `issue:${blockerIssueId}`,
+        wakeReason: "issue_assigned",
+      },
+    });
+    expect(queued).toBeTruthy();
+    await firstRunStartedPromise;
+
+    const deferredWakeupId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId: blockerIssueId,
+        _paperclipWakeContext: {
+          issueId: blockerIssueId,
+          taskKey: `issue:${blockerIssueId}`,
+          wakeReason: "issue_commented",
+        },
+      },
+      status: "deferred_issue_execution",
+    });
+    const deferredRecorded = await waitForCondition(async () => {
+      const row = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeupId))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "deferred_issue_execution";
+    });
+    expect(deferredRecorded).toBe(true);
+
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issues.id, blockerIssueId));
+    finishFirstRun();
+
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    const postTerminalState = await waitForPostTerminalState(db, agentId, queued!.id);
+    const finalizedSideEffects = await waitForCondition(async () => {
+      const [originalWakeup] = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.runId, queued!.id));
+      const promotedWakeup = await db
+        .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "issue_execution_promoted"),
+        ))
+        .then((rows) => rows[0] ?? null);
+      const dependentWakeup = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.agentId, dependentAgentId),
+          eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+        ))
+        .then((rows) => rows[0] ?? null);
+      return originalWakeup?.status === "completed" &&
+        Boolean(promotedWakeup?.runId) &&
+        Boolean(dependentWakeup);
+    });
+    expect(finalizedSideEffects).toBe(true);
+
     const reconciled = await heartbeat.getRun(queued!.id);
+    const [originalWakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+    const promotedWakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "issue_execution_promoted"),
+      ))
+      .then((rows) => rows[0]);
+    const [sourceIssueWhilePromoted] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, blockerIssueId));
+    const promotedRun = promotedWakeup?.runId
+      ? await heartbeat.getRun(promotedWakeup.runId)
+      : null;
 
     expect(terminal?.status).toBe("succeeded");
     expect(reconciled?.status).toBe("succeeded");
     expect(reconciled?.errorCode).not.toBe("process_lost");
+    expect(originalWakeup?.status).toBe("completed");
+    expect(promotedWakeup?.runId).toBeTruthy();
+    expect(promotedWakeup?.runId).not.toBe(queued!.id);
+    expect(sourceIssueWhilePromoted?.checkoutRunId).toBeNull();
+    expect(sourceIssueWhilePromoted?.executionRunId).toBeNull();
+    expect(promotedRun?.status).toBe("cancelled");
+    expect(promotedRun?.errorCode).toBe("issue_terminal_status");
+    expect(postTerminalState.runtimeState?.lastRunId).toBe(queued!.id);
+    expect(postTerminalState.sessions.some((session) => session.lastRunId === queued!.id)).toBe(true);
+
+    finishFollowUpRuns();
+    releaseBlockedFollowUps = null;
+    const followUpsFinished = await waitForCondition(async () => {
+      const active = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.status, ["queued", "running"]));
+      return active.length === 0;
+    });
+    expect(followUpsFinished).toBe(true);
+    const [sourceIssueAfterPromotion] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, blockerIssueId));
+    expect(sourceIssueAfterPromotion?.executionRunId).toBeNull();
   });
 });
