@@ -1785,8 +1785,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             consumerId: agentId,
             configPath: "env.UNBOUND_API_KEY",
             envKey: "UNBOUND_API_KEY",
-            secretId: secret.id,
-            secretName,
+            // The persistence boundary deliberately redacts secret metadata;
+            // operators still receive the actionable binding path above.
+            secretId: "***REDACTED***",
+            secretName: "***REDACTED***",
           },
         ],
       },
