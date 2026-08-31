@@ -96,6 +96,7 @@ vi.mock("../adapters/index.ts", async () => {
 
 import {
   heartbeatService,
+  isHeartbeatRunTrackedInMemory,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
 import { secretService } from "../services/secrets.ts";
@@ -639,6 +640,128 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     releaseAdapter();
     const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
     expect(settledRun?.status).toBe("succeeded");
+  });
+
+  it("reaps a dead local pid even while stale in-memory handles claim the execution", async () => {
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async (context: {
+        runId: string;
+        onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+      }) => {
+        const deadPid = 999_999_999;
+        await context.onSpawn?.({
+          pid: deadPid,
+          processGroupId: null,
+          startedAt: new Date().toISOString(),
+        });
+        runningProcesses.set(context.runId, {
+          child: { pid: deadPid } as ChildProcess,
+          graceSec: 1,
+          processGroupId: null,
+        });
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Late adapter completion must not overwrite process_lost.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      runStatus: "queued",
+      processLossRetryCount: 1,
+      includeIssue: false,
+    });
+    const executorHeartbeat = heartbeatService(db);
+    const reaperHeartbeat = heartbeatService(db);
+
+    await executorHeartbeat.resumeQueuedRuns();
+    await adapterStarted;
+    try {
+      expect(isHeartbeatRunTrackedInMemory(runId)).toBe(true);
+
+      // A recent updatedAt must not protect a definitively dead recorded pid.
+      await db
+        .update(heartbeatRuns)
+        .set({ updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const result = await reaperHeartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60_000 });
+      expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+      const reapedRun = await reaperHeartbeat.getRun(runId);
+      expect(reapedRun?.status).toBe("failed");
+      expect(reapedRun?.errorCode).toBe("process_lost");
+      expect(reapedRun?.finishedAt).toBeTruthy();
+      expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
+    } finally {
+      releaseAdapter?.();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect((await executorHeartbeat.getRun(runId))?.errorCode).toBe("process_lost");
+  });
+
+  it("persists a codex inactivity monitor failure and clears both in-memory trackers", async () => {
+    mockAdapterExecute.mockImplementationOnce(async (context: { runId: string }) => {
+      runningProcesses.set(context.runId, {
+        child: { pid: 999_999_999 } as ChildProcess,
+        graceSec: 1,
+        processGroupId: null,
+      });
+      return {
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: false,
+        errorMessage: "monitor: no codex output for 7m 0s",
+        errorCode: "codex_output_inactivity_monitor",
+        summary: null,
+        provider: "openai",
+        model: "gpt-5",
+        resultJson: {
+          outputInactivityMonitor: {
+            kind: "output_inactivity",
+            timeoutMs: 420_000,
+            elapsedMsSinceLastEvent: 420_005,
+            terminationSignal: "SIGTERM",
+          },
+        },
+      };
+    });
+
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      runStatus: "queued",
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const terminalRun = await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    expect(terminalRun?.status).toBe("failed");
+    expect(terminalRun?.errorCode).toBe("codex_output_inactivity_monitor");
+    expect(terminalRun?.error).toBe("monitor: no codex output for 7m 0s");
+    expect(terminalRun?.finishedAt).toBeTruthy();
+    expect(terminalRun?.signal).toBe("SIGTERM");
+    expect(terminalRun?.resultJson).toMatchObject({
+      outputInactivityMonitor: {
+        kind: "output_inactivity",
+        timeoutMs: 420_000,
+      },
+    });
+    expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
   });
 
   async function seedStrandedIssueFixture(input: {

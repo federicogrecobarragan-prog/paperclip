@@ -2,7 +2,44 @@ import { describe, expect, it } from "vitest";
 import {
   isZombieRun,
   filterZombieCoalesceTarget,
+  isTrackedDeadLocalProcess,
 } from "../services/heartbeat.ts";
+
+describe("isTrackedDeadLocalProcess", () => {
+  it("only bypasses reaper liveness gates for a tracked local run with a valid dead pid", () => {
+    expect(isTrackedDeadLocalProcess({
+      trackedInMemory: true,
+      tracksLocalChild: true,
+      processPid: 12345,
+      processPidAlive: false,
+    })).toBe(true);
+
+    expect(isTrackedDeadLocalProcess({
+      trackedInMemory: true,
+      tracksLocalChild: true,
+      processPid: 12345,
+      processPidAlive: true,
+    })).toBe(false);
+    expect(isTrackedDeadLocalProcess({
+      trackedInMemory: false,
+      tracksLocalChild: true,
+      processPid: 12345,
+      processPidAlive: false,
+    })).toBe(false);
+    expect(isTrackedDeadLocalProcess({
+      trackedInMemory: true,
+      tracksLocalChild: false,
+      processPid: 12345,
+      processPidAlive: false,
+    })).toBe(false);
+    expect(isTrackedDeadLocalProcess({
+      trackedInMemory: true,
+      tracksLocalChild: true,
+      processPid: null,
+      processPidAlive: false,
+    })).toBe(false);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // isZombieRun — the core predicate

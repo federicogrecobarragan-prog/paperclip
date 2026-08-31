@@ -882,6 +882,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timeoutSec,
           graceSec,
           onSpawn: wrappedOnSpawn,
+          // A killed Codex parent can leave inherited stdio handles open in a
+          // descendant. Bound the wait for `close` so the monitor result still
+          // reaches heartbeat finalization after SIGKILL has had its grace.
+          postExitCloseTimeoutMs: CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS + 250,
           onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: async (stream, chunk) => {
             if (stream === "stdout") {
