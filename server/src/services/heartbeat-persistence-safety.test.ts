@@ -243,6 +243,68 @@ describe("heartbeat persistence safety", () => {
     }
   });
 
+  it("rejects invalid usage, question, and runtime-service contracts recursively", () => {
+    const invalidCases: Array<[string, Record<string, unknown>]> = [
+      ["usage missing required totals", { usage: {} }],
+      ["usage negative input", { usage: { inputTokens: -1, outputTokens: 0 } }],
+      ["usage non-finite output", { usage: { inputTokens: 0, outputTokens: Number.NaN } }],
+      ["question missing prompt and choices", { question: {} }],
+      ["question choices is not an array", { question: { prompt: "Continue?", choices: {} } }],
+      ["question choice missing label", {
+        question: { prompt: "Continue?", choices: [{ key: "yes" }] },
+      }],
+      ["runtime service missing serviceName", { runtimeServices: [{}] }],
+      ["runtime service has invalid status", {
+        runtimeServices: [{ serviceName: "preview", status: "ready" }],
+      }],
+      ["runtime service has invalid port", {
+        runtimeServices: [{ serviceName: "preview", port: -1 }],
+      }],
+    ];
+
+    for (const [label, extra] of invalidCases) {
+      expect(() => normalizeAdapterExecutionResultForPersistence({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        ...extra,
+      }), label).toThrow(InvalidAdapterExecutionResultError);
+    }
+  });
+
+  it("rejects nested contract accessors without executing them", () => {
+    for (const [label, build] of [
+      ["usage", (getter: () => unknown) => {
+        const usage = { outputTokens: 0 } as Record<string, unknown>;
+        Object.defineProperty(usage, "inputTokens", { enumerable: true, get: getter });
+        return { usage };
+      }],
+      ["question choice", (getter: () => unknown) => {
+        const choice = { key: "yes" } as Record<string, unknown>;
+        Object.defineProperty(choice, "label", { enumerable: true, get: getter });
+        return { question: { prompt: "Continue?", choices: [choice] } };
+      }],
+      ["runtime service", (getter: () => unknown) => {
+        const service = { serviceName: "preview" } as Record<string, unknown>;
+        Object.defineProperty(service, "status", { enumerable: true, get: getter });
+        return { runtimeServices: [service] };
+      }],
+    ] as const) {
+      let getterCalls = 0;
+      const extra = build(() => {
+        getterCalls += 1;
+        return "must not run";
+      });
+      expect(() => normalizeAdapterExecutionResultForPersistence({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        ...extra,
+      }), label).toThrow(InvalidAdapterExecutionResultError);
+      expect(getterCalls, label).toBe(0);
+    }
+  });
+
   it("strictly rejects missing, accessor-backed, and wrongly typed required fields", () => {
     let getterCalls = 0;
     const accessorBacked = { signal: null, timedOut: false } as Record<string, unknown>;
@@ -290,10 +352,10 @@ describe("heartbeat persistence safety", () => {
       signal: null,
       timedOut: false,
       errorMeta: { fanOut },
-      usage: { fanOut },
+      usage: { inputTokens: 1, outputTokens: 2 },
       resultJson: { fanOut },
       sessionParams: { fanOut },
-      question: { fanOut },
+      question: { prompt: "Continue?", choices: [{ key: "yes", label: "Yes" }] },
     });
     const encoded = JSON.stringify(result);
     const countSlots = (value: unknown): number => {
@@ -310,9 +372,68 @@ describe("heartbeat persistence safety", () => {
     expect(encoded).toContain("[Shared reference]");
     expect(countSlots(result)).toBeLessThanOrEqual(HEARTBEAT_PERSISTENCE_LIMITS.maxOutputSlots);
     expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(
-      HEARTBEAT_PERSISTENCE_LIMITS.maxOutputBytes +
-      HEARTBEAT_PERSISTENCE_LIMITS.maxOutputSlots * 16,
+      HEARTBEAT_PERSISTENCE_LIMITS.maxOutputBytes,
     );
+  });
+
+  it("budgets serialized JSON bytes including distributed escapes and separators", () => {
+    const escapedChunks = Array.from(
+      { length: 16 },
+      () => "\u0001\"\\".repeat(80_000),
+    );
+
+    const result = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      resultJson: { escapedChunks },
+    });
+    const encodedBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+
+    expect(encodedBytes).toBeLessThanOrEqual(HEARTBEAT_PERSISTENCE_LIMITS.maxOutputBytes);
+    expect(JSON.stringify(result)).not.toContain("\u0000");
+  });
+
+  it("caps pre-cutoff work and allocation for huge strings and wide objects", () => {
+    const hugeString = "safe-text-".repeat(3_000_000);
+    const wide = Object.create(null) as Record<string, unknown>;
+    for (let index = 0; index < 100_000; index += 1) wide[`key-${index}`] = index;
+    const heapBefore = process.memoryUsage().heapUsed;
+    const startedAt = performance.now();
+
+    const result = sanitizeHeartbeatPersistenceRecord({ hugeString, wide });
+
+    const elapsedMs = performance.now() - startedAt;
+    const allocatedBytes = Math.max(0, process.memoryUsage().heapUsed - heapBefore);
+    expect(elapsedMs).toBeLessThan(2_000);
+    expect(allocatedBytes).toBeLessThan(128 * 1024 * 1024);
+    expect(Object.keys(result.wide as Record<string, unknown>).length)
+      .toBeLessThanOrEqual(HEARTBEAT_PERSISTENCE_LIMITS.maxObjectKeys);
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8"))
+      .toBeLessThanOrEqual(HEARTBEAT_PERSISTENCE_LIMITS.maxOutputBytes);
+  });
+
+  it("redacts synthetic secrets structurally and textually before persistence", () => {
+    const syntheticSentinel = "sk-syntheticfixture123456789";
+    const result = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: `token=${syntheticSentinel}`,
+      resultJson: {
+        apiKey: syntheticSentinel,
+        nested: { text: `Authorization: Bearer ${syntheticSentinel}` },
+        commandArgs: ["--api-key", syntheticSentinel, "safe-next"],
+      },
+    });
+    const encoded = JSON.stringify(result);
+
+    expect(encoded).not.toContain(syntheticSentinel);
+    expect(encoded).toContain("***REDACTED***");
+    expect(result.resultJson).toMatchObject({
+      apiKey: "***REDACTED***",
+      commandArgs: ["--api-key", "***REDACTED***", "safe-next"],
+    });
   });
 
   it("sanitizes standalone text and omits non-JSON behavior", () => {

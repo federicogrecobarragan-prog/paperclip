@@ -12,6 +12,7 @@ import {
   heartbeatRuns,
   issueRelations,
   issues,
+  workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -254,6 +255,80 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(terminal?.error).toContain("errorMessage must be a data property");
     expect(wakeup?.status).toBe("failed");
     expect(wakeup?.status).not.toBe("completed");
+  });
+
+  it("fails closed on an invalid runtime-service report and fabricates no service", async () => {
+    const { companyId, agentId } = await seedAgent();
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      runtimeServices: [{}],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+    });
+    expect(queued).toBeTruthy();
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    const persistedServices = await db
+      .select()
+      .from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.companyId, companyId));
+
+    expect(terminal?.status).toBe("failed");
+    expect(terminal?.status).not.toBe("succeeded");
+    expect(terminal?.error).toContain("runtimeServices[0].serviceName is required");
+    expect(persistedServices).toHaveLength(0);
+  });
+
+  it("redacts synthetic secrets from the row, event, snapshot, wakeup, and log", async () => {
+    const { agentId } = await seedAgent();
+    const syntheticSentinel = "sk-syntheticfixture123456789";
+    mockAdapterExecute.mockImplementationOnce(async (context: {
+      onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    }) => {
+      await context.onLog("stderr", `Authorization: Bearer ${syntheticSentinel}`);
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: `token=${syntheticSentinel}`,
+        resultJson: {
+          apiKey: syntheticSentinel,
+          detail: `Authorization: Bearer ${syntheticSentinel}`,
+        },
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      payload: { apiKey: syntheticSentinel },
+      contextSnapshot: {
+        nested: { authorization: syntheticSentinel },
+        note: `token=${syntheticSentinel}`,
+      },
+    });
+    expect(queued).toBeTruthy();
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    const [wakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, queued!.id));
+    const log = await heartbeat.readLog(queued!.id);
+    const persisted = JSON.stringify({ terminal, wakeup, events, log });
+
+    expect(terminal?.status).toBe("failed");
+    expect(persisted).not.toContain(syntheticSentinel);
+    expect(persisted).toContain("***REDACTED***");
   });
 
   it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization when publication throws", async () => {
