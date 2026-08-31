@@ -11798,9 +11798,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ).catch(() => undefined);
         return;
       }
+      const failureRedactionOptions = await getCurrentUserRedactionOptions();
       const message = sanitizeHeartbeatFailureMessage(
         err,
-        currentUserRedactionOptions,
+        failureRedactionOptions,
         "Adapter execution failed",
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
@@ -11818,7 +11819,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             {
               err: sanitizeHeartbeatFailureMessage(
                 finalizeErr,
-                currentUserRedactionOptions,
+                failureRedactionOptions,
                 "Run log finalization failed",
               ),
               runId,
@@ -11836,7 +11837,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           {
             err: sanitizeHeartbeatFailureMessage(
               flushErr,
-              currentUserRedactionOptions,
+              failureRedactionOptions,
               "Run output progress flush failed",
             ),
             runId,

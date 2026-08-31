@@ -76,6 +76,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Typecheck touched packages
+        run: |
+          pnpm --filter @paperclipai/db typecheck
+          pnpm --filter @paperclipai/adapter-codex-local typecheck
+          pnpm --filter @paperclipai/server typecheck
+
       # JUnit preserves the exact number of test cases. A skipped suite would
       # otherwise let Vitest exit successfully, so reject skips and zero-test
       # reports after every required suite (fail closed).
