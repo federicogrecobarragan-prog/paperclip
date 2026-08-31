@@ -4,7 +4,15 @@ import { workspaceOperations } from "@paperclipai/db";
 import type { WorkspaceOperation, WorkspaceOperationPhase, WorkspaceOperationStatus } from "@paperclipai/shared";
 import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
 import { notFound } from "../errors.js";
-import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import {
+  redactCurrentUserText,
+  redactCurrentUserValue,
+  type CurrentUserRedactionOptions,
+} from "../log-redaction.js";
+import {
+  sanitizeHeartbeatPersistenceText,
+  sanitizeHeartbeatPersistenceValue,
+} from "./heartbeat-persistence-safety.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 
@@ -50,6 +58,26 @@ function combineMetadata(
     ...(base ?? {}),
     ...(patch ?? {}),
   };
+}
+
+export function sanitizeWorkspaceOperationTextForPersistence(
+  value: string,
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+) {
+  return sanitizeHeartbeatPersistenceText(
+    redactCurrentUserText(value, currentUserRedactionOptions),
+  );
+}
+
+export function sanitizeWorkspaceOperationMetadataForPersistence(
+  value: Record<string, unknown> | null | undefined,
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+) {
+  const secretRedacted = sanitizeHeartbeatPersistenceValue(value ?? null);
+  return redactCurrentUserValue(
+    secretRedacted,
+    currentUserRedactionOptions,
+  ) as Record<string, unknown> | null;
 }
 
 export interface WorkspaceOperationRecorder {
@@ -112,6 +140,10 @@ export function workspaceOperationService(db: Db) {
           const currentUserRedactionOptions = {
             enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
           };
+          const sanitizeText = (value: string) =>
+            sanitizeWorkspaceOperationTextForPersistence(value, currentUserRedactionOptions);
+          const sanitizeMetadata = (value: Record<string, unknown> | null | undefined) =>
+            sanitizeWorkspaceOperationMetadataForPersistence(value, currentUserRedactionOptions);
           const startedAt = new Date();
           const id = randomUUID();
           const handle = await logStore.begin({
@@ -123,7 +155,7 @@ export function workspaceOperationService(db: Db) {
           let stderrExcerpt = "";
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
-            const sanitizedChunk = redactCurrentUserText(chunk, currentUserRedactionOptions);
+            const sanitizedChunk = sanitizeText(chunk);
             if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
             if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
             await logStore.append(handle, {
@@ -140,15 +172,12 @@ export function workspaceOperationService(db: Db) {
             heartbeatRunId: input.heartbeatRunId ?? null,
             issueId: input.issueId ?? null,
             phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
+            command: recordInput.command == null ? null : sanitizeText(recordInput.command),
+            cwd: recordInput.cwd == null ? null : sanitizeText(recordInput.cwd),
             status: "running",
             logStore: handle.store,
             logRef: handle.logRef,
-            metadata: redactCurrentUserValue(
-              recordInput.metadata ?? null,
-              currentUserRedactionOptions,
-            ) as Record<string, unknown> | null,
+            metadata: sanitizeMetadata(recordInput.metadata),
             startedAt,
           });
           createdIds.push(id);
@@ -171,10 +200,7 @@ export function workspaceOperationService(db: Db) {
                 logBytes: finalized.bytes,
                 logSha256: finalized.sha256,
                 logCompressed: finalized.compressed,
-                metadata: redactCurrentUserValue(
-                  combineMetadata(recordInput.metadata, result.metadata),
-                  currentUserRedactionOptions,
-                ) as Record<string, unknown> | null,
+                metadata: sanitizeMetadata(combineMetadata(recordInput.metadata, result.metadata)),
                 finishedAt,
                 updatedAt: finishedAt,
               })

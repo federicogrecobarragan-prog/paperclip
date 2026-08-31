@@ -13,11 +13,14 @@ on:
       - "server/src/services/heartbeat-persistence-safety-postgres.test.ts"
       - "server/src/services/heartbeat-persistence-safety.ts"
       - "server/src/services/heartbeat.ts"
+      - "server/src/services/workspace-operations.test.ts"
+      - "server/src/services/workspace-operations.ts"
       - "packages/adapter-utils/src/execution-target.ts"
       - "packages/adapter-utils/src/server-utils.test.ts"
       - "packages/adapter-utils/src/server-utils.ts"
       - "packages/adapters/codex-local/src/server/execute.ts"
       - "packages/adapters/codex-local/src/server/output-inactivity-monitor.integration.test.ts"
+      - "packages/adapters/codex-local/src/server/output-inactivity-monitor.ts"
       - "packages/db/src/test-embedded-postgres.test.ts"
       - "packages/db/src/test-embedded-postgres.ts"
       - "packages/db/src/embedded-postgres-native.ts"
@@ -76,7 +79,7 @@ jobs:
       # JUnit preserves the exact number of test cases. A skipped suite would
       # otherwise let Vitest exit successfully, so reject skips and zero-test
       # reports after every required suite (fail closed).
-      - name: Run PostgreSQL persistence suites (fail closed on skips)
+      - name: Run persistence and LAC-1264 recovery suites (fail closed on skips)
         shell: bash
         run: |
           set -euo pipefail
@@ -119,3 +122,4 @@ jobs:
           run_suite @paperclipai/server server/src/services/heartbeat-persistence-safety.test.ts
           run_suite @paperclipai/server server/src/services/heartbeat-persistence-safety-postgres.test.ts
           run_suite @paperclipai/db packages/db/src/test-embedded-postgres.test.ts
+          run_suite @paperclipai/server server/src/services/workspace-operations.test.ts

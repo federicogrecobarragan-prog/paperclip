@@ -20,6 +20,7 @@ describe("external PostgreSQL test database safety", () => {
     "postgres://paperclip:secret@localhost/paperclip",
     "postgres://paperclip:secret@localhost/production",
     "postgres://paperclip:secret@localhost/contest",
+    "postgres://paperclip:secret@localhost/paperclip_test",
     "postgres://paperclip:secret@localhost/paperclip_test%2Fproduction",
     "postgres://paperclip:secret@db.production.internal/paperclip_test",
     "postgres://paperclip:secret@localhost.example.com/paperclip_test",
@@ -30,28 +31,23 @@ describe("external PostgreSQL test database safety", () => {
   });
 
   it.each([
-    "postgres://paperclip:secret@localhost/paperclip_test",
-    "postgresql://paperclip:secret@localhost/paperclip-ci",
-    "postgres://paperclip:secret@localhost/test",
-    "postgres://paperclip:secret@localhost/ephemeral_paperclip",
+    "postgres://paperclip:secret@127.0.0.1/paperclip_test",
+    "postgresql://paperclip:secret@127.0.0.1/paperclip-ci",
+    "postgres://paperclip:secret@127.0.0.1/test",
+    "postgres://paperclip:secret@127.0.0.1/ephemeral_paperclip",
     "postgres://paperclip:secret@[::1]/paperclip_testing",
   ])("accepts an unmistakable test control database: %s", (url) => {
     expect(validateExternalTestDatabaseUrl(url)).toBeInstanceOf(URL);
   });
 
-  it("accepts only an exact additional hostname configured by the test runner", () => {
-    vi.stubEnv("PAPERCLIP_TEST_DATABASE_ALLOWED_HOSTS", "postgres-ci.internal");
+  it("rejects a remote hostname even when the test runner tries to allow it", () => {
+    vi.stubEnv("PAPERCLIP_TEST_DATABASE_ALLOWED_HOSTS", "db.production.internal");
 
-    expect(
-      validateExternalTestDatabaseUrl(
-        "postgres://paperclip:secret@postgres-ci.internal/paperclip_test",
-      ),
-    ).toBeInstanceOf(URL);
     expect(() =>
       validateExternalTestDatabaseUrl(
-        "postgres://paperclip:secret@postgres-ci.internal.example.com/paperclip_test",
+        "postgres://paperclip:secret@db.production.internal/paperclip_test",
       ),
-    ).toThrow(/not explicitly allowed/);
+    ).toThrow(/numeric loopback host/);
   });
 });
 

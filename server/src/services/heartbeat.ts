@@ -358,6 +358,27 @@ export class ConfigurationIncompleteFailure extends Error {
   }
 }
 
+export function sanitizeHeartbeatFailureMessage(
+  error: unknown,
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+  fallback = "Heartbeat execution failed",
+) {
+  if (!(error instanceof WorkspaceValidationFailure) && !(error instanceof ConfigurationIncompleteFailure)) {
+    return sanitizeHeartbeatPersistenceText(fallback);
+  }
+
+  let rawMessage = "Unknown heartbeat failure";
+  try {
+    rawMessage = error.message;
+  } catch {
+    // A hostile error subclass may reject message access. Keep the persistence
+    // and logger boundary deterministic and secret-free.
+  }
+  return sanitizeHeartbeatPersistenceText(
+    redactCurrentUserText(rawMessage, currentUserRedactionOptions),
+  );
+}
+
 function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallbackMode {
   if (attempt <= 1) return "same_session";
   if (attempt === 2) return "safer_invocation";
@@ -1234,21 +1255,8 @@ async function ensureManagedProjectWorkspace(input: {
   }
 }
 
-type WorkspaceValidationFailureLike = WorkspaceValidationFailure | {
-  code: typeof WORKSPACE_VALIDATION_FAILURE_CODE;
-  resultJson: Record<string, unknown>;
-};
-
-function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailureLike {
-  if (error instanceof WorkspaceValidationFailure) return true;
-  const maybe = error as { code?: unknown; resultJson?: unknown } | null;
-  return Boolean(
-    maybe &&
-      maybe.code === WORKSPACE_VALIDATION_FAILURE_CODE &&
-      maybe.resultJson &&
-      typeof maybe.resultJson === "object" &&
-      !Array.isArray(maybe.resultJson),
-  );
+function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailure {
+  return error instanceof WorkspaceValidationFailure;
 }
 
 function isWorkspaceValidationFailedRun(
@@ -4021,6 +4029,22 @@ function isSameTaskScope(left: string | null, right: string | null) {
 
 function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
+}
+
+export function heartbeatRunTracksHostLocalChildProcess(input: {
+  adapterType: string;
+  contextSnapshot: unknown;
+}) {
+  if (!isTrackedLocalChildProcessAdapter(input.adapterType)) return false;
+
+  const context = parseObject(input.contextSnapshot);
+  const environment = parseObject(context.paperclipEnvironment);
+  const driver = readNonEmptyString(environment.driver);
+
+  // Only an explicitly realized `local` environment owns a PID in this host's
+  // process namespace. Missing/legacy context fails closed: SSH, sandbox,
+  // plugin, and unclassified PIDs must never be probed with process.kill.
+  return driver === "local";
 }
 
 function isHeartbeatRunTerminalStatus(
@@ -9335,7 +9359,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const tracksLocalChild = heartbeatRunTracksHostLocalChildProcess({
+        adapterType,
+        contextSnapshot: run.contextSnapshot,
+      });
       const hasRecordedProcessPid =
         tracksLocalChild &&
         typeof run.processPid === "number" &&
@@ -11350,11 +11377,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and surface the original error to the caller.
         try {
           await recordWorkspaceFinalize("failed", {
-            errorMessage: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
+            errorMessage: sanitizeHeartbeatFailureMessage(
+              adapterErr,
+              currentUserRedactionOptions,
+              "Adapter execution failed",
+            ),
           });
         } catch (recordErr) {
           logger.warn(
-            { err: recordErr, runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
+            {
+              err: sanitizeHeartbeatFailureMessage(
+                recordErr,
+                currentUserRedactionOptions,
+                "Workspace finalize recording failed",
+              ),
+              runId: run.id,
+              executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+            },
             "failed to record workspace_finalize=failed operation; dependents may remain gated",
           );
         }
@@ -11754,22 +11793,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ).catch(() => undefined);
         return;
       }
-      const message = redactCurrentUserText(
-        err instanceof Error ? err.message : "Unknown adapter failure",
-        await getCurrentUserRedactionOptions(),
+      const message = sanitizeHeartbeatFailureMessage(
+        err,
+        currentUserRedactionOptions,
+        "Adapter execution failed",
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
       const configurationIncompleteFailure = isConfigurationIncompleteFailure(err) ? err : null;
       const failureErrorCode =
         workspaceValidationFailure?.code ?? configurationIncompleteFailure?.code ?? "adapter_failed";
-      logger.error({ err, runId }, "heartbeat execution failed");
+      logger.error({ err: message, runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
         try {
           logSummary = await runLogStore.finalize(handle);
         } catch (finalizeErr) {
-          logger.warn({ err: finalizeErr, runId }, "failed to finalize run log after error");
+          logger.warn(
+            {
+              err: sanitizeHeartbeatFailureMessage(
+                finalizeErr,
+                currentUserRedactionOptions,
+                "Run log finalization failed",
+              ),
+              runId,
+            },
+            "failed to finalize run log after error",
+          );
         }
       }
       const finalLogBytes = logSummary?.bytes;
@@ -11777,7 +11827,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outputProgressState.pending.bytes = finalLogBytes;
       }
       await flushOutputProgress({ force: true }).catch((flushErr) => {
-        logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
+        logger.warn(
+          {
+            err: sanitizeHeartbeatFailureMessage(
+              flushErr,
+              currentUserRedactionOptions,
+              "Run output progress flush failed",
+            ),
+            runId,
+          },
+          "failed to flush run output progress after error",
+        );
       });
 
       const failedRunWrite = await setTerminalRunStatusIfRunning(run.id, "failed", {
@@ -11859,9 +11919,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
-          const message = redactCurrentUserText(
-            outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
-            await getCurrentUserRedactionOptions(),
+          const setupFailureRedactionOptions = await getCurrentUserRedactionOptions();
+          const message = sanitizeHeartbeatFailureMessage(
+            outerErr,
+            setupFailureRedactionOptions,
+            "Heartbeat setup failed",
           );
           // A missing secret/env binding is a known pre-dispatch configuration gap,
           // not an opaque setup crash. Surface it with its own errorCode so the
@@ -11870,7 +11932,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const configurationIncompleteSetupFailure = isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
           const setupFailureErrorCode =
             workspaceValidationSetupFailure?.code ?? configurationIncompleteSetupFailure?.code ?? "setup_failed";
-          logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          logger.error({ err: message, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           const setupFailureWrite = await setTerminalRunStatusIfRunning(runId, "failed", {
             error: message,

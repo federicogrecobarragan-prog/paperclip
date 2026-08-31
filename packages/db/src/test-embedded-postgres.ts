@@ -41,7 +41,7 @@ let embeddedPostgresSupportPromise: Promise<EmbeddedPostgresTestSupport> | null 
 const DEFAULT_PAPERCLIP_EMBEDDED_POSTGRES_PORT = 54329;
 const DEFAULT_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS = 10_000;
 const DEFAULT_EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 2_000;
-const DEFAULT_EXTERNAL_TEST_DATABASE_HOSTS = ["localhost", "127.0.0.1", "::1"];
+const EXTERNAL_TEST_DATABASE_LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const execFileAsync = promisify(execFile);
 
 function getExternalTestDatabaseUrl(): string | null {
@@ -52,17 +52,6 @@ const EXPLICIT_TEST_DATABASE_NAME = /(^|[_-])(test|testing|ci|tmp|temp|ephemeral
 
 function normalizeDatabaseHostname(hostname: string): string {
   return hostname.toLowerCase().replace(/^\[|\]$/g, "");
-}
-
-function getAllowedExternalTestDatabaseHosts(): Set<string> {
-  return new Set(
-    [
-      ...DEFAULT_EXTERNAL_TEST_DATABASE_HOSTS,
-      ...String(process.env.PAPERCLIP_TEST_DATABASE_ALLOWED_HOSTS ?? "").split(","),
-    ]
-      .map((hostname) => normalizeDatabaseHostname(hostname.trim()))
-      .filter(Boolean),
-  );
 }
 
 export function validateExternalTestDatabaseUrl(rawUrl: string): URL {
@@ -76,10 +65,10 @@ export function validateExternalTestDatabaseUrl(rawUrl: string): URL {
     throw new Error("PAPERCLIP_TEST_DATABASE_URL must use the postgres or postgresql protocol");
   }
   const hostname = normalizeDatabaseHostname(parsed.hostname);
-  if (!getAllowedExternalTestDatabaseHosts().has(hostname)) {
+  if (!EXTERNAL_TEST_DATABASE_LOOPBACK_HOSTS.has(hostname)) {
     throw new Error(
-      `PAPERCLIP_TEST_DATABASE_URL host "${parsed.hostname}" is not explicitly allowed; ` +
-      "use a loopback host or add the exact hostname to PAPERCLIP_TEST_DATABASE_ALLOWED_HOSTS",
+      "PAPERCLIP_TEST_DATABASE_URL must use a numeric loopback host " +
+      "(127.0.0.1 or ::1); refusing any configurable or remote destination",
     );
   }
   const databaseName = decodeURIComponent(parsed.pathname.replace(/^\//, ""));

@@ -19,7 +19,10 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
     "kills a codex child that goes silent after one event and surfaces a monitor failure",
     async () => {
       const runId = `monitor-integration-${Date.now()}`;
-      const timeoutMs = 250;
+      // Leave enough room for a cold Windows process spawn before asserting
+      // the post-event inactivity path. This stays far below the production
+      // default while avoiding a pre-first-event race on slower hosts.
+      const timeoutMs = 2_000;
       const logs: Array<{ stream: string; chunk: string }> = [];
       let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
       let monitorFired = false;

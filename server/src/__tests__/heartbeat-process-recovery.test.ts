@@ -463,6 +463,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issueId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const contextSnapshot = {
+      paperclipEnvironment: { driver: "local" },
+      ...(input?.contextSnapshot ?? {}),
+    };
 
     await db.insert(companies).values({
       id: companyId,
@@ -505,8 +509,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: input?.runStatus ?? "running",
       wakeupRequestId,
       contextSnapshot: input?.includeIssue === false
-        ? input?.contextSnapshot ?? {}
-        : { ...(input?.contextSnapshot ?? {}), issueId },
+        ? contextSnapshot
+        : { ...contextSnapshot, issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
@@ -710,6 +714,41 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect((await executorHeartbeat.getRun(runId))?.errorCode).toBe("process_lost");
+  });
+
+  it("does not probe a sandbox pid in the host process namespace while the remote execution is tracked", async () => {
+    const remotePid = 999_999_999;
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      runStatus: "running",
+      processPid: remotePid,
+      processLossRetryCount: 1,
+      includeIssue: false,
+      contextSnapshot: {
+        paperclipEnvironment: {
+          driver: "sandbox",
+        },
+      },
+    });
+    runningProcesses.set(runId, {
+      child: { pid: remotePid } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    try {
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 1 });
+
+      expect(result).toEqual({ reaped: 0, runIds: [] });
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "running",
+        errorCode: null,
+        processPid: remotePid,
+      });
+    } finally {
+      runningProcesses.delete(runId);
+    }
   });
 
   it("persists a codex inactivity monitor failure and clears both in-memory trackers", async () => {
@@ -1240,6 +1279,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
+
+  it("does not persist an opaque exception thrown by an untrusted adapter", async () => {
+    const canary = `opaque-adapter-canary-${randomUUID()}`;
+    mockAdapterExecute.mockRejectedValueOnce(new Error(canary));
+    const { agentId, runId, wakeupRequestId, issueId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    const failedRun = await heartbeat.getRun(runId);
+    expect(failedRun).toMatchObject({
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: "Adapter execution failed",
+    });
+
+    const [events, operations, comments, wakeup, runtimeState] = await Promise.all([
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)),
+      db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, runId)),
+      db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+      db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select()
+        .from(agentRuntimeState)
+        .where(eq(agentRuntimeState.agentId, agentId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    const persistedEvidence = JSON.stringify({
+      failedRun,
+      events,
+      operations,
+      comments,
+      wakeup,
+      runtimeState,
+    });
+
+    expect(persistedEvidence).not.toContain(canary);
+    expect(operations).toContainEqual(expect.objectContaining({
+      phase: "workspace_finalize",
+      status: "failed",
+      metadata: expect.objectContaining({
+        errorMessage: "Adapter execution failed",
+      }),
+    }));
+  });
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();

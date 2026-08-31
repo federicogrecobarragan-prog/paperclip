@@ -1,9 +1,50 @@
 import { describe, expect, it } from "vitest";
 import {
+  heartbeatRunTracksHostLocalChildProcess,
   isZombieRun,
   filterZombieCoalesceTarget,
   isTrackedDeadLocalProcess,
+  sanitizeHeartbeatFailureMessage,
 } from "../services/heartbeat.ts";
+
+describe("heartbeat process namespace classification", () => {
+  it("only treats explicitly local sessioned adapters as host-local children", () => {
+    expect(heartbeatRunTracksHostLocalChildProcess({
+      adapterType: "codex_local",
+      contextSnapshot: { paperclipEnvironment: { driver: "local" } },
+    })).toBe(true);
+
+    for (const driver of ["sandbox", "ssh", "plugin", "unknown"]) {
+      expect(heartbeatRunTracksHostLocalChildProcess({
+        adapterType: "codex_local",
+        contextSnapshot: { paperclipEnvironment: { driver } },
+      })).toBe(false);
+    }
+    expect(heartbeatRunTracksHostLocalChildProcess({
+      adapterType: "codex_local",
+      contextSnapshot: {},
+    })).toBe(false);
+    expect(heartbeatRunTracksHostLocalChildProcess({
+      adapterType: "http",
+      contextSnapshot: { paperclipEnvironment: { driver: "local" } },
+    })).toBe(false);
+  });
+});
+
+describe("sanitizeHeartbeatFailureMessage", () => {
+  it("does not persist or log details from an untrusted thrown adapter value", () => {
+    const secret = "opaque-hostile-adapter-canary";
+    const result = sanitizeHeartbeatFailureMessage(
+      new Error(`${secret}\u0000tail`),
+      { enabled: false },
+      "Adapter execution failed",
+    );
+
+    expect(result).toBe("Adapter execution failed");
+    expect(result).not.toContain(secret);
+    expect(result).not.toContain("\u0000");
+  });
+});
 
 describe("isTrackedDeadLocalProcess", () => {
   it("only bypasses reaper liveness gates for a tracked local run with a valid dead pid", () => {
