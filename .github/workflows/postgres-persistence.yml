@@ -95,7 +95,7 @@ jobs:
             grep -Eo '<testsuites[^>]*tests="[0-9]+"' "$report_file" || true
           }
 
-          run_suite server server/src/__tests__/heartbeat-nul-persistence.integration.test.ts
-          run_suite server server/src/services/heartbeat-persistence-safety.test.ts
-          run_suite server server/src/services/heartbeat-persistence-safety-postgres.test.ts
-          run_suite packages/db packages/db/src/test-embedded-postgres.test.ts
+          run_suite @paperclipai/server server/src/__tests__/heartbeat-nul-persistence.integration.test.ts
+          run_suite @paperclipai/server server/src/services/heartbeat-persistence-safety.test.ts
+          run_suite @paperclipai/server server/src/services/heartbeat-persistence-safety-postgres.test.ts
+          run_suite @paperclipai/db packages/db/src/test-embedded-postgres.test.ts
