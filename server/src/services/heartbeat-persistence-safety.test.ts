@@ -8,6 +8,7 @@ import {
   sanitizeHeartbeatPersistenceRecord,
   sanitizeHeartbeatPersistenceText,
   sanitizeHeartbeatPersistenceValue,
+  sanitizeHeartbeatWakeupSkipReasonForPersistence,
 } from "./heartbeat-persistence-safety.js";
 
 describe("heartbeat persistence safety", () => {
@@ -466,5 +467,25 @@ describe("heartbeat persistence safety", () => {
     expect(sanitizeHeartbeatPersistenceText("a\u0000b")).toBe("a\uFFFDb");
     expect(sanitizeHeartbeatPersistenceValue({ fn: () => "no", symbol: Symbol("no"), value: 1 }))
       .toEqual({ value: 1 });
+  });
+
+  it("preserves only the exact canonical server-owned wakeup skip reason", () => {
+    const canonical = "heartbeat.wakeOnDemand.disabled";
+
+    expect(sanitizeHeartbeatWakeupSkipReasonForPersistence(canonical)).toBe(canonical);
+
+    for (const spoof of [
+      `${canonical}.attacker`,
+      `${canonical}\u0000attacker`,
+      `${canonical}\nsecret=synthetic-secret`,
+      ` ${canonical}`,
+      canonical.toUpperCase(),
+    ]) {
+      const sanitized = sanitizeHeartbeatWakeupSkipReasonForPersistence(spoof);
+      expect(sanitized).toBe(sanitizeHeartbeatPersistenceText(spoof));
+      expect(sanitized).not.toBe(canonical);
+      expect(sanitized).not.toContain("\u0000");
+      expect(sanitized).not.toContain("synthetic-secret");
+    }
   });
 });

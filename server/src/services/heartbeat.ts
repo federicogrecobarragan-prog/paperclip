@@ -197,6 +197,7 @@ import {
   sanitizeHeartbeatPersistenceRecord,
   sanitizeHeartbeatPersistenceText,
   sanitizeHeartbeatPersistenceValue,
+  sanitizeHeartbeatWakeupSkipReasonForPersistence,
 } from "./heartbeat-persistence-safety.js";
 import {
   hasSessionCompactionThresholds,
@@ -12898,7 +12899,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId,
         source,
         triggerDetail,
-        reason: sanitizeHeartbeatPersistenceText(skipReason),
+        reason: sanitizeHeartbeatWakeupSkipReasonForPersistence(skipReason),
         payload,
         status: "skipped",
         requestedByActorType: opts.requestedByActorType ?? null,

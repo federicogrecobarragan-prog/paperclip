@@ -42,6 +42,14 @@ const NON_SECRET_USAGE_KEYS = new Set([
   "maxtokens",
 ]);
 
+// This is an exact allowlist for server-owned wakeup skip reasons whose
+// canonical spelling collides with command-text redaction heuristics. Keep it
+// deliberately narrow: near-matches and caller-controlled text still go
+// through the normal fail-closed persistence sanitizer.
+const TRUSTED_HEARTBEAT_WAKEUP_SKIP_REASONS = new Set<string>([
+  "heartbeat.wakeOnDemand.disabled",
+]);
+
 export const HEARTBEAT_PERSISTENCE_LIMITS = Object.freeze({
   maxDepth: MAX_DEPTH,
   maxNodes: MAX_NODES,
@@ -137,6 +145,11 @@ export function sanitizeHeartbeatPersistenceText(value: string): string {
   return prepared.wasTruncated
     ? appendTruncationMarker(prepared.text, MAX_STRING_CHARS)
     : prepared.text;
+}
+
+export function sanitizeHeartbeatWakeupSkipReasonForPersistence(value: string): string {
+  if (TRUSTED_HEARTBEAT_WAKEUP_SKIP_REASONS.has(value)) return value;
+  return sanitizeHeartbeatPersistenceText(value);
 }
 
 function consumeWork(state: SanitizerState, units = 1): boolean {
