@@ -5,6 +5,8 @@ import {
   filterZombieCoalesceTarget,
   isTrackedDeadLocalProcess,
   sanitizeHeartbeatFailureMessage,
+  sanitizeHeartbeatErrorForLog,
+  shouldPersistHeartbeatProcessMetadata,
 } from "../services/heartbeat.ts";
 import { InvalidAdapterExecutionResultError } from "../services/heartbeat-persistence-safety.ts";
 
@@ -61,6 +63,7 @@ describe("isTrackedDeadLocalProcess", () => {
   it("only bypasses reaper liveness gates for a tracked local run with a valid dead pid", () => {
     expect(isTrackedDeadLocalProcess({
       trackedInMemory: true,
+      adapterExecutionInMemory: false,
       tracksLocalChild: true,
       processPid: 12345,
       processPidAlive: false,
@@ -68,28 +71,88 @@ describe("isTrackedDeadLocalProcess", () => {
 
     expect(isTrackedDeadLocalProcess({
       trackedInMemory: true,
+      adapterExecutionInMemory: false,
       tracksLocalChild: true,
       processPid: 12345,
       processPidAlive: true,
     })).toBe(false);
     expect(isTrackedDeadLocalProcess({
       trackedInMemory: false,
+      adapterExecutionInMemory: false,
       tracksLocalChild: true,
       processPid: 12345,
       processPidAlive: false,
     })).toBe(false);
     expect(isTrackedDeadLocalProcess({
       trackedInMemory: true,
+      adapterExecutionInMemory: false,
       tracksLocalChild: false,
       processPid: 12345,
       processPidAlive: false,
     })).toBe(false);
     expect(isTrackedDeadLocalProcess({
       trackedInMemory: true,
+      adapterExecutionInMemory: false,
       tracksLocalChild: true,
       processPid: null,
       processPidAlive: false,
     })).toBe(false);
+    expect(isTrackedDeadLocalProcess({
+      trackedInMemory: true,
+      adapterExecutionInMemory: true,
+      tracksLocalChild: true,
+      processPid: 12345,
+      processPidAlive: false,
+    })).toBe(false);
+    expect(isTrackedDeadLocalProcess({
+      trackedInMemory: true,
+      adapterExecutionInMemory: true,
+      tracksLocalChild: true,
+      processPid: 12345,
+      processPidAlive: false,
+      deadProcessObservedForMs: 15_000,
+      activeExecutionDeadProcessGraceMs: 15_000,
+    })).toBe(true);
+  });
+});
+
+describe("heartbeat process ownership metadata", () => {
+  it("never treats a sandbox-reported remote pid as a host-local child", () => {
+    expect(shouldPersistHeartbeatProcessMetadata(undefined)).toBe(true);
+    expect(shouldPersistHeartbeatProcessMetadata({ kind: "local" })).toBe(true);
+    expect(shouldPersistHeartbeatProcessMetadata({ kind: "remote", transport: "ssh" })).toBe(true);
+    expect(shouldPersistHeartbeatProcessMetadata({ kind: "remote", transport: "sandbox" })).toBe(false);
+  });
+});
+
+describe("heartbeat logger redaction", () => {
+  it("omits opaque provider diagnostics from structured logs and persisted fallbacks", () => {
+    const syntheticSentinel = "OpaqueLac1270ValueZ9Q8";
+    const error = new Error(`provider failure ${syntheticSentinel}`);
+    const safe = sanitizeHeartbeatErrorForLog(error);
+
+    expect(JSON.stringify(safe)).not.toContain(syntheticSentinel);
+    expect(safe).toEqual({ name: "HeartbeatExecutionError" });
+    expect(
+      sanitizeHeartbeatFailureMessage(
+        error,
+        { enabled: false },
+        "Adapter execution failed; raw provider diagnostic omitted",
+      ),
+    ).toBe("Adapter execution failed; raw provider diagnostic omitted");
+    expect(sanitizeHeartbeatFailureMessage(
+      {
+        code: "workspace_validation_failed",
+        resultJson: {},
+        message: syntheticSentinel,
+      },
+      { enabled: false },
+      "Adapter execution failed; raw provider diagnostic omitted",
+    )).toBe(
+      "Adapter execution failed; raw provider diagnostic omitted",
+    );
+    expect(safe).not.toHaveProperty("stack");
+    expect(safe).not.toHaveProperty("message");
   });
 });
 

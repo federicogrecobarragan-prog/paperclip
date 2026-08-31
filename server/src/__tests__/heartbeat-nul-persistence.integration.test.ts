@@ -12,6 +12,7 @@ import {
   heartbeatRuns,
   issueRelations,
   issues,
+  workspaceOperations,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
@@ -34,6 +35,8 @@ vi.mock("../adapters/index.ts", async () => {
 
 import * as activityLogService from "../services/activity-log.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { logger } from "../middleware/logger.ts";
+import { workspaceOperationService } from "../services/workspace-operations.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -397,6 +400,129 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(terminal?.status).toBe("failed");
     expect(persisted).not.toContain(syntheticSentinel);
     expect(persisted).toContain("***REDACTED***");
+  });
+
+  it("redacts synthetic secrets from thrown adapter errors and workspace-finalize evidence", async () => {
+    const { agentId } = await seedAgent();
+    const syntheticSentinel = "OpaqueLac1270ValueZ9Q8";
+    const loggerErrorSpy = vi.spyOn(logger, "error");
+    mockAdapterExecute.mockRejectedValueOnce(
+      new Error(`provider failure ${syntheticSentinel}`),
+    );
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+    });
+    expect(queued).toBeTruthy();
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    const { runtimeState, sessions } = await waitForPostTerminalState(db, agentId, queued!.id);
+    const [wakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, queued!.id));
+    const operations = await db
+      .select()
+      .from(workspaceOperations)
+      .where(eq(workspaceOperations.heartbeatRunId, queued!.id));
+    const log = await heartbeat.readLog(queued!.id);
+    const persisted = JSON.stringify({
+      terminal,
+      wakeup,
+      events,
+      operations,
+      runtimeState,
+      sessions,
+      log,
+    });
+
+    expect(terminal?.status).toBe("failed");
+    expect(terminal?.error).toBe("Adapter execution failed; raw provider diagnostic omitted");
+    expect(operations.some((operation) => operation.phase === "workspace_finalize")).toBe(true);
+    expect(persisted).not.toContain(syntheticSentinel);
+    expect(JSON.stringify(loggerErrorSpy.mock.calls)).not.toContain(syntheticSentinel);
+  });
+
+  it("rejects spoofed workspace-validation metadata from adapter exceptions", async () => {
+    const { agentId } = await seedAgent();
+    const syntheticSentinel = "OpaqueSpoofedWorkspaceMetadataR4N8";
+    mockAdapterExecute.mockRejectedValueOnce({
+      code: "workspace_validation_failed",
+      message: syntheticSentinel,
+      resultJson: {
+        detail: syntheticSentinel,
+        workspaceValidation: { note: syntheticSentinel },
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+    });
+    expect(queued).toBeTruthy();
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+
+    expect(terminal?.status).toBe("failed");
+    expect(terminal?.errorCode).toBe("adapter_failed");
+    expect(terminal?.error).toBe("Adapter execution failed; raw provider diagnostic omitted");
+    expect(JSON.stringify(terminal?.resultJson)).not.toContain(syntheticSentinel);
+    expect(JSON.stringify(terminal?.resultJson)).not.toContain("workspaceValidation");
+  });
+
+  it("omits opaque diagnostics when a workspace operation throws", async () => {
+    const { companyId } = await seedAgent();
+    const syntheticSentinel = "OpaqueWorkspaceValueK7M4";
+    const operationsService = workspaceOperationService(db);
+    const recorder = operationsService.createRecorder({ companyId });
+
+    await expect(recorder.recordOperation({
+      phase: "workspace_finalize",
+      run: async () => {
+        throw new Error(`provider failure ${syntheticSentinel}`);
+      },
+    })).rejects.toThrow("Workspace operation failed; raw diagnostic omitted");
+
+    const [operation] = await db
+      .select()
+      .from(workspaceOperations)
+      .where(eq(workspaceOperations.companyId, companyId));
+    expect(operation).toBeTruthy();
+    const operationLog = await operationsService.readLog(operation!.id);
+    const persisted = JSON.stringify({ operation, operationLog });
+
+    expect(persisted).not.toContain(syntheticSentinel);
+    expect(persisted).toContain("Workspace operation failed; raw diagnostic omitted");
+  });
+
+  it("omits opaque output from failed workspace command results", async () => {
+    const { companyId } = await seedAgent();
+    const syntheticSentinel = "OpaqueFailedWorkspaceStreamM5T2";
+    const operationsService = workspaceOperationService(db);
+    const recorder = operationsService.createRecorder({ companyId });
+
+    const operation = await recorder.recordOperation({
+      phase: "workspace_provision",
+      run: async () => ({
+        status: "failed",
+        exitCode: 23,
+        stdout: `command stdout ${syntheticSentinel}`,
+        stderr: `command stderr ${syntheticSentinel}`,
+      }),
+    });
+    const operationLog = await operationsService.readLog(operation.id);
+    const persisted = JSON.stringify({ operation, operationLog });
+
+    expect(operation.status).toBe("failed");
+    expect(operation.exitCode).toBe(23);
+    expect(persisted).not.toContain(syntheticSentinel);
+    expect(operation.stdoutExcerpt).toContain("raw stdout omitted");
+    expect(operation.stderrExcerpt).toContain("raw stderr omitted");
   });
 
   it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization when publication throws", async () => {

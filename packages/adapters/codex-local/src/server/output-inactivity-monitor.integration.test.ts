@@ -5,6 +5,7 @@ import {
   createCodexOutputInactivityMonitor,
   formatOutputInactivityMonitorErrorMessage,
 } from "./output-inactivity-monitor.js";
+import { resolveCodexHostKillTarget } from "./execute.js";
 
 const FAKE_CODEX_SCRIPT = `
 process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "abc" }) + "\\n");
@@ -13,6 +14,24 @@ process.stdin.resume();
 process.stdin.on("data", () => {});
 setInterval(() => {}, 60_000);
 `;
+
+describe("codex inactivity monitor process ownership", () => {
+  it("never maps a sandbox-reported remote pid to a host kill target", () => {
+    const remotePidCollidingWithThisHost = process.pid;
+
+    expect(resolveCodexHostKillTarget({
+      pid: remotePidCollidingWithThisHost,
+      processGroupId: null,
+    }, true)).toBeNull();
+    expect(resolveCodexHostKillTarget({
+      pid: remotePidCollidingWithThisHost,
+      processGroupId: null,
+    }, false)).toEqual({
+      pid: remotePidCollidingWithThisHost,
+      processGroupId: null,
+    });
+  });
+});
 
 describe("codex inactivity monitor (integration: real subprocess)", () => {
   it(

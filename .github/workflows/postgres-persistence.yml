@@ -9,12 +9,20 @@ on:
       - "server/src/__tests__/heartbeat-nul-persistence.integration.test.ts"
       - "server/src/__tests__/heartbeat-zombie-guard.test.ts"
       - "server/src/__tests__/heartbeat-process-recovery.test.ts"
+      - "server/src/__tests__/error-handler.test.ts"
+      - "server/src/__tests__/logger-tz.test.ts"
       - "server/src/services/heartbeat-persistence-safety.test.ts"
       - "server/src/services/heartbeat-persistence-safety-postgres.test.ts"
       - "server/src/services/heartbeat-persistence-safety.ts"
       - "server/src/services/heartbeat.ts"
       - "server/src/services/workspace-operations.test.ts"
       - "server/src/services/workspace-operations.ts"
+      - "server/src/services/workspace-runtime.ts"
+      - "server/src/middleware/error-handler.ts"
+      - "server/src/middleware/http-error-log-safety.ts"
+      - "server/src/middleware/logger.ts"
+      - "server/src/routes/plugins.ts"
+      - "server/src/__tests__/plugin-routes-authz.test.ts"
       - "packages/adapter-utils/src/execution-target.ts"
       - "packages/adapter-utils/src/server-utils.test.ts"
       - "packages/adapter-utils/src/server-utils.ts"
@@ -124,6 +132,9 @@ jobs:
           run_suite @paperclipai/server server/src/__tests__/heartbeat-nul-persistence.integration.test.ts
           run_suite @paperclipai/server server/src/__tests__/heartbeat-zombie-guard.test.ts
           run_suite @paperclipai/server server/src/__tests__/heartbeat-process-recovery.test.ts
+          run_suite @paperclipai/server server/src/__tests__/error-handler.test.ts
+          run_suite @paperclipai/server server/src/__tests__/logger-tz.test.ts
+          run_suite @paperclipai/server server/src/__tests__/plugin-routes-authz.test.ts
           run_suite @paperclipai/adapter-codex-local packages/adapters/codex-local/src/server/output-inactivity-monitor.integration.test.ts
           run_suite @paperclipai/server server/src/services/heartbeat-persistence-safety.test.ts
           run_suite @paperclipai/server server/src/services/heartbeat-persistence-safety-postgres.test.ts

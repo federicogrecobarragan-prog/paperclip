@@ -18,6 +18,22 @@ import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.j
 
 type WorkspaceOperationRow = typeof workspaceOperations.$inferSelect;
 
+const OMITTED_FAILED_WORKSPACE_STDOUT =
+  "Workspace command failed; raw stdout omitted.\n";
+const OMITTED_FAILED_WORKSPACE_STDERR =
+  "Workspace command failed; raw stderr omitted.\n";
+const GENERIC_WORKSPACE_OPERATION_FAILURE =
+  "Workspace operation failed; raw diagnostic omitted";
+
+export class WorkspaceOperationFailure extends Error {
+  readonly code = "workspace_operation_failed";
+
+  constructor() {
+    super(GENERIC_WORKSPACE_OPERATION_FAILURE);
+    this.name = "WorkspaceOperationFailure";
+  }
+}
+
 function toWorkspaceOperation(row: WorkspaceOperationRow): WorkspaceOperation {
   return {
     id: row.id,
@@ -156,6 +172,10 @@ export function workspaceOperationService(db: Db) {
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
             const sanitizedChunk = sanitizeText(chunk);
+            // Explicit command output remains operator-visible evidence and is
+            // sanitized with the normal log policy. The fail-closed boundary is
+            // exception propagation: unexpected thrown diagnostics are never
+            // copied into persistence or HTTP logs below.
             if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
             if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
             await logStore.append(handle, {
@@ -184,9 +204,21 @@ export function workspaceOperationService(db: Db) {
 
           try {
             const result = await recordInput.run();
+            const failedCommandOutput = result.status === "failed" ||
+              (typeof result.exitCode === "number" && result.exitCode !== 0);
             await append("system", result.system ?? null);
-            await append("stdout", result.stdout ?? null);
-            await append("stderr", result.stderr ?? null);
+            await append(
+              "stdout",
+              failedCommandOutput && result.stdout
+                ? OMITTED_FAILED_WORKSPACE_STDOUT
+                : result.stdout ?? null,
+            );
+            await append(
+              "stderr",
+              failedCommandOutput && result.stderr
+                ? OMITTED_FAILED_WORKSPACE_STDERR
+                : result.stderr ?? null,
+            );
             const finalized = await logStore.finalize(handle);
             const finishedAt = new Date();
             const row = await db
@@ -210,7 +242,9 @@ export function workspaceOperationService(db: Db) {
             if (!row) throw notFound("Workspace operation not found");
             return toWorkspaceOperation(row);
           } catch (error) {
-            await append("stderr", error instanceof Error ? error.message : String(error));
+            // The thrown diagnostic is not trustworthy: providers and hooks
+            // can embed opaque credentials that no heuristic can identify.
+            await append("system", GENERIC_WORKSPACE_OPERATION_FAILURE);
             const finalized = await logStore.finalize(handle).catch(() => null);
             const finishedAt = new Date();
             await db
@@ -227,7 +261,7 @@ export function workspaceOperationService(db: Db) {
                 updatedAt: finishedAt,
               })
               .where(eq(workspaceOperations.id, id));
-            throw error;
+            throw new WorkspaceOperationFailure();
           }
         },
       };

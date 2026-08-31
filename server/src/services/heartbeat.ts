@@ -104,6 +104,7 @@ import {
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  WorkspaceRuntimeValidationFailure,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
@@ -366,6 +367,7 @@ export function sanitizeHeartbeatFailureMessage(
 ) {
   if (
     !(error instanceof WorkspaceValidationFailure) &&
+    !(error instanceof WorkspaceRuntimeValidationFailure) &&
     !(error instanceof ConfigurationIncompleteFailure) &&
     !(error instanceof InvalidAdapterExecutionResultError)
   ) {
@@ -471,23 +473,59 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+const deadLocalProcessFirstObservedAt = new Map<
+  string,
+  { pid: number; firstObservedAt: number }
+>();
+export const ACTIVE_EXECUTION_DEAD_PROCESS_GRACE_MS = 15_000;
 
 export function isHeartbeatRunTrackedInMemory(runId: string) {
   return runningProcesses.has(runId) || activeRunExecutions.has(runId);
 }
 
+export function shouldPersistHeartbeatProcessMetadata(executionTarget: unknown) {
+  const target = parseObject(executionTarget);
+  // SSH execution is represented by a host-local ssh child, so its pid is a
+  // valid host liveness signal. Sandbox runners report the remote process pid,
+  // which must never be probed with process.kill() on the Paperclip host.
+  return !(target.kind === "remote" && target.transport === "sandbox");
+}
+
+export function sanitizeHeartbeatErrorForLog(_error: unknown) {
+  // Deliberately omit the raw Error object, name, message, and stack. Provider
+  // failures can embed opaque credentials in any of them, and heuristic text
+  // redaction cannot prove an arbitrary value is safe.
+  return { name: "HeartbeatExecutionError" };
+}
+
 export function isTrackedDeadLocalProcess(input: {
   trackedInMemory: boolean;
+  adapterExecutionInMemory: boolean;
   tracksLocalChild: boolean;
   processPid: number | null | undefined;
   processPidAlive: boolean;
+  deadProcessObservedForMs?: number;
+  activeExecutionDeadProcessGraceMs?: number;
 }) {
-  return input.trackedInMemory &&
+  const isDeadTrackedChild = input.trackedInMemory &&
     input.tracksLocalChild &&
     typeof input.processPid === "number" &&
     Number.isInteger(input.processPid) &&
     input.processPid > 0 &&
     !input.processPidAlive;
+  if (!isDeadTrackedChild) return false;
+  if (!input.adapterExecutionInMemory) return true;
+
+  const configuredGraceMs = input.activeExecutionDeadProcessGraceMs ??
+    ACTIVE_EXECUTION_DEAD_PROCESS_GRACE_MS;
+  const graceMs = Number.isFinite(configuredGraceMs)
+    ? Math.max(0, configuredGraceMs)
+    : ACTIVE_EXECUTION_DEAD_PROCESS_GRACE_MS;
+  const observedForMs = Math.max(0, input.deadProcessObservedForMs ?? 0);
+  // A live executeRun may briefly own a child between Node's `exit` and
+  // `close` events. Protect that race only for a bounded window; a dead PID
+  // plus a Promise that never settles must become reapable again.
+  return observedForMs >= graceMs;
 }
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
@@ -1260,8 +1298,14 @@ async function ensureManagedProjectWorkspace(input: {
   }
 }
 
-function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailure {
-  return error instanceof WorkspaceValidationFailure;
+type WorkspaceValidationFailureLike = WorkspaceValidationFailure | WorkspaceRuntimeValidationFailure;
+
+function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailureLike {
+  // Only failures constructed by Paperclip may carry validation metadata into
+  // persistence. Adapter/provider exceptions are untrusted and can spoof a
+  // structural `code`/`resultJson` shape to smuggle opaque values into a run.
+  return error instanceof WorkspaceValidationFailure ||
+    error instanceof WorkspaceRuntimeValidationFailure;
 }
 
 function isWorkspaceValidationFailedRun(
@@ -2943,7 +2987,7 @@ async function recordWorkspaceConfigFreshnessOperation(input: WorkspaceConfigFre
   } catch (error) {
     logger.warn(
       {
-        err: error instanceof Error ? error.message : String(error),
+        err: sanitizeHeartbeatErrorForLog(error),
         runId: input.runId,
         previousWorkspaceId: input.previousWorkspaceId,
         activeWorkspaceId: input.activeWorkspaceId,
@@ -4698,12 +4742,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       status: leaseReleaseStatusForRunStatus(input.status),
       failureReason: input.failureReason ?? undefined,
     }).catch((err) => {
-      logger.warn({ err, runId: input.runId }, "failed to release environment leases for heartbeat run");
+      logger.warn(
+        { err: sanitizeHeartbeatErrorForLog(err), runId: input.runId },
+        "failed to release environment leases for heartbeat run",
+      );
       return null;
     });
     for (const releaseError of releaseResult?.errors ?? []) {
       logger.warn(
-        { err: releaseError.error, leaseId: releaseError.leaseId, runId: input.runId },
+        {
+          err: sanitizeHeartbeatErrorForLog(releaseError.error),
+          leaseId: releaseError.leaseId,
+          runId: input.runId,
+        },
         "failed to release environment lease for heartbeat run",
       );
     }
@@ -4721,7 +4772,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return typeof serverEncoding === "string" && serverEncoding.toUpperCase() === "SQL_ASCII";
         })
         .catch((err) => {
-          logger.warn({ err }, "failed to inspect database server encoding; using conservative heartbeat result projection");
+          logger.warn(
+            { err: sanitizeHeartbeatErrorForLog(err) },
+            "failed to inspect database server encoding; using conservative heartbeat result projection",
+          );
           return true;
         });
     }
@@ -5639,7 +5693,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
       } catch (err) {
-        logger.error({ err, issueId: claimed.id }, "issue monitor tick failed");
+        logger.error(
+          { err: sanitizeHeartbeatErrorForLog(err), issueId: claimed.id },
+          "issue monitor tick failed",
+        );
       }
     }
 
@@ -6323,7 +6380,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         publishRunStatusUpdate(persisted.run);
       } catch (err) {
         logger.warn(
-          { err, runId, status },
+          { err: sanitizeHeartbeatErrorForLog(err), runId, status },
           "best-effort terminal heartbeat publication failed after persisted CAS",
         );
       }
@@ -7045,7 +7102,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } catch (err) {
       logger.warn(
         {
-          err,
+          err: sanitizeHeartbeatErrorForLog(err),
           runId: run.id,
           issueId,
           agentId: agent.id,
@@ -9346,7 +9403,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: {
+    staleThresholdMs?: number;
+    activeExecutionDeadProcessGraceMs?: number;
+  }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -9375,15 +9435,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         run.processPid > 0;
       const processPidAlive = hasRecordedProcessPid && isProcessAlive(run.processPid);
       const trackedInMemory = isHeartbeatRunTrackedInMemory(run.id);
-      // A stale ChildProcess/adapter-execution handle is not proof of life.
-      // Once the persisted local child pid is definitively gone, bypass both
-      // the in-memory gate and the age gate so repeated coalesced wakes cannot
+      const adapterExecutionInMemory = activeRunExecutions.has(run.id);
+      const deadTrackedChildCandidate = trackedInMemory &&
+        tracksLocalChild &&
+        typeof run.processPid === "number" &&
+        Number.isInteger(run.processPid) &&
+        run.processPid > 0 &&
+        !processPidAlive;
+      let deadProcessObservedForMs = 0;
+      if (deadTrackedChildCandidate) {
+        const recordedPid = run.processPid as number;
+        const previousObservation = deadLocalProcessFirstObservedAt.get(run.id);
+        const firstObservedAt = previousObservation?.pid === recordedPid
+          ? previousObservation.firstObservedAt
+          : now.getTime();
+        deadLocalProcessFirstObservedAt.set(run.id, {
+          pid: recordedPid,
+          firstObservedAt,
+        });
+        deadProcessObservedForMs = Math.max(0, now.getTime() - firstObservedAt);
+      } else {
+        deadLocalProcessFirstObservedAt.delete(run.id);
+      }
+      // A stale ChildProcess handle alone is not proof of life. Once no live
+      // executeRun owns the run and the persisted local child pid is gone,
+      // bypass the remaining in-memory/age gates so coalesced wakes cannot
       // keep refreshing updatedAt and make the dead run immortal.
       const trackedDeadLocalProcess = isTrackedDeadLocalProcess({
         trackedInMemory,
+        adapterExecutionInMemory,
         tracksLocalChild,
         processPid: run.processPid,
         processPidAlive,
+        deadProcessObservedForMs,
+        activeExecutionDeadProcessGraceMs: opts?.activeExecutionDeadProcessGraceMs,
       });
       if (trackedInMemory && !trackedDeadLocalProcess) continue;
 
@@ -9447,11 +9532,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // outcome is authoritative, but stale handles are still safe to drop.
         runningProcesses.delete(run.id);
         activeRunExecutions.delete(run.id);
+        deadLocalProcessFirstObservedAt.delete(run.id);
         continue;
       }
       let finalizedRun = finalizedRunWrite.run;
       runningProcesses.delete(run.id);
       activeRunExecutions.delete(run.id);
+      deadLocalProcessFirstObservedAt.delete(run.id);
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -9700,7 +9787,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       for (const claimedRun of claimedRuns) {
         void executeRun(claimedRun.id).catch((err) => {
-          logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+          logger.error(
+            { err: sanitizeHeartbeatErrorForLog(err), runId: claimedRun.id },
+            "queued heartbeat execution failed",
+          );
         });
       }
       return claimedRuns;
@@ -10058,9 +10148,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               'PAPERCLIP_EXECUTION_MODE bootstrap env is not kubernetes-forced (absent or "any")';
           }
         } catch (err) {
-          bootstrapSkipReason = `PAPERCLIP_EXECUTION_MODE bootstrap env failed to parse: ${
-            err instanceof Error ? err.message : String(err)
-          }`;
+          bootstrapSkipReason =
+            "PAPERCLIP_EXECUTION_MODE bootstrap env failed to parse; raw diagnostic omitted";
         }
         if (bootstrap) {
           await environmentsSvc.ensureKubernetesEnvironment(
@@ -10117,7 +10206,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       profileResolutionFallbackReason = "adapter_profile_resolution_failed";
       logger.warn(
         {
-          err: error,
+          err: sanitizeHeartbeatErrorForLog(error),
           companyId: agent.companyId,
           agentId: agent.id,
           adapterType: agent.adapterType,
@@ -10548,7 +10637,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               runId: run.id,
               issueId,
               executionWorkspaceCwd: executionWorkspace.cwd,
-              cleanupError: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+              err: sanitizeHeartbeatErrorForLog(cleanupError),
             },
             "Failed to cleanup realized execution workspace after persistence failure",
           );
@@ -11131,7 +11220,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } catch (err) {
           await onLog(
             "stderr",
-            `[paperclip] Failed to post workspace-ready comment: ${err instanceof Error ? err.message : String(err)}\n`,
+            "[paperclip] Failed to post workspace-ready comment; raw diagnostic omitted\n",
           );
         }
       }
@@ -11355,6 +11444,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
           },
           onSpawn: async (meta) => {
+            // A retry/fallback can spawn a new process within the same run.
+            // Reset the dead-PID grace clock even if the OS recycles the same
+            // numeric pid; each child receives its own bounded exit→close window.
+            deadLocalProcessFirstObservedAt.delete(run.id);
+            if (!shouldPersistHeartbeatProcessMetadata(executionTarget)) return;
             await persistRunProcessMetadata(run.id, {
               pid: meta.pid,
               processGroupId:
@@ -11379,23 +11473,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // write itself threw. Either way the workspace may be in a partial
         // state. Best-effort record finalize=failed so the dependent readiness
         // check keeps the gate closed instead of waking on stale local state,
-        // and surface the original error to the caller.
+          // and surface the original error to the caller.
         try {
           await recordWorkspaceFinalize("failed", {
             errorMessage: sanitizeHeartbeatFailureMessage(
               adapterErr,
               currentUserRedactionOptions,
-              "Adapter execution failed",
+              "Adapter execution failed; raw provider diagnostic omitted",
             ),
           });
         } catch (recordErr) {
           logger.warn(
             {
-              err: sanitizeHeartbeatFailureMessage(
-                recordErr,
-                currentUserRedactionOptions,
-                "Workspace finalize recording failed",
-              ),
+              err: sanitizeHeartbeatErrorForLog(recordErr),
               runId: run.id,
               executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
             },
@@ -11447,7 +11537,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           } catch (err) {
             await onLog(
               "stderr",
-              `[paperclip] Failed to post adapter-managed runtime comment: ${err instanceof Error ? err.message : String(err)}\n`,
+              "[paperclip] Failed to post adapter-managed runtime comment; raw diagnostic omitted\n",
             );
           }
         }
@@ -11629,7 +11719,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           } catch (err) {
             await onLog(
               "stderr",
-              `[paperclip] Failed to post run summary comment: ${err instanceof Error ? err.message : String(err)}\n`,
+              "[paperclip] Failed to post run summary comment; raw diagnostic omitted\n",
             );
           }
         }
@@ -11737,7 +11827,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   })
                 ).catch((wakeErr) => {
                   logger.warn(
-                    { err: wakeErr, issueId, dependentIssueId: dependent.id, agentId: dependent.assigneeAgentId },
+                    {
+                      err: sanitizeHeartbeatErrorForLog(wakeErr),
+                      issueId,
+                      dependentIssueId: dependent.id,
+                      agentId: dependent.assigneeAgentId,
+                    },
                     "failed to fire deferred dependent wake after workspace_finalize",
                   );
                 });
@@ -11745,7 +11840,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           } catch (finalizeWakeErr) {
             logger.warn(
-              { err: finalizeWakeErr, runId: run.id, issueId },
+              { err: sanitizeHeartbeatErrorForLog(finalizeWakeErr), runId: run.id, issueId },
               "failed to evaluate dependent wakes after workspace_finalize",
             );
           }
@@ -11802,13 +11897,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const message = sanitizeHeartbeatFailureMessage(
         err,
         failureRedactionOptions,
-        "Adapter execution failed",
+        "Adapter execution failed; raw provider diagnostic omitted",
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
       const configurationIncompleteFailure = isConfigurationIncompleteFailure(err) ? err : null;
       const failureErrorCode =
         workspaceValidationFailure?.code ?? configurationIncompleteFailure?.code ?? "adapter_failed";
-      logger.error({ err: message, runId }, "heartbeat execution failed");
+      logger.error({ err: sanitizeHeartbeatErrorForLog(err), runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -11816,14 +11911,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           logSummary = await runLogStore.finalize(handle);
         } catch (finalizeErr) {
           logger.warn(
-            {
-              err: sanitizeHeartbeatFailureMessage(
-                finalizeErr,
-                failureRedactionOptions,
-                "Run log finalization failed",
-              ),
-              runId,
-            },
+            { err: sanitizeHeartbeatErrorForLog(finalizeErr), runId },
             "failed to finalize run log after error",
           );
         }
@@ -11834,14 +11922,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       await flushOutputProgress({ force: true }).catch((flushErr) => {
         logger.warn(
-          {
-            err: sanitizeHeartbeatFailureMessage(
-              flushErr,
-              failureRedactionOptions,
-              "Run output progress flush failed",
-            ),
-            runId,
-          },
+          { err: sanitizeHeartbeatErrorForLog(flushErr), runId },
           "failed to flush run output progress after error",
         );
       });
@@ -11929,7 +12010,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const message = sanitizeHeartbeatFailureMessage(
             outerErr,
             setupFailureRedactionOptions,
-            "Heartbeat setup failed",
+            "Heartbeat setup failed; raw diagnostic omitted",
           );
           // A missing secret/env binding is a known pre-dispatch configuration gap,
           // not an opaque setup crash. Surface it with its own errorCode so the
@@ -11938,7 +12019,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const configurationIncompleteSetupFailure = isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
           const setupFailureErrorCode =
             workspaceValidationSetupFailure?.code ?? configurationIncompleteSetupFailure?.code ?? "setup_failed";
-          logger.error({ err: message, runId }, "heartbeat execution setup failed");
+          logger.error(
+            { err: sanitizeHeartbeatErrorForLog(outerErr), runId },
+            "heartbeat execution setup failed",
+          );
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           const setupFailureWrite = await setTerminalRunStatusIfRunning(runId, "failed", {
             error: message,
@@ -12006,6 +12090,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           runningProcesses.delete(run.id);
           activeRunExecutions.delete(run.id);
+          deadLocalProcessFirstObservedAt.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
   }

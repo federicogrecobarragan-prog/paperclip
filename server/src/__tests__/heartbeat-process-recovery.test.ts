@@ -646,7 +646,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(settledRun?.status).toBe("succeeded");
   });
 
-  it("reaps a dead local pid even while stale in-memory handles claim the execution", async () => {
+  it("does not reap a dead pid while an adapter execution still owns the run", async () => {
     let releaseAdapter: (() => void) | null = null;
     const adapterStarted = new Promise<void>((resolve) => {
       mockAdapterExecute.mockImplementationOnce(async (context: {
@@ -673,7 +673,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           signal: null,
           timedOut: false,
           errorMessage: null,
-          summary: "Late adapter completion must not overwrite process_lost.",
+          summary: "The active adapter remained authoritative through process close.",
           provider: "test",
           model: "test-model",
         };
@@ -695,25 +695,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     try {
       expect(isHeartbeatRunTrackedInMemory(runId)).toBe(true);
 
-      // A recent updatedAt must not protect a definitively dead recorded pid.
+      // A dead pid can be the bounded exit-to-close window. While executeRun
+      // still owns the run, the reaper must not fabricate process_lost.
       await db
         .update(heartbeatRuns)
         .set({ updatedAt: new Date() })
         .where(eq(heartbeatRuns.id, runId));
 
       const result = await reaperHeartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60_000 });
-      expect(result).toEqual({ reaped: 1, runIds: [runId] });
+      expect(result).toEqual({ reaped: 0, runIds: [] });
 
+      const activeRun = await reaperHeartbeat.getRun(runId);
+      expect(activeRun?.status).toBe("running");
+      expect(activeRun?.errorCode).toBeNull();
+      expect(isHeartbeatRunTrackedInMemory(runId)).toBe(true);
+
+      // A fallback child in the same executeRun gets its own grace window.
+      // If the old PID's observation timestamp leaked across this update, the
+      // 10 ms grace below would immediately and falsely terminalize the run.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await db
+        .update(heartbeatRuns)
+        .set({ processPid: 999_999_998, updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+      const afterReplacement = await reaperHeartbeat.reapOrphanedRuns({
+        staleThresholdMs: 5 * 60_000,
+        activeExecutionDeadProcessGraceMs: 10,
+      });
+      expect(afterReplacement).toEqual({ reaped: 0, runIds: [] });
+    } finally {
+      releaseAdapter?.();
+    }
+    const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
+    expect(settledRun?.status).toBe("succeeded");
+    expect(settledRun?.errorCode).toBeNull();
+    expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
+  });
+
+  it("reaps a dead local pid after the active execution grace expires", async () => {
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async (context: {
+        runId: string;
+        onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+      }) => {
+        const deadPid = 999_999_997;
+        await context.onSpawn?.({
+          pid: deadPid,
+          processGroupId: null,
+          startedAt: new Date().toISOString(),
+        });
+        runningProcesses.set(context.runId, {
+          child: { pid: deadPid } as ChildProcess,
+          graceSec: 1,
+          processGroupId: null,
+        });
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Late adapter result must not overwrite process_lost.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      runStatus: "queued",
+      processLossRetryCount: 1,
+      includeIssue: false,
+    });
+    const executorHeartbeat = heartbeatService(db);
+    const reaperHeartbeat = heartbeatService(db);
+
+    await executorHeartbeat.resumeQueuedRuns();
+    await adapterStarted;
+    try {
+      const protectedResult = await reaperHeartbeat.reapOrphanedRuns({
+        staleThresholdMs: 5 * 60_000,
+      });
+      expect(protectedResult).toEqual({ reaped: 0, runIds: [] });
+
+      const result = await reaperHeartbeat.reapOrphanedRuns({
+        staleThresholdMs: 5 * 60_000,
+        activeExecutionDeadProcessGraceMs: 0,
+      });
+      expect(result).toEqual({ reaped: 1, runIds: [runId] });
       const reapedRun = await reaperHeartbeat.getRun(runId);
       expect(reapedRun?.status).toBe("failed");
       expect(reapedRun?.errorCode).toBe("process_lost");
-      expect(reapedRun?.finishedAt).toBeTruthy();
       expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
     } finally {
       releaseAdapter?.();
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect((await executorHeartbeat.getRun(runId))?.errorCode).toBe("process_lost");
+    const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
+    expect(settledRun?.status).toBe("failed");
+    expect(settledRun?.errorCode).toBe("process_lost");
   });
 
   it("does not probe a sandbox pid in the host process namespace while the remote execution is tracked", async () => {

@@ -843,7 +843,7 @@ describe.sequential("plugin tool and bridge authz", () => {
     expect(call).not.toHaveBeenCalled();
   });
 
-  it("attaches worker bridge errors to the HTTP logger context", async () => {
+  it("omits worker bridge diagnostics from the HTTP logger context", async () => {
     readyPlugin();
     const call = vi.fn().mockRejectedValue(new Error("missing source_objects column"));
     const captured: Array<{ context: any; body: unknown }> = [];
@@ -866,15 +866,10 @@ describe.sequential("plugin tool and bridge authz", () => {
       message: "missing source_objects column",
     });
     expect(captured.at(-1)?.context?.error).toMatchObject({
-      message: "missing source_objects column",
-      details: {
-        pluginId,
-        pluginKey: "paperclip.example",
-        bridgeMethod: "getData",
-        dataKey: "source-objects",
-        bridgeCode: "UNKNOWN",
-      },
+      message: "Request failed; raw diagnostic omitted",
+      name: "RequestError",
     });
+    expect(JSON.stringify(captured.at(-1)?.context)).not.toContain("missing source_objects column");
   });
 
   it("rejects manual job triggers for non-admin board users", async () => {
