@@ -438,6 +438,24 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+
+export function isHeartbeatRunTrackedInMemory(runId: string) {
+  return runningProcesses.has(runId) || activeRunExecutions.has(runId);
+}
+
+export function isTrackedDeadLocalProcess(input: {
+  trackedInMemory: boolean;
+  tracksLocalChild: boolean;
+  processPid: number | null | undefined;
+  processPidAlive: boolean;
+}) {
+  return input.trackedInMemory &&
+    input.tracksLocalChild &&
+    typeof input.processPid === "number" &&
+    Number.isInteger(input.processPid) &&
+    input.processPid > 0 &&
+    !input.processPidAlive;
+}
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -4614,7 +4632,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const workspaceOperationsSvc = workspaceOperationService(db);
   const liveRunExecutions = {
     has(id: string) {
-      return runningProcesses.has(id) || activeRunExecutions.has(id);
+      return isHeartbeatRunTrackedInMemory(id);
     },
   };
   const budgetHooks = {
@@ -9230,16 +9248,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const hasRecordedProcessPid =
+        tracksLocalChild &&
+        typeof run.processPid === "number" &&
+        Number.isInteger(run.processPid) &&
+        run.processPid > 0;
+      const processPidAlive = hasRecordedProcessPid && isProcessAlive(run.processPid);
+      const trackedInMemory = isHeartbeatRunTrackedInMemory(run.id);
+      // A stale ChildProcess/adapter-execution handle is not proof of life.
+      // Once the persisted local child pid is definitively gone, bypass both
+      // the in-memory gate and the age gate so repeated coalesced wakes cannot
+      // keep refreshing updatedAt and make the dead run immortal.
+      const trackedDeadLocalProcess = isTrackedDeadLocalProcess({
+        trackedInMemory,
+        tracksLocalChild,
+        processPid: run.processPid,
+        processPidAlive,
+      });
+      if (trackedInMemory && !trackedDeadLocalProcess) continue;
 
       // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      if (staleThresholdMs > 0 && !trackedDeadLocalProcess) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
@@ -9275,7 +9309,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -9289,6 +9323,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
         ),
       });
+      if (!finalizedRunWrite.updated) {
+        // The live execution won the terminalization race. Its persisted
+        // outcome is authoritative, but stale handles are still safe to drop.
+        runningProcesses.delete(run.id);
+        activeRunExecutions.delete(run.id);
+        continue;
+      }
+      let finalizedRun = finalizedRunWrite.run;
+      runningProcesses.delete(run.id);
+      activeRunExecutions.delete(run.id);
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -9331,7 +9375,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(run.agentId, "failed", baseMessage);
       await startNextQueuedRunForAgent(run.agentId);
-      runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
 
@@ -11783,6 +11826,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          runningProcesses.delete(run.id);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
