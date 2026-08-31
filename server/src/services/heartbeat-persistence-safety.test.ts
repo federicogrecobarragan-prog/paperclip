@@ -4,6 +4,7 @@ import {
   HEARTBEAT_PERSISTENCE_LIMITS,
   InvalidAdapterExecutionResultError,
   normalizeAdapterExecutionResultForPersistence,
+  normalizeHeartbeatExitCodeForPersistence,
   sanitizeHeartbeatPersistenceRecord,
   sanitizeHeartbeatPersistenceText,
   sanitizeHeartbeatPersistenceValue,
@@ -323,6 +324,31 @@ describe("heartbeat persistence safety", () => {
       .toThrow(/timedOut/);
     expect(() => normalizeAdapterExecutionResultForPersistence({ exitCode: "0", signal: null, timedOut: false }))
       .toThrow(/exitCode/);
+  });
+
+  it("maps unsigned Windows process codes into PostgreSQL int4 without hiding invalid values", () => {
+    expect(normalizeHeartbeatExitCodeForPersistence(3_221_226_505)).toBe(-1_073_740_791);
+    expect(normalizeHeartbeatExitCodeForPersistence(2_147_483_648)).toBe(-2_147_483_648);
+    expect(normalizeHeartbeatExitCodeForPersistence(4_294_967_295)).toBe(-1);
+    expect(normalizeHeartbeatExitCodeForPersistence(-2_147_483_648)).toBe(-2_147_483_648);
+    expect(normalizeHeartbeatExitCodeForPersistence(2_147_483_647)).toBe(2_147_483_647);
+    expect(normalizeHeartbeatExitCodeForPersistence(4_294_967_296)).toBeNull();
+    expect(normalizeHeartbeatExitCodeForPersistence(-2_147_483_649)).toBeNull();
+    expect(normalizeHeartbeatExitCodeForPersistence(1.5)).toBeNull();
+    expect(normalizeHeartbeatExitCodeForPersistence(Number.NaN)).toBeNull();
+    expect(normalizeHeartbeatExitCodeForPersistence(Number.POSITIVE_INFINITY)).toBeNull();
+    expect(normalizeHeartbeatExitCodeForPersistence(Number.NEGATIVE_INFINITY)).toBeNull();
+
+    expect(normalizeAdapterExecutionResultForPersistence({
+      exitCode: 3_221_226_505,
+      signal: null,
+      timedOut: false,
+    }).exitCode).toBe(-1_073_740_791);
+    expect(() => normalizeAdapterExecutionResultForPersistence({
+      exitCode: 4_294_967_296,
+      signal: null,
+      timedOut: false,
+    })).toThrow(/PostgreSQL int4/);
   });
 
   it("rejects a proxy root without triggering its traps", () => {

@@ -16,6 +16,10 @@ const MAX_OBJECT_KEYS = 2_000;
 const MAX_STRING_CHARS = 1_000_000;
 const MAX_TOTAL_STRING_CHARS = 4_000_000;
 const MAX_KEY_CHARS = 1_024;
+const POSTGRES_INT32_MIN = -2_147_483_648;
+const POSTGRES_INT32_MAX = 2_147_483_647;
+const WINDOWS_UINT32_MAX = 4_294_967_295;
+const UINT32_MODULUS = 4_294_967_296;
 
 const SECRET_PAYLOAD_KEY_RE =
   /[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*/i;
@@ -97,6 +101,16 @@ export class InvalidAdapterExecutionResultError extends Error {
     super(`Adapter returned an invalid execution result: ${reason}`);
     this.name = "InvalidAdapterExecutionResultError";
   }
+}
+
+export function normalizeHeartbeatExitCodeForPersistence(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isInteger(value)) return null;
+  if (value >= POSTGRES_INT32_MIN && value <= POSTGRES_INT32_MAX) return value;
+  if (value > POSTGRES_INT32_MAX && value <= WINDOWS_UINT32_MAX) {
+    return value - UINT32_MODULUS;
+  }
+  return null;
 }
 
 function prepareBoundedPersistenceText(value: string, maxChars: number) {
@@ -718,8 +732,11 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
   const rawExitCode = candidates.get("exitCode")?.value;
   const rawSignal = candidates.get("signal")?.value;
   const rawTimedOut = candidates.get("timedOut")?.value;
-  if (rawExitCode !== null && (typeof rawExitCode !== "number" || !Number.isInteger(rawExitCode))) {
-    throw new InvalidAdapterExecutionResultError("exitCode must be an integer or null");
+  const normalizedExitCode = normalizeHeartbeatExitCodeForPersistence(rawExitCode);
+  if (rawExitCode !== null && normalizedExitCode === null) {
+    throw new InvalidAdapterExecutionResultError(
+      "exitCode must fit PostgreSQL int4, be a Windows uint32 process code, or be null",
+    );
   }
   if (rawSignal !== null && typeof rawSignal !== "string") {
     throw new InvalidAdapterExecutionResultError("signal must be a string or null");
@@ -768,7 +785,7 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
     state.outputSlots += 1;
   };
 
-  storeField("exitCode", rawExitCode, true);
+  storeField("exitCode", normalizedExitCode, true);
   storeField("signal", rawSignal, true);
   storeField("timedOut", rawTimedOut, true);
   for (const field of PRIORITIZED_OPTIONAL_FIELDS) {

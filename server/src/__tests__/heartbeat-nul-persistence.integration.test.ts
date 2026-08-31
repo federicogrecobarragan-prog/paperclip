@@ -99,6 +99,37 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 5_000) {
   return fn();
 }
 
+async function waitForHeartbeatQuiescence(
+  db: ReturnType<typeof createDb>,
+  timeoutMs = 10_000,
+) {
+  const isQuiescent = async () => {
+    const [activeRuns, activeWakeups, activeAgents] = await Promise.all([
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.status, ["queued", "running"])),
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(inArray(agentWakeupRequests.status, ["queued", "claimed"])),
+      db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.status, "running")),
+    ]);
+    return activeRuns.length === 0 && activeWakeups.length === 0 && activeAgents.length === 0;
+  };
+
+  if (!await waitForCondition(isQuiescent, timeoutMs)) {
+    throw new Error("Heartbeat test database did not become quiescent");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  if (!await waitForCondition(isQuiescent, timeoutMs)) {
+    throw new Error("Heartbeat test database did not remain quiescent");
+  }
+}
+
 describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -107,24 +138,19 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-nul-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     releaseBlockedFollowUps?.();
     releaseBlockedFollowUps = null;
-    await waitForCondition(async () => {
-      const active = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.status, ["queued", "running"]));
-      return active.length === 0;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await waitForHeartbeatQuiescence(db);
     vi.clearAllMocks();
     vi.restoreAllMocks();
   });
 
   afterAll(async () => {
+    if (tempDb) await waitForHeartbeatQuiescence(db);
+    await db?.$client.end({ timeout: 0 });
     await tempDb?.cleanup();
   });
 
@@ -255,6 +281,48 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(terminal?.error).toContain("errorMessage must be a data property");
     expect(wakeup?.status).toBe("failed");
     expect(wakeup?.status).not.toBe("completed");
+  });
+
+  it("persists an unsigned Windows process code as signed int4 and reaches a terminal state", async () => {
+    const { agentId } = await seedAgent();
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 3_221_226_505,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Windows process terminated with 0xC0000409",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+    });
+    expect(queued).toBeTruthy();
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    await waitForCondition(async () => {
+      const [currentWakeup] = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.runId, queued!.id));
+      return currentWakeup?.status === "failed";
+    });
+    const [wakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+    const active = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, queued!.id),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+      ));
+
+    expect(terminal?.status).toBe("failed");
+    expect(terminal?.exitCode).toBe(-1_073_740_791);
+    expect(terminal?.error).toContain("0xC0000409");
+    expect(wakeup?.status).toBe("failed");
+    expect(active).toHaveLength(0);
   });
 
   it("fails closed on an invalid runtime-service report and fabricates no service", async () => {

@@ -191,6 +191,7 @@ import {
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
   normalizeAdapterExecutionResultForPersistence,
+  normalizeHeartbeatExitCodeForPersistence,
   sanitizeHeartbeatPersistenceRecord,
   sanitizeHeartbeatPersistenceText,
   sanitizeHeartbeatPersistenceValue,
@@ -6275,7 +6276,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: typeof patch.errorCode === "string"
           ? sanitizeHeartbeatPersistenceText(patch.errorCode)
           : status === "succeeded" ? null : "terminal_persistence_fallback",
-        exitCode: typeof patch.exitCode === "number" ? patch.exitCode : null,
+        exitCode: normalizeHeartbeatExitCodeForPersistence(patch.exitCode),
         signal: typeof patch.signal === "string"
           ? sanitizeHeartbeatPersistenceText(patch.signal)
           : null,
