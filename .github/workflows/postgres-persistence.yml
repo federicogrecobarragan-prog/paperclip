@@ -11,6 +11,7 @@ on:
       - "server/src/services/heartbeat-persistence-safety-postgres.test.ts"
       - "server/src/services/heartbeat-persistence-safety.ts"
       - "server/src/services/heartbeat.ts"
+      - "packages/db/src/test-embedded-postgres.test.ts"
       - "packages/db/src/test-embedded-postgres.ts"
       - "packages/db/src/embedded-postgres-native.ts"
       - "packages/db/src/migrations/**"
