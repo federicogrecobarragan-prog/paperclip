@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import postgres from "postgres";
 import { applyPendingMigrations, ensurePostgresDatabase } from "./client.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
@@ -37,12 +39,31 @@ export type EmbeddedPostgresTestDatabase = {
 let embeddedPostgresSupportPromise: Promise<EmbeddedPostgresTestSupport> | null = null;
 
 const DEFAULT_PAPERCLIP_EMBEDDED_POSTGRES_PORT = 54329;
+const DEFAULT_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS = 10_000;
+const DEFAULT_EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 2_000;
+const DEFAULT_EXTERNAL_TEST_DATABASE_HOSTS = ["localhost", "127.0.0.1", "::1"];
+const execFileAsync = promisify(execFile);
 
 function getExternalTestDatabaseUrl(): string | null {
   return process.env.PAPERCLIP_TEST_DATABASE_URL?.trim() || null;
 }
 
 const EXPLICIT_TEST_DATABASE_NAME = /(^|[_-])(test|testing|ci|tmp|temp|ephemeral)([_-]|$)/i;
+
+function normalizeDatabaseHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+function getAllowedExternalTestDatabaseHosts(): Set<string> {
+  return new Set(
+    [
+      ...DEFAULT_EXTERNAL_TEST_DATABASE_HOSTS,
+      ...String(process.env.PAPERCLIP_TEST_DATABASE_ALLOWED_HOSTS ?? "").split(","),
+    ]
+      .map((hostname) => normalizeDatabaseHostname(hostname.trim()))
+      .filter(Boolean),
+  );
+}
 
 export function validateExternalTestDatabaseUrl(rawUrl: string): URL {
   let parsed: URL;
@@ -53,6 +74,13 @@ export function validateExternalTestDatabaseUrl(rawUrl: string): URL {
   }
   if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
     throw new Error("PAPERCLIP_TEST_DATABASE_URL must use the postgres or postgresql protocol");
+  }
+  const hostname = normalizeDatabaseHostname(parsed.hostname);
+  if (!getAllowedExternalTestDatabaseHosts().has(hostname)) {
+    throw new Error(
+      `PAPERCLIP_TEST_DATABASE_URL host "${parsed.hostname}" is not explicitly allowed; ` +
+      "use a loopback host or add the exact hostname to PAPERCLIP_TEST_DATABASE_ALLOWED_HOSTS",
+    );
   }
   const databaseName = decodeURIComponent(parsed.pathname.replace(/^\//, ""));
   if (!databaseName || databaseName.includes("/") || !EXPLICIT_TEST_DATABASE_NAME.test(databaseName)) {
@@ -177,25 +205,92 @@ async function getAvailablePort(): Promise<number> {
 }
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
   const port = await getAvailablePort();
   const EmbeddedPostgres = await getEmbeddedPostgresCtor();
-  const instance = new EmbeddedPostgres({
-    databaseDir: dataDir,
-    user: "paperclip",
-    password: "paperclip",
-    port,
-    persistent: true,
-    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    onLog: () => {},
-    onError: () => {},
-  });
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
+  try {
+    const instance = new EmbeddedPostgres({
+      databaseDir: dataDir,
+      user: "paperclip",
+      password: "paperclip",
+      port,
+      persistent: true,
+      initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+      onLog: () => {},
+      onError: () => {},
+    });
 
-  return { dataDir, port, instance };
+    return { dataDir, port, instance };
+  } catch (error) {
+    cleanupEmbeddedPostgresTestDirs(dataDir);
+    throw error;
+  }
 }
 
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
+
+async function terminateEmbeddedPostgresProcessesForDataDir(dataDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    const script = [
+      "$target = $env:PAPERCLIP_TEST_POSTGRES_DATA_DIR",
+      "Get-CimInstance Win32_Process | Where-Object {",
+      "  $processName = [string]$_.Name",
+      "  $commandLine = [string]$_.CommandLine",
+      "  ($processName -ieq \"initdb.exe\" -or $processName -ieq \"postgres.exe\") -and",
+      "    $commandLine.Contains($target)",
+      "} | ForEach-Object {",
+      "  & taskkill.exe /PID ([string]$_.ProcessId) /T /F | Out-Null",
+      "}",
+    ].join("\n");
+    await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      env: { ...process.env, PAPERCLIP_TEST_POSTGRES_DATA_DIR: dataDir },
+      timeout: 5_000,
+      windowsHide: true,
+    });
+    return;
+  }
+
+  const { stdout } = await execFileAsync("ps", ["-eo", "pid=,args="], { timeout: 5_000 });
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1]!, 10);
+    const commandLine = match[2]!;
+    if (
+      pid !== process.pid &&
+      (commandLine.includes(`--pgdata=${dataDir}`) || commandLine.includes(`-D ${dataDir}`))
+    ) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+  }
+}
+
+async function removeEmbeddedPostgresTestDir(dataDir: string): Promise<void> {
+  try {
+    cleanupEmbeddedPostgresTestDirs(dataDir);
+  } catch (initialCleanupError) {
+    let terminationError: unknown;
+    try {
+      await terminateEmbeddedPostgresProcessesForDataDir(dataDir);
+    } catch (error) {
+      terminationError = error;
+    }
+
+    try {
+      cleanupEmbeddedPostgresTestDirs(dataDir);
+    } catch (retryCleanupError) {
+      throw new AggregateError(
+        [initialCleanupError, terminationError, retryCleanupError].filter(Boolean),
+        "Embedded PostgreSQL test data directory cleanup failed after terminating its processes",
+      );
+    }
+  }
 }
 
 function formatEmbeddedPostgresError(error: unknown): string {
@@ -204,9 +299,71 @@ function formatEmbeddedPostgresError(error: unknown): string {
   return "embedded Postgres startup failed";
 }
 
+function getEmbeddedPostgresStartupTimeoutMs(): number {
+  const configured = Number.parseInt(
+    process.env.PAPERCLIP_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS ?? "",
+    10,
+  );
+  return Number.isInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS;
+}
+
+async function runEmbeddedPostgresOperationWithTimeout<T>(
+  operation: () => Promise<T>,
+  phase: string,
+  timeoutMs: number,
+): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`Embedded PostgreSQL ${phase} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timeout.unref();
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function startEmbeddedPostgresInstance(
+  instance: EmbeddedPostgresInstance,
+  timeoutMs: number,
+): Promise<void> {
+  await runEmbeddedPostgresOperationWithTimeout(
+    () => instance.initialise(),
+    "initialise",
+    timeoutMs,
+  );
+  await runEmbeddedPostgresOperationWithTimeout(() => instance.start(), "start", timeoutMs);
+}
+
+async function cleanupEmbeddedPostgresTestInstance(
+  instance: EmbeddedPostgresInstance | null,
+  dataDir: string | null,
+  startupTimeoutMs: number,
+): Promise<void> {
+  try {
+    if (instance) {
+      await runEmbeddedPostgresOperationWithTimeout(
+        () => instance.stop(),
+        "stop",
+        Math.min(startupTimeoutMs, DEFAULT_EMBEDDED_POSTGRES_STOP_TIMEOUT_MS),
+      ).catch(() => {});
+    }
+  } finally {
+    if (dataDir) await removeEmbeddedPostgresTestDir(dataDir);
+  }
+}
+
 async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSupport> {
   let dataDir: string | null = null;
   let instance: EmbeddedPostgresInstance | null = null;
+  const startupTimeoutMs = getEmbeddedPostgresStartupTimeoutMs();
 
   try {
     const created = await createEmbeddedPostgresTestInstance(
@@ -214,8 +371,7 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
     );
     dataDir = created.dataDir;
     instance = created.instance;
-    await instance.initialise();
-    await instance.start();
+    await startEmbeddedPostgresInstance(instance, startupTimeoutMs);
     return { supported: true };
   } catch (error) {
     return {
@@ -223,8 +379,7 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
       reason: formatEmbeddedPostgresError(error),
     };
   } finally {
-    await instance?.stop().catch(() => {});
-    if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
+    await cleanupEmbeddedPostgresTestInstance(instance, dataDir, startupTimeoutMs);
   }
 }
 
@@ -250,30 +405,31 @@ export async function startEmbeddedPostgresTestDatabase(
 
   let dataDir: string | null = null;
   let instance: EmbeddedPostgresInstance | null = null;
+  const startupTimeoutMs = getEmbeddedPostgresStartupTimeoutMs();
 
   try {
     const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
     dataDir = created.dataDir;
     instance = created.instance;
     const { port } = created;
-    await instance.initialise();
-    await instance.start();
+    await startEmbeddedPostgresInstance(instance, startupTimeoutMs);
 
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
     await applyPendingMigrations(connectionString);
 
+    let cleaned = false;
     return {
       connectionString,
       cleanup: async () => {
-        await instance?.stop().catch(() => {});
-        if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
+        if (cleaned) return;
+        await cleanupEmbeddedPostgresTestInstance(instance, dataDir, startupTimeoutMs);
+        cleaned = true;
       },
     };
   } catch (error) {
-    await instance?.stop().catch(() => {});
-    if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
+    await cleanupEmbeddedPostgresTestInstance(instance, dataDir, startupTimeoutMs);
     throw new Error(
       `Failed to start embedded PostgreSQL test database: ${formatEmbeddedPostgresError(error)}`,
     );
