@@ -78,9 +78,18 @@ jobs:
             local test_file="$2"
             local report_file="$(basename "$test_file").junit.xml"
 
-            pnpm exec vitest run --project "$project" "$test_file" \
-              --pool=forks --isolate --reporter=verbose --reporter=junit \
-              --outputFile.junit="$report_file"
+            # This unit file mocks embedded-postgres lifecycle timeouts. It
+            # must not inherit the external-service URL, which intentionally
+            # bypasses that embedded path. The integration suites do inherit it.
+            if [[ "$project" == "@paperclipai/db" ]]; then
+              PAPERCLIP_TEST_DATABASE_URL= pnpm exec vitest run --project "$project" "$test_file" \
+                --pool=forks --isolate --reporter=verbose --reporter=junit \
+                --outputFile.junit="$report_file"
+            else
+              pnpm exec vitest run --project "$project" "$test_file" \
+                --pool=forks --isolate --reporter=verbose --reporter=junit \
+                --outputFile.junit="$report_file"
+            fi
 
             if grep -q '<skipped' "$report_file"; then
               echo "::error::${test_file} contained skipped tests; PostgreSQL CI must not pass on a skip."
