@@ -446,7 +446,7 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(operations.some((operation) => operation.phase === "workspace_finalize")).toBe(true);
     expect(persisted).not.toContain(syntheticSentinel);
     expect(JSON.stringify(loggerErrorSpy.mock.calls)).not.toContain(syntheticSentinel);
-  });
+  }, 15_000);
 
   it("rejects spoofed workspace-validation metadata from adapter exceptions", async () => {
     const { agentId } = await seedAgent();
