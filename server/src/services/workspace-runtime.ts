@@ -74,11 +74,64 @@ export class WorkspaceRuntimeValidationFailure extends Error {
   code = "workspace_validation_failed" as const;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(
+    message: string,
+    resultJson: Record<string, unknown>,
+    authenticityToken?: unknown,
+  ) {
     super(message);
     this.name = "WorkspaceRuntimeValidationFailure";
     this.resultJson = resultJson;
+    if (authenticityToken === WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN) {
+      authenticWorkspaceRuntimeValidationFailures.set(this, {
+        message: this.message,
+        resultJson: snapshotWorkspaceRuntimeValidationResultJson(resultJson),
+      });
+    }
   }
+}
+
+const WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN = Symbol(
+  "paperclip.workspace-runtime-validation-failure",
+);
+const authenticWorkspaceRuntimeValidationFailures =
+  new WeakMap<WorkspaceRuntimeValidationFailure, {
+    message: string;
+    resultJson: Record<string, unknown>;
+  }>();
+
+function snapshotWorkspaceRuntimeValidationResultJson(
+  resultJson: Record<string, unknown>,
+): Record<string, unknown> {
+  try {
+    return structuredClone(resultJson) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function workspaceRuntimeValidationFailure(
+  message: string,
+  resultJson: Record<string, unknown>,
+) {
+  return new WorkspaceRuntimeValidationFailure(
+    message,
+    resultJson,
+    WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN,
+  );
+}
+
+export function readAuthenticWorkspaceRuntimeValidationFailure(
+  error: unknown,
+): { message: string; resultJson: Record<string, unknown> } | null {
+  const snapshot = authenticWorkspaceRuntimeValidationFailures.get(
+    error as WorkspaceRuntimeValidationFailure,
+  );
+  if (!snapshot) return null;
+  return {
+    message: snapshot.message,
+    resultJson: snapshotWorkspaceRuntimeValidationResultJson(snapshot.resultJson),
+  };
 }
 
 export interface RuntimeServiceRef {
@@ -808,7 +861,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
 }
 
 function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoherenceEvidence) {
-  return new WorkspaceRuntimeValidationFailure(
+  return workspaceRuntimeValidationFailure(
     `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
     {
       workspaceValidation: evidence,
@@ -1860,7 +1913,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       expectedBranchName: realized.branchName,
     });
     if (!validation.valid) {
-      throw new WorkspaceRuntimeValidationFailure(
+      throw workspaceRuntimeValidationFailure(
         `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,
         {
           workspaceValidation: {

@@ -104,7 +104,7 @@ import {
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
-  WorkspaceRuntimeValidationFailure,
+  readAuthenticWorkspaceRuntimeValidationFailure,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
@@ -191,7 +191,7 @@ import {
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
-  InvalidAdapterExecutionResultError,
+  readAuthenticInvalidAdapterExecutionResultErrorMessage,
   normalizeAdapterExecutionResultForPersistence,
   normalizeHeartbeatExitCodeForPersistence,
   sanitizeHeartbeatPersistenceRecord,
@@ -340,11 +340,31 @@ export class WorkspaceValidationFailure extends Error {
   code = WORKSPACE_VALIDATION_FAILURE_CODE;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(message: string, resultJson: Record<string, unknown>, authenticityToken?: unknown) {
     super(message);
     this.name = "WorkspaceValidationFailure";
     this.resultJson = resultJson;
+    if (authenticityToken === WORKSPACE_VALIDATION_FAILURE_TOKEN) {
+      authenticWorkspaceValidationFailures.set(this, {
+        message: this.message,
+        resultJson: snapshotTrustedHeartbeatFailureResultJson(resultJson),
+      });
+    }
   }
+}
+
+const WORKSPACE_VALIDATION_FAILURE_TOKEN = Symbol("paperclip.workspace-validation-failure");
+const authenticWorkspaceValidationFailures = new WeakMap<WorkspaceValidationFailure, {
+  message: string;
+  resultJson: Record<string, unknown>;
+}>();
+
+function workspaceValidationFailure(message: string, resultJson: Record<string, unknown>) {
+  return new WorkspaceValidationFailure(
+    message,
+    resultJson,
+    WORKSPACE_VALIDATION_FAILURE_TOKEN,
+  );
 }
 
 // Pre-dispatch gate outcome: required secret/env bindings are missing, so the
@@ -354,11 +374,99 @@ export class ConfigurationIncompleteFailure extends Error {
   code = CONFIGURATION_INCOMPLETE_FAILURE_CODE;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(message: string, resultJson: Record<string, unknown>, authenticityToken?: unknown) {
     super(message);
     this.name = "ConfigurationIncompleteFailure";
     this.resultJson = resultJson;
+    if (authenticityToken === CONFIGURATION_INCOMPLETE_FAILURE_TOKEN) {
+      authenticConfigurationIncompleteFailures.set(this, {
+        message: this.message,
+        resultJson: snapshotTrustedHeartbeatFailureResultJson(resultJson),
+      });
+    }
   }
+}
+
+const CONFIGURATION_INCOMPLETE_FAILURE_TOKEN = Symbol(
+  "paperclip.configuration-incomplete-failure",
+);
+const authenticConfigurationIncompleteFailures = new WeakMap<ConfigurationIncompleteFailure, {
+  message: string;
+  resultJson: Record<string, unknown>;
+}>();
+
+function configurationIncompleteFailure(
+  message: string,
+  resultJson: Record<string, unknown>,
+) {
+  return new ConfigurationIncompleteFailure(
+    message,
+    resultJson,
+    CONFIGURATION_INCOMPLETE_FAILURE_TOKEN,
+  );
+}
+
+function snapshotTrustedHeartbeatFailureResultJson(
+  resultJson: Record<string, unknown>,
+): Record<string, unknown> {
+  try {
+    return structuredClone(resultJson) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+type TrustedHeartbeatFailureSnapshot = {
+  message: string;
+  resultJson: Record<string, unknown>;
+};
+
+function readAuthenticWorkspaceValidationFailure(
+  error: unknown,
+): TrustedHeartbeatFailureSnapshot | null {
+  const snapshot = authenticWorkspaceValidationFailures.get(
+    error as WorkspaceValidationFailure,
+  );
+  if (snapshot) {
+    return {
+      message: snapshot.message,
+      resultJson: snapshotTrustedHeartbeatFailureResultJson(snapshot.resultJson),
+    };
+  }
+  return readAuthenticWorkspaceRuntimeValidationFailure(error);
+}
+
+function readAuthenticConfigurationIncompleteFailure(
+  error: unknown,
+): TrustedHeartbeatFailureSnapshot | null {
+  const snapshot = authenticConfigurationIncompleteFailures.get(
+    error as ConfigurationIncompleteFailure,
+  );
+  if (!snapshot) return null;
+  return {
+    message: snapshot.message,
+    resultJson: snapshotTrustedHeartbeatFailureResultJson(snapshot.resultJson),
+  };
+}
+
+export function readTrustedHeartbeatFailurePersistenceDetails(
+  error: unknown,
+): { errorCode: string; resultJson: Record<string, unknown> } | null {
+  const workspaceFailure = readAuthenticWorkspaceValidationFailure(error);
+  if (workspaceFailure) {
+    return {
+      errorCode: WORKSPACE_VALIDATION_FAILURE_CODE,
+      resultJson: workspaceFailure.resultJson,
+    };
+  }
+  const configurationFailure = readAuthenticConfigurationIncompleteFailure(error);
+  if (configurationFailure) {
+    return {
+      errorCode: CONFIGURATION_INCOMPLETE_FAILURE_CODE,
+      resultJson: configurationFailure.resultJson,
+    };
+  }
+  return null;
 }
 
 export function sanitizeHeartbeatFailureMessage(
@@ -366,24 +474,15 @@ export function sanitizeHeartbeatFailureMessage(
   currentUserRedactionOptions?: CurrentUserRedactionOptions,
   fallback = "Heartbeat execution failed",
 ) {
-  if (
-    !(error instanceof WorkspaceValidationFailure) &&
-    !(error instanceof WorkspaceRuntimeValidationFailure) &&
-    !(error instanceof ConfigurationIncompleteFailure) &&
-    !(error instanceof InvalidAdapterExecutionResultError)
-  ) {
+  const trustedMessage =
+    readAuthenticWorkspaceValidationFailure(error)?.message ??
+    readAuthenticConfigurationIncompleteFailure(error)?.message ??
+    readAuthenticInvalidAdapterExecutionResultErrorMessage(error);
+  if (trustedMessage === null) {
     return sanitizeHeartbeatPersistenceText(fallback);
   }
-
-  let rawMessage = "Unknown heartbeat failure";
-  try {
-    rawMessage = error.message;
-  } catch {
-    // A hostile error subclass may reject message access. Keep the persistence
-    // and logger boundary deterministic and secret-free.
-  }
   return sanitizeHeartbeatPersistenceText(
-    redactCurrentUserText(rawMessage, currentUserRedactionOptions),
+    redactCurrentUserText(trustedMessage, currentUserRedactionOptions),
   );
 }
 
@@ -661,7 +760,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     ))
     : false;
   if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured) {
-    throw new ConfigurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
+    throw configurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
       configurationIncomplete: {
         reason: requiredScopedEnvBinding.reason,
         companyId: input.companyId,
@@ -736,7 +835,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       );
       if (requiredMissingBindings.length > 0) {
         const detail = requiredMissingBindings.map(formatMissingBindingForOperator).join("; ");
-        throw new ConfigurationIncompleteFailure(
+        throw configurationIncompleteFailure(
           `configuration incomplete: ${requiredScopedEnvBinding.remediation}; ${detail}`,
           {
             configurationIncomplete: {
@@ -756,7 +855,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     }
     if (missingBindings.length > 0) {
       const detail = missingBindings.map(formatMissingBindingForOperator).join("; ");
-      throw new ConfigurationIncompleteFailure(`configuration incomplete: ${detail}`, {
+      throw configurationIncompleteFailure(`configuration incomplete: ${detail}`, {
         configurationIncomplete: {
           reason: "secret_binding_missing",
           companyId: input.companyId,
@@ -884,7 +983,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       return typeof value === "string" && value.trim().length > 0;
     });
     if (blockedPaygKeys.length > 0) {
-      throw new ConfigurationIncompleteFailure(
+      throw configurationIncompleteFailure(
         `subscription-only mode: PAYG provider key(s) blocked in run env: ${blockedPaygKeys.join(", ")}. ` +
           "Remove them from the agent adapterConfig.env / environment / project / routine bindings to run on subscription auth.",
         {
@@ -1299,16 +1398,6 @@ async function ensureManagedProjectWorkspace(input: {
   }
 }
 
-type WorkspaceValidationFailureLike = WorkspaceValidationFailure | WorkspaceRuntimeValidationFailure;
-
-function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailureLike {
-  // Only failures constructed by Paperclip may carry validation metadata into
-  // persistence. Adapter/provider exceptions are untrusted and can spoof a
-  // structural `code`/`resultJson` shape to smuggle opaque values into a run.
-  return error instanceof WorkspaceValidationFailure ||
-    error instanceof WorkspaceRuntimeValidationFailure;
-}
-
 function isWorkspaceValidationFailedRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
 ) {
@@ -1345,10 +1434,6 @@ function fingerprintFinalizeWorkspaceBranchValidation(input: {
     }))
     .digest("hex");
   return `workspace_finalize_branch_mismatch:v1:sha256:${digest}`;
-}
-
-function isConfigurationIncompleteFailure(error: unknown): error is ConfigurationIncompleteFailure {
-  return error instanceof ConfigurationIncompleteFailure;
 }
 
 function isConfigurationIncompleteFailedRun(
@@ -1406,7 +1491,7 @@ export async function assertPushCapabilityCheckoutValid(input: {
   const cwd = readNonEmptyString(input.cwd);
   if (!cwd) return;
   if (await hasGitPushRemote(cwd)) return;
-  throw new WorkspaceValidationFailure(
+  throw workspaceValidationFailure(
     `Issue ${input.issue.identifier ?? input.issue.id} requested the GitHub PR workflow, but checkout "${cwd}" has no configured push remote. Bind the run to a writable repo checkout before dispatching the agent.`,
     {
       workspaceValidation: {
@@ -1460,7 +1545,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     input.executionWorkspace.strategy === "git_worktree";
 
   const fail = (reason: string, message: string, extra: Record<string, unknown> = {}) => {
-    throw new WorkspaceValidationFailure(message, {
+    throw workspaceValidationFailure(message, {
       workspaceValidation: {
         reason,
         adapterType: input.adapterType,
@@ -11316,7 +11401,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   recorder: workspaceOperationRecorder,
                 });
               } catch (repairErr) {
-                const workspaceValidationFailure = isWorkspaceValidationFailure(repairErr) ? repairErr : null;
+                const workspaceValidationFailure =
+                  readAuthenticWorkspaceValidationFailure(repairErr);
+                const repairFailureMessage = workspaceValidationFailure?.message ??
+                  "Managed git worktree branch repair failed; raw diagnostic omitted";
                 finalizeBranchMetadata = {
                   executionWorkspaceId: branchInspection.workspaceRecord.id,
                   ...initialManagedGitWorktreeBranch,
@@ -11325,7 +11413,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   attempted: true,
                   succeeded: false,
                   initial: initialManagedGitWorktreeBranch,
-                  reason: repairErr instanceof Error ? repairErr.message : String(repairErr),
+                  reason: repairFailureMessage,
                 };
                 await workspaceOperationRecorder.recordOperation({
                   phase: "workspace_finalize",
@@ -11342,7 +11430,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   },
                   run: async () => ({
                     status: "failed",
-                    stderr: `Managed git worktree branch check failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)}\n`,
+                    stderr: `Managed git worktree branch check failed: ${repairFailureMessage}\n`,
                   }),
                 });
                 adapterFinalizeOutcome = "failed";
@@ -11390,7 +11478,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 }),
               });
               adapterFinalizeOutcome = "failed";
-              throw new WorkspaceValidationFailure(
+              throw workspaceValidationFailure(
                 `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${inspection.expectedBranchName}" at "${inspection.worktreePath}", but ${inspection.reason ?? "the checked-out branch could not be verified"}. Record a sanctioned execution-workspace branch transition or restore the workspace branch before completing the run.`,
                 {
                   workspaceValidation: {
@@ -11900,10 +11988,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureRedactionOptions,
         "Adapter execution failed; raw provider diagnostic omitted",
       );
-      const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
-      const configurationIncompleteFailure = isConfigurationIncompleteFailure(err) ? err : null;
-      const failureErrorCode =
-        workspaceValidationFailure?.code ?? configurationIncompleteFailure?.code ?? "adapter_failed";
+      const trustedFailureDetails = readTrustedHeartbeatFailurePersistenceDetails(err);
+      const failureErrorCode = trustedFailureDetails?.errorCode ?? "adapter_failed";
       logger.error({ err: sanitizeHeartbeatErrorForLog(err), runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -11935,7 +12021,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
           errorCode: failureErrorCode,
           errorMessage: message,
-          resultJson: workspaceValidationFailure?.resultJson ?? configurationIncompleteFailure?.resultJson ?? null,
+          resultJson: trustedFailureDetails?.resultJson ?? null,
         }),
         stdoutExcerpt,
         stderrExcerpt,
@@ -12016,10 +12102,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // A missing secret/env binding is a known pre-dispatch configuration gap,
           // not an opaque setup crash. Surface it with its own errorCode so the
           // recovery path routes it to a human owner instead of looping retries.
-          const workspaceValidationSetupFailure = isWorkspaceValidationFailure(outerErr) ? outerErr : null;
-          const configurationIncompleteSetupFailure = isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
-          const setupFailureErrorCode =
-            workspaceValidationSetupFailure?.code ?? configurationIncompleteSetupFailure?.code ?? "setup_failed";
+          const trustedSetupFailureDetails =
+            readTrustedHeartbeatFailurePersistenceDetails(outerErr);
+          const setupFailureErrorCode = trustedSetupFailureDetails?.errorCode ?? "setup_failed";
           logger.error(
             { err: sanitizeHeartbeatErrorForLog(outerErr), runId },
             "heartbeat execution setup failed",
@@ -12033,8 +12118,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
                 errorCode: setupFailureErrorCode,
                 errorMessage: message,
-                resultJson:
-                  workspaceValidationSetupFailure?.resultJson ?? configurationIncompleteSetupFailure?.resultJson ?? null,
+                resultJson: trustedSetupFailureDetails?.resultJson ?? null,
               }),
             } : {}),
           }).catch(() => ({ run: null, updated: false as const }));

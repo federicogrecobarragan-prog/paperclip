@@ -8,6 +8,7 @@ on:
       - ".github/workflows/postgres-persistence.yml"
       - "server/src/__tests__/heartbeat-nul-persistence.integration.test.ts"
       - "server/src/__tests__/heartbeat-zombie-guard.test.ts"
+      - "server/src/__tests__/heartbeat-workspace-session.test.ts"
       - "server/src/__tests__/heartbeat-process-recovery.test.ts"
       - "server/src/__tests__/error-handler.test.ts"
       - "server/src/__tests__/logger-tz.test.ts"
@@ -131,6 +132,7 @@ jobs:
 
           run_suite @paperclipai/server server/src/__tests__/heartbeat-nul-persistence.integration.test.ts
           run_suite @paperclipai/server server/src/__tests__/heartbeat-zombie-guard.test.ts
+          run_suite @paperclipai/server server/src/__tests__/heartbeat-workspace-session.test.ts
           run_suite @paperclipai/server server/src/__tests__/heartbeat-process-recovery.test.ts
           run_suite @paperclipai/server server/src/__tests__/error-handler.test.ts
           run_suite @paperclipai/server server/src/__tests__/logger-tz.test.ts

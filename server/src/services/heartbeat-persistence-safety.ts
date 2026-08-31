@@ -105,10 +105,34 @@ type SanitizerState = {
 export class InvalidAdapterExecutionResultError extends Error {
   readonly code = "invalid_adapter_execution_result";
 
-  constructor(reason: string) {
+  constructor(reason: string, authenticityToken?: unknown) {
     super(`Adapter returned an invalid execution result: ${reason}`);
     this.name = "InvalidAdapterExecutionResultError";
+    if (authenticityToken === INVALID_ADAPTER_EXECUTION_RESULT_ERROR_TOKEN) {
+      authenticInvalidAdapterExecutionResultErrors.set(this, this.message);
+    }
   }
+}
+
+const INVALID_ADAPTER_EXECUTION_RESULT_ERROR_TOKEN = Symbol(
+  "paperclip.invalid-adapter-execution-result-error",
+);
+const authenticInvalidAdapterExecutionResultErrors =
+  new WeakMap<InvalidAdapterExecutionResultError, string>();
+
+function invalidAdapterExecutionResultError(reason: string) {
+  return new InvalidAdapterExecutionResultError(
+    reason,
+    INVALID_ADAPTER_EXECUTION_RESULT_ERROR_TOKEN,
+  );
+}
+
+export function readAuthenticInvalidAdapterExecutionResultErrorMessage(
+  error: unknown,
+): string | null {
+  return authenticInvalidAdapterExecutionResultErrors.get(
+    error as InvalidAdapterExecutionResultError,
+  ) ?? null;
 }
 
 export function normalizeHeartbeatExitCodeForPersistence(value: unknown): number | null {
@@ -478,7 +502,7 @@ function isRawPlainRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function invalidContract(reason: string): never {
-  throw new InvalidAdapterExecutionResultError(reason);
+  throw invalidAdapterExecutionResultError(reason);
 }
 
 function readContractField(
@@ -724,21 +748,21 @@ const PRIORITIZED_OPTIONAL_FIELDS: readonly AdapterExecutionResultField[] = [
 
 export function normalizeAdapterExecutionResultForPersistence(input: unknown): AdapterExecutionResult {
   if (!input || typeof input !== "object" || utilTypes.isProxy(input) || !isPlainRecord(input)) {
-    throw new InvalidAdapterExecutionResultError("root value must be a plain, non-proxy object");
+    throw invalidAdapterExecutionResultError("root value must be a plain, non-proxy object");
   }
 
   const candidates = new Map<AdapterExecutionResultField, KnownFieldCandidate>();
   for (const field of ADAPTER_EXECUTION_RESULT_FIELDS) {
     const candidate = ownDataField(input, field);
     if (candidate.present && candidate.accessor) {
-      throw new InvalidAdapterExecutionResultError(`${field} must be a data property`);
+      throw invalidAdapterExecutionResultError(`${field} must be a data property`);
     }
     candidates.set(field, candidate);
   }
 
   for (const field of ["exitCode", "signal", "timedOut"] as const) {
     if (!candidates.get(field)?.present) {
-      throw new InvalidAdapterExecutionResultError(`missing required field ${field}`);
+      throw invalidAdapterExecutionResultError(`missing required field ${field}`);
     }
   }
 
@@ -747,15 +771,15 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
   const rawTimedOut = candidates.get("timedOut")?.value;
   const normalizedExitCode = normalizeHeartbeatExitCodeForPersistence(rawExitCode);
   if (rawExitCode !== null && normalizedExitCode === null) {
-    throw new InvalidAdapterExecutionResultError(
+    throw invalidAdapterExecutionResultError(
       "exitCode must fit PostgreSQL int4, be a Windows uint32 process code, or be null",
     );
   }
   if (rawSignal !== null && typeof rawSignal !== "string") {
-    throw new InvalidAdapterExecutionResultError("signal must be a string or null");
+    throw invalidAdapterExecutionResultError("signal must be a string or null");
   }
   if (typeof rawTimedOut !== "boolean") {
-    throw new InvalidAdapterExecutionResultError("timedOut must be a boolean");
+    throw invalidAdapterExecutionResultError("timedOut must be a boolean");
   }
 
   for (const field of ADAPTER_EXECUTION_RESULT_FIELDS.slice(3)) {
@@ -808,7 +832,7 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
 
   const encodedBytes = Buffer.byteLength(JSON.stringify(output), "utf8");
   if (encodedBytes > MAX_OUTPUT_BYTES) {
-    throw new InvalidAdapterExecutionResultError(
+    throw invalidAdapterExecutionResultError(
       `serialized output exceeded ${MAX_OUTPUT_BYTES} bytes after sanitization`,
     );
   }

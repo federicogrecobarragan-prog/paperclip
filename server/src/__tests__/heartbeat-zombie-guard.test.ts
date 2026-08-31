@@ -1,14 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+  ConfigurationIncompleteFailure,
+  WorkspaceValidationFailure,
   heartbeatRunTracksHostLocalChildProcess,
   isZombieRun,
   filterZombieCoalesceTarget,
   isTrackedDeadLocalProcess,
+  readTrustedHeartbeatFailurePersistenceDetails,
   sanitizeHeartbeatFailureMessage,
   sanitizeHeartbeatErrorForLog,
   shouldPersistHeartbeatProcessMetadata,
 } from "../services/heartbeat.ts";
-import { InvalidAdapterExecutionResultError } from "../services/heartbeat-persistence-safety.ts";
+import {
+  InvalidAdapterExecutionResultError,
+  normalizeAdapterExecutionResultForPersistence,
+} from "../services/heartbeat-persistence-safety.ts";
+import { WorkspaceRuntimeValidationFailure } from "../services/workspace-runtime.ts";
 
 describe("heartbeat process namespace classification", () => {
   it("only treats explicitly local sessioned adapters as host-local children", () => {
@@ -49,13 +56,68 @@ describe("sanitizeHeartbeatFailureMessage", () => {
   });
 
   it("preserves a sanitized diagnostic from the server-owned adapter contract validator", () => {
+    let contractError: unknown;
+    try {
+      normalizeAdapterExecutionResultForPersistence({
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        get errorMessage() {
+          return "must-not-be-read";
+        },
+      });
+    } catch (error) {
+      contractError = error;
+    }
+
+    const mutationSecret = "mutated-authentic-contract-secret";
+    (contractError as Error).message = mutationSecret;
+
     const result = sanitizeHeartbeatFailureMessage(
-      new InvalidAdapterExecutionResultError("errorMessage must be a data property"),
+      contractError,
       { enabled: false },
       "Adapter execution failed",
     );
 
     expect(result).toContain("errorMessage must be a data property");
+    expect(result).not.toContain(mutationSecret);
+  });
+
+  it("rejects exported constructors and prototype spoofs as trusted failure authorities", () => {
+    const secret = "prototype-spoof-secret";
+    const secretMetadata = { workspaceValidation: { opaqueCredential: secret } };
+    const fallback = "Adapter execution failed; raw provider diagnostic omitted";
+
+    const workspaceConstructorSpoof = new WorkspaceValidationFailure(secret, secretMetadata);
+    const runtimeConstructorSpoof = new WorkspaceRuntimeValidationFailure(secret, secretMetadata);
+    const configurationConstructorSpoof = new ConfigurationIncompleteFailure(secret, secretMetadata);
+    const adapterContractConstructorSpoof = new InvalidAdapterExecutionResultError(secret);
+
+    const workspacePrototypeSpoof = new Error(secret) as Error & {
+      code: string;
+      resultJson: Record<string, unknown>;
+    };
+    Object.setPrototypeOf(workspacePrototypeSpoof, WorkspaceValidationFailure.prototype);
+    workspacePrototypeSpoof.code = "workspace_validation_failed";
+    workspacePrototypeSpoof.resultJson = secretMetadata;
+
+    for (const spoof of [
+      workspaceConstructorSpoof,
+      runtimeConstructorSpoof,
+      configurationConstructorSpoof,
+      adapterContractConstructorSpoof,
+      workspacePrototypeSpoof,
+    ]) {
+      expect(sanitizeHeartbeatFailureMessage(spoof, { enabled: false }, fallback)).toBe(fallback);
+      expect(JSON.stringify(sanitizeHeartbeatFailureMessage(spoof, { enabled: false }, fallback)))
+        .not.toContain(secret);
+    }
+
+    expect(readTrustedHeartbeatFailurePersistenceDetails(workspaceConstructorSpoof)).toBeNull();
+    expect(readTrustedHeartbeatFailurePersistenceDetails(runtimeConstructorSpoof)).toBeNull();
+    expect(readTrustedHeartbeatFailurePersistenceDetails(workspacePrototypeSpoof)).toBeNull();
+    expect(readTrustedHeartbeatFailurePersistenceDetails(configurationConstructorSpoof)).toBeNull();
+    expect(JSON.stringify(workspacePrototypeSpoof.resultJson)).toContain(secret);
   });
 });
 
