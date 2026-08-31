@@ -153,6 +153,15 @@ async function waitForRunToSettle(
   return heartbeat.getRun(runId);
 }
 
+async function waitForRunToLeaveMemory(runId: string, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isHeartbeatRunTrackedInMemory(runId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isHeartbeatRunTrackedInMemory(runId);
+}
+
 async function waitForValue<T>(
   read: () => Promise<T | null | undefined>,
   timeoutMs = 3_000,
@@ -729,7 +738,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
     expect(settledRun?.status).toBe("succeeded");
     expect(settledRun?.errorCode).toBeNull();
-    expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
+    // The database terminal transition occurs before executeRun's finally
+    // releases its in-memory ownership. Assert eventual cleanup rather than
+    // racing that bounded publication/finalization tail.
+    expect(await waitForRunToLeaveMemory(runId)).toBe(true);
   });
 
   it("reaps a dead local pid after the active execution grace expires", async () => {
@@ -885,7 +897,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         timeoutMs: 420_000,
       },
     });
-    expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
+    expect(await waitForRunToLeaveMemory(runId)).toBe(true);
   });
 
   async function seedStrandedIssueFixture(input: {
@@ -1378,7 +1390,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(failedRun).toMatchObject({
       status: "failed",
       errorCode: "adapter_failed",
-      error: "Adapter execution failed",
+      error: "Adapter execution failed; raw provider diagnostic omitted",
     });
 
     const [events, operations, comments, wakeup, runtimeState] = await Promise.all([
@@ -1410,7 +1422,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       phase: "workspace_finalize",
       status: "failed",
       metadata: expect.objectContaining({
-        errorMessage: "Adapter execution failed",
+        errorMessage: "Adapter execution failed; raw provider diagnostic omitted",
       }),
     }));
   });
