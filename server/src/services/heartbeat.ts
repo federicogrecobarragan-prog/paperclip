@@ -190,6 +190,7 @@ import {
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
+  InvalidAdapterExecutionResultError,
   normalizeAdapterExecutionResultForPersistence,
   normalizeHeartbeatExitCodeForPersistence,
   sanitizeHeartbeatPersistenceRecord,
@@ -363,7 +364,11 @@ export function sanitizeHeartbeatFailureMessage(
   currentUserRedactionOptions?: CurrentUserRedactionOptions,
   fallback = "Heartbeat execution failed",
 ) {
-  if (!(error instanceof WorkspaceValidationFailure) && !(error instanceof ConfigurationIncompleteFailure)) {
+  if (
+    !(error instanceof WorkspaceValidationFailure) &&
+    !(error instanceof ConfigurationIncompleteFailure) &&
+    !(error instanceof InvalidAdapterExecutionResultError)
+  ) {
     return sanitizeHeartbeatPersistenceText(fallback);
   }
 

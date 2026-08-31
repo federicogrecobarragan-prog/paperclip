@@ -6,6 +6,7 @@ import {
   isTrackedDeadLocalProcess,
   sanitizeHeartbeatFailureMessage,
 } from "../services/heartbeat.ts";
+import { InvalidAdapterExecutionResultError } from "../services/heartbeat-persistence-safety.ts";
 
 describe("heartbeat process namespace classification", () => {
   it("only treats explicitly local sessioned adapters as host-local children", () => {
@@ -43,6 +44,16 @@ describe("sanitizeHeartbeatFailureMessage", () => {
     expect(result).toBe("Adapter execution failed");
     expect(result).not.toContain(secret);
     expect(result).not.toContain("\u0000");
+  });
+
+  it("preserves a sanitized diagnostic from the server-owned adapter contract validator", () => {
+    const result = sanitizeHeartbeatFailureMessage(
+      new InvalidAdapterExecutionResultError("errorMessage must be a data property"),
+      { enabled: false },
+      "Adapter execution failed",
+    );
+
+    expect(result).toContain("errorMessage must be a data property");
   });
 });
 
