@@ -7,6 +7,8 @@ on:
     paths:
       - ".github/workflows/postgres-persistence.yml"
       - "server/src/__tests__/heartbeat-nul-persistence.integration.test.ts"
+      - "server/src/services/heartbeat-persistence-safety.test.ts"
+      - "server/src/services/heartbeat-persistence-safety-postgres.test.ts"
       - "server/src/services/heartbeat-persistence-safety.ts"
       - "server/src/services/heartbeat.ts"
       - "packages/db/src/test-embedded-postgres.ts"
@@ -26,7 +28,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      PAPERCLIP_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS: "10000"
+      # The test helper creates and drops an isolated database per suite from
+      # this service. Its validation only accepts an unmistakably test-only DB.
+      PAPERCLIP_TEST_DATABASE_URL: postgres://paperclip:paperclip@127.0.0.1:5432/paperclip_test
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: paperclip_test
+          POSTGRES_USER: paperclip
+          POSTGRES_PASSWORD: paperclip
+        options: >-
+          --health-cmd "pg_isready -U paperclip -d paperclip_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
 
     steps:
       - name: Checkout repository
@@ -46,15 +65,37 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # The suite conditionally skips on hosts where embedded PostgreSQL cannot
-      # start. CI must treat that as a failed gate, never as a passing no-op.
-      - name: Require embedded PostgreSQL support
-        run: >-
-          pnpm exec tsx --eval
-          "import { getEmbeddedPostgresTestSupport } from '@paperclipai/db'; void (async () => { const support = await getEmbeddedPostgresTestSupport(); if (!support.supported) { throw new Error('Embedded PostgreSQL is unavailable: ' + (support.reason ?? 'unknown reason')); } })();"
+      # JUnit preserves the exact number of test cases. A skipped suite would
+      # otherwise let Vitest exit successfully, so reject skips and zero-test
+      # reports after every required suite (fail closed).
+      - name: Run PostgreSQL persistence suites (fail closed on skips)
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Run heartbeat NUL persistence suite
-        run: >-
-          pnpm exec vitest --project @paperclipai/server
-          server/src/__tests__/heartbeat-nul-persistence.integration.test.ts
-          --pool=forks --isolate
+          run_suite() {
+            local project="$1"
+            local test_file="$2"
+            local report_file="$(basename "$test_file").junit.xml"
+
+            pnpm exec vitest run --project "$project" "$test_file" \
+              --pool=forks --isolate --reporter=verbose --reporter=junit \
+              --outputFile.junit="$report_file"
+
+            if grep -q '<skipped' "$report_file"; then
+              echo "::error::${test_file} contained skipped tests; PostgreSQL CI must not pass on a skip."
+              exit 1
+            fi
+            if ! grep -qE 'tests="[1-9][0-9]*"' "$report_file"; then
+              echo "::error::${test_file} reported zero executed tests."
+              exit 1
+            fi
+
+            echo "JUnit test count for ${test_file}:"
+            grep -Eo '<testsuites[^>]*tests="[0-9]+"' "$report_file" || true
+          }
+
+          run_suite server server/src/__tests__/heartbeat-nul-persistence.integration.test.ts
+          run_suite server server/src/services/heartbeat-persistence-safety.test.ts
+          run_suite server server/src/services/heartbeat-persistence-safety-postgres.test.ts
+          run_suite packages/db packages/db/src/test-embedded-postgres.test.ts
