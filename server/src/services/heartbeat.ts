@@ -4176,10 +4176,12 @@ export function heartbeatRunTracksHostLocalChildProcess(input: {
   const environment = parseObject(context.paperclipEnvironment);
   const driver = readNonEmptyString(environment.driver);
 
-  // Only an explicitly realized `local` environment owns a PID in this host's
-  // process namespace. Missing/legacy context fails closed: SSH, sandbox,
-  // plugin, and unclassified PIDs must never be probed with process.kill.
-  return driver === "local";
+  // Local adapters spawn either the adapter process itself or, for SSH
+  // environments, a host-local `ssh` child. Both PIDs live in Paperclip's
+  // process namespace and are safe liveness signals. Sandbox/plugin runners
+  // report provider-owned PIDs, so those must never be probed on this host.
+  // Missing/legacy context remains fail-closed.
+  return driver === "local" || driver === "ssh";
 }
 
 function isHeartbeatRunTerminalStatus(
@@ -4774,9 +4776,32 @@ export function resolveNextSessionState(input: {
 
 export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeService>;
 
+export type HeartbeatPostTerminalStep =
+  | "liveness_classification"
+  | "wakeup_finalize"
+  | "run_reload"
+  | "lifecycle_event"
+  | "continuation_summary"
+  | "run_summary_comment"
+  | "retry_scheduling"
+  | "issue_comment_policy"
+  | "issue_execution_release"
+  | "liveness_continuation"
+  | "successful_handoff"
+  | "dependency_wake"
+  | "runtime_state"
+  | "task_session"
+  | "agent_status";
+
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  /** @internal Deterministic fault injection for post-terminal recovery tests. */
+  postTerminalStepFaultInjector?: (input: {
+    runId: string;
+    step: HeartbeatPostTerminalStep;
+    attempt: number;
+  }) => void | Promise<void>;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -4813,6 +4838,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   const taskWatchdogs = taskWatchdogService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
+
+  async function settlePostTerminalStep<T>(input: {
+    runId: string;
+    step: HeartbeatPostTerminalStep;
+    operation: () => Promise<T>;
+    fallback: T;
+    attempts?: number;
+  }): Promise<T> {
+    const attempts = Math.max(1, Math.trunc(input.attempts ?? 1));
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await options.postTerminalStepFaultInjector?.({
+          runId: input.runId,
+          step: input.step,
+          attempt,
+        });
+        return await input.operation();
+      } catch (err) {
+        logger.warn(
+          {
+            err: sanitizeHeartbeatErrorForLog(err),
+            runId: input.runId,
+            step: input.step,
+            attempt,
+            attempts,
+          },
+          "post-terminal heartbeat step failed; continuing finalization",
+        );
+      }
+    }
+    return input.fallback;
+  }
 
   async function releaseEnvironmentLeasesForRun(input: {
     runId: string;
@@ -11032,6 +11089,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let seq = 1;
     let handle: RunLogHandle | null = null;
     let terminalOutcomePersisted: RunSessionOutcome | null = null;
+    let reconcilePersistedTerminalSideEffects: (() => Promise<void>) | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
     let outputSeq = Number(run.lastOutputSeq ?? 0);
@@ -11771,83 +11829,269 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       terminalOutcomePersisted = outcome;
 
-      let persistedRun = persistedRunWrite.run;
+      const terminalSideEffectProgress = {
+        wakeup: false,
+        issueExecution: false,
+        runtimeAttempted: false,
+        taskSession: taskKey == null,
+        agentStatus: false,
+      };
+      let terminalRunForSideEffects = persistedRunWrite.run;
+      const loadTerminalRunForSideEffects = async () => {
+        if (!terminalRunForSideEffects) {
+          terminalRunForSideEffects = await getRun(run.id);
+        }
+        return terminalRunForSideEffects;
+      };
+      const finalizeTerminalWakeup = async () => {
+        if (terminalSideEffectProgress.wakeup) return;
+        await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+          finishedAt: new Date(),
+          error: runErrorMessage,
+        });
+        terminalSideEffectProgress.wakeup = true;
+      };
+      const finalizeTerminalIssueExecution = async () => {
+        if (terminalSideEffectProgress.issueExecution) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await releaseIssueExecutionAndPromote(terminalRun);
+        terminalSideEffectProgress.issueExecution = true;
+      };
+      const finalizeTerminalRuntimeState = async () => {
+        if (terminalSideEffectProgress.runtimeAttempted) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        // updateRuntimeState can increment accounting totals. Mark it attempted
+        // immediately before entry so recovery never double-applies a partial
+        // write; failures in the injected pre-call seam remain retryable.
+        terminalSideEffectProgress.runtimeAttempted = true;
+        await updateRuntimeState(agent, terminalRun, adapterResult, {
+          legacySessionId: nextSessionState.legacySessionId,
+        }, normalizedUsage);
+      };
+      const finalizeTerminalTaskSession = async () => {
+        if (terminalSideEffectProgress.taskSession || !taskKey) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
+          await clearTaskSessions(agent.companyId, agent.id, {
+            taskKey,
+            adapterType: agent.adapterType,
+          });
+        } else {
+          await upsertTaskSession({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey,
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+              nextSessionState.params,
+              configuredModel,
+              sessionConfigMetadata,
+            ),
+            sessionDisplayId: nextSessionState.displayId,
+            lastRunId: terminalRun.id,
+            lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
+          });
+        }
+        terminalSideEffectProgress.taskSession = true;
+      };
+      const finalizeTerminalAgent = async () => {
+        if (terminalSideEffectProgress.agentStatus) return;
+        await finalizeAgentStatus(
+          agent.id,
+          outcome,
+          outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
+        );
+        terminalSideEffectProgress.agentStatus = true;
+      };
+      reconcilePersistedTerminalSideEffects = async () => {
+        if (!terminalSideEffectProgress.wakeup) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "wakeup_finalize",
+            operation: finalizeTerminalWakeup,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.issueExecution) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "issue_execution_release",
+            operation: finalizeTerminalIssueExecution,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.runtimeAttempted) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "runtime_state",
+            operation: finalizeTerminalRuntimeState,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.taskSession) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "task_session",
+            operation: finalizeTerminalTaskSession,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.agentStatus) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "agent_status",
+            operation: finalizeTerminalAgent,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+      };
+
+      let persistedRun = terminalRunForSideEffects;
       if (persistedRun) {
-        persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
+        persistedRun = await settlePostTerminalStep({
+          runId: run.id,
+          step: "liveness_classification",
+          operation: async () => await classifyAndPersistRunLiveness(persistedRun!, persistedResultJson) ?? persistedRun!,
+          fallback: persistedRun,
+        });
+        terminalRunForSideEffects = persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
-        finishedAt: new Date(),
-        error: runErrorMessage,
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "wakeup_finalize",
+        operation: finalizeTerminalWakeup,
+        fallback: undefined,
+        attempts: 2,
       });
 
-      const finalizedRun = persistedRun ?? (await getRun(run.id));
+      const finalizedRun = persistedRun ?? await settlePostTerminalStep({
+        runId: run.id,
+        step: "run_reload",
+        operation: async () => await getRun(run.id),
+        fallback: null,
+        attempts: 2,
+      });
+      terminalRunForSideEffects = finalizedRun ?? terminalRunForSideEffects;
       if (finalizedRun) {
-        await appendRunEvent(finalizedRun, seq++, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
-          message: `run ${outcome}`,
-          payload: {
-            status,
-            exitCode: adapterResult.exitCode,
-          },
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "lifecycle_event",
+          operation: async () => await appendRunEvent(finalizedRun, seq++, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: outcome === "succeeded" ? "info" : "error",
+            message: `run ${outcome}`,
+            payload: {
+              status,
+              exitCode: adapterResult.exitCode,
+            },
+          }),
+          fallback: null,
         });
         const livenessRun = finalizedRun;
-        await refreshContinuationSummaryForRun(livenessRun, agent);
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "continuation_summary",
+          operation: async () => await refreshContinuationSummaryForRun(livenessRun, agent),
+          fallback: undefined,
+        });
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
         if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
-          try {
-            const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
-            if (!existingRunComment) {
-              const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
-              if (issueComment) {
-                await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "run_summary_comment",
+            operation: async () => {
+              try {
+                const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
+                if (!existingRunComment) {
+                  const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
+                  if (issueComment) {
+                    await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
+                  }
+                }
+              } catch (err) {
+                await onLog(
+                  "stderr",
+                  "[paperclip] Failed to post run summary comment; raw diagnostic omitted\n",
+                );
               }
-            }
-          } catch (err) {
-            await onLog(
-              "stderr",
-              "[paperclip] Failed to post run summary comment; raw diagnostic omitted\n",
-            );
-          }
+            },
+            fallback: undefined,
+          });
         }
-        if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
-          const policy = parseMaxTurnContinuationPolicy(agent);
-          if (policy.enabled && policy.maxAttempts > 0) {
-            await scheduleBoundedRetryForRun(livenessRun, agent, {
-              retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-              wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
-              maxAttempts: policy.maxAttempts,
-              delayMs: policy.delayMs,
-            });
-          } else {
-            await appendRunEvent(livenessRun, await nextRunEventSeq(livenessRun.id), {
-              eventType: "lifecycle",
-              stream: "system",
-              level: "warn",
-              message: "Max-turn continuation suppressed because the policy is disabled",
-              payload: {
-                retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-                policy,
-              },
-            });
-          }
-        } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent);
-        }
-        const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(livenessRun);
-        await handleRunLivenessContinuation(livenessRun);
-        await handleSuccessfulRunHandoff(
-          issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
-            ? {
-              ...livenessRun,
-              issueCommentStatus: issueCommentPolicyResult.outcome,
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "retry_scheduling",
+          operation: async () => {
+            if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+              const policy = parseMaxTurnContinuationPolicy(agent);
+              if (policy.enabled && policy.maxAttempts > 0) {
+                await scheduleBoundedRetryForRun(livenessRun, agent, {
+                  retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+                  wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+                  maxAttempts: policy.maxAttempts,
+                  delayMs: policy.delayMs,
+                });
+              } else {
+                await appendRunEvent(livenessRun, await nextRunEventSeq(livenessRun.id), {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "warn",
+                  message: "Max-turn continuation suppressed because the policy is disabled",
+                  payload: {
+                    retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+                    policy,
+                  },
+                });
+              }
+            } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
+              await scheduleBoundedRetryForRun(livenessRun, agent);
             }
-            : livenessRun,
-          agent,
-        );
+          },
+          fallback: undefined,
+        });
+        const issueCommentPolicyResult = await settlePostTerminalStep({
+          runId: run.id,
+          step: "issue_comment_policy",
+          operation: async () => await finalizeIssueCommentPolicy(livenessRun, agent),
+          fallback: null,
+        });
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "issue_execution_release",
+          operation: finalizeTerminalIssueExecution,
+          fallback: undefined,
+          attempts: 2,
+        });
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "liveness_continuation",
+          operation: async () => await handleRunLivenessContinuation(livenessRun),
+          fallback: undefined,
+        });
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "successful_handoff",
+          operation: async () => await handleSuccessfulRunHandoff(
+            issueCommentPolicyResult?.outcome === "retry_queued" || issueCommentPolicyResult?.outcome === "retry_exhausted"
+              ? {
+                ...livenessRun,
+                issueCommentStatus: issueCommentPolicyResult.outcome,
+              }
+              : livenessRun,
+            agent,
+          ),
+          fallback: undefined,
+        });
 
         // Dependency wake re-check: if this run's issue was marked done mid-run,
         // the route-time `issue_blockers_resolved` wake may have been gated by
@@ -11856,8 +12100,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // `listWakeableBlockedDependents` delegates to dependency readiness, which
         // only returns dependents whose done blockers have crossed the successful
         // `workspace_finalize` barrier.
-        if (issueId && finalizedRun) {
-          try {
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "dependency_wake",
+          operation: async () => {
+            if (!issueId || !finalizedRun) return;
+            try {
             const blockerIssueStatus = await db
               .select({ status: issues.status })
               .from(issues)
@@ -11927,59 +12175,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 });
               }
             }
-          } catch (finalizeWakeErr) {
-            logger.warn(
-              { err: sanitizeHeartbeatErrorForLog(finalizeWakeErr), runId: run.id, issueId },
-              "failed to evaluate dependent wakes after workspace_finalize",
-            );
-          }
-        }
+            } catch (finalizeWakeErr) {
+              logger.warn(
+                { err: sanitizeHeartbeatErrorForLog(finalizeWakeErr), runId: run.id, issueId },
+                "failed to evaluate dependent wakes after workspace_finalize",
+              );
+            }
+          },
+          fallback: undefined,
+        });
       }
 
-      if (finalizedRun) {
-        await updateRuntimeState(agent, finalizedRun, adapterResult, {
-          legacySessionId: nextSessionState.legacySessionId,
-        }, normalizedUsage);
-        if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
-              taskKey,
-              adapterType: agent.adapterType,
-            });
-          } else {
-            await upsertTaskSession({
-              companyId: agent.companyId,
-              agentId: agent.id,
-              adapterType: agent.adapterType,
-              taskKey,
-              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-                nextSessionState.params,
-                configuredModel,
-                sessionConfigMetadata,
-              ),
-              sessionDisplayId: nextSessionState.displayId,
-              lastRunId: finalizedRun.id,
-              lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
-            });
-          }
-        }
-      }
-      await finalizeAgentStatus(
-        agent.id,
-        outcome,
-        outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
-      );
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "runtime_state",
+        operation: finalizeTerminalRuntimeState,
+        fallback: undefined,
+        attempts: 2,
+      });
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "task_session",
+        operation: finalizeTerminalTaskSession,
+        fallback: undefined,
+        attempts: 2,
+      });
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "agent_status",
+        operation: finalizeTerminalAgent,
+        fallback: undefined,
+        attempts: 2,
+      });
+      // A bounded second reconciliation pass retries only incomplete,
+      // idempotent critical steps. Runtime accounting is guarded as
+      // attempt-once to avoid double-counting a partial write.
+      await reconcilePersistedTerminalSideEffects();
     } catch (err) {
       if (terminalOutcomePersisted) {
         logger.warn(
-          { runId, outcome: terminalOutcomePersisted },
-          "best-effort post-terminal heartbeat publication failed; persisted terminal outcome remains authoritative",
+          { err: sanitizeHeartbeatErrorForLog(err), runId, outcome: terminalOutcomePersisted },
+          "unexpected post-terminal heartbeat failure; reconciling persisted terminal side effects",
         );
-        await finalizeAgentStatus(
-          agent.id,
-          terminalOutcomePersisted,
-          terminalOutcomePersisted === "succeeded" ? null : "Post-terminal publication failed",
-        ).catch(() => undefined);
+        await reconcilePersistedTerminalSideEffects?.().catch((reconcileErr) => {
+          logger.warn(
+            { err: sanitizeHeartbeatErrorForLog(reconcileErr), runId, outcome: terminalOutcomePersisted },
+            "persisted terminal side-effect reconciliation failed",
+          );
+        });
         return;
       }
       const failureRedactionOptions = await getCurrentUserRedactionOptions();

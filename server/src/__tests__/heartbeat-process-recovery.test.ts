@@ -1454,6 +1454,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("keeps an SSH run active after restart while its host ssh pid is still alive", async () => {
+    const sshChild = spawnAliveProcess();
+    childProcesses.add(sshChild);
+    expect(sshChild.pid).toBeTypeOf("number");
+
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      processPid: sshChild.pid ?? null,
+      includeIssue: false,
+      contextSnapshot: {
+        paperclipEnvironment: { driver: "ssh" },
+      },
+    });
+    // This run is deliberately absent from both in-memory trackers, matching
+    // the state a newly restarted Paperclip process sees.
+    expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect(isPidAlive(sshChild.pid)).toBe(true);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "running",
+      errorCode: "process_detached",
+      processPid: sshChild.pid,
+    });
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("claimed");
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",

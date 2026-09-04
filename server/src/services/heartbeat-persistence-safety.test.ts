@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parseGeminiJsonl } from "@paperclipai/adapter-gemini-local/server";
 import {
   ADAPTER_EXECUTION_RESULT_FIELDS,
   HEARTBEAT_PERSISTENCE_LIMITS,
@@ -467,6 +468,54 @@ describe("heartbeat persistence safety", () => {
     expect(sanitizeHeartbeatPersistenceText("a\u0000b")).toBe("a\uFFFDb");
     expect(sanitizeHeartbeatPersistenceValue({ fn: () => "no", symbol: Symbol("no"), value: 1 }))
       .toEqual({ value: 1 });
+  });
+
+  it("omits undefined optional fields emitted by Claude and Gemini adapters", () => {
+    const claudeResult = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      errorCode: null,
+      errorMeta: undefined,
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+    });
+
+    expect(claudeResult).not.toHaveProperty("errorMeta");
+    expect(claudeResult).toMatchObject({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "anthropic",
+    });
+
+    const geminiParsed = parseGeminiJsonl(JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [{
+          type: "question",
+          prompt: "Continue?",
+          choices: [{ key: "yes", label: "Yes" }],
+        }],
+      },
+    }));
+    expect(geminiParsed.question?.choices[0]).toHaveProperty("description", undefined);
+
+    const geminiResult = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      question: geminiParsed.question,
+      provider: "google",
+      model: "gemini-2.5-pro",
+    });
+
+    expect(geminiResult.question).toEqual({
+      prompt: "Continue?",
+      choices: [{ key: "yes", label: "Yes" }],
+    });
+    expect(geminiResult.question?.choices[0]).not.toHaveProperty("description");
   });
 
   it("preserves only the exact canonical server-owned wakeup skip reason", () => {

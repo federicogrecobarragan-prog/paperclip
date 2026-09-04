@@ -517,6 +517,9 @@ function readContractField(
     return { present: false as const, value: undefined };
   }
   if (!("value" in descriptor)) invalidContract(`${path}.${field} must be a data property`);
+  if (!required && descriptor.value === undefined) {
+    return { present: false as const, value: undefined };
+  }
   return { present: true as const, value: descriptor.value };
 }
 
@@ -784,7 +787,9 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
 
   for (const field of ADAPTER_EXECUTION_RESULT_FIELDS.slice(3)) {
     const candidate = candidates.get(field);
-    if (candidate?.present) candidate.value = canonicalizeOptionalField(field, candidate.value);
+    if (candidate?.present && candidate.value !== undefined) {
+      candidate.value = canonicalizeOptionalField(field, candidate.value);
+    }
   }
 
   const state = createState();
@@ -827,7 +832,7 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
   storeField("timedOut", rawTimedOut, true);
   for (const field of PRIORITIZED_OPTIONAL_FIELDS) {
     const candidate = candidates.get(field);
-    if (candidate?.present) storeField(field, candidate.value);
+    if (candidate?.present && candidate.value !== undefined) storeField(field, candidate.value);
   }
 
   const encodedBytes = Buffer.byteLength(JSON.stringify(output), "utf8");

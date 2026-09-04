@@ -33,8 +33,7 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-import * as activityLogService from "../services/activity-log.ts";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService, type HeartbeatPostTerminalStep } from "../services/heartbeat.ts";
 import { logger } from "../middleware/logger.ts";
 import { workspaceOperationService } from "../services/workspace-operations.ts";
 
@@ -525,7 +524,7 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(operation.stderrExcerpt).toContain("raw stderr omitted");
   });
 
-  it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization when publication throws", async () => {
+  it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization across injected step failures", async () => {
     const { companyId, agentId } = await seedAgent();
     const dependentAgentId = randomUUID();
     const blockerIssueId = randomUUID();
@@ -603,10 +602,24 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
         model: "test-model",
       };
     });
-    vi.spyOn(activityLogService, "publishPluginDomainEvent").mockImplementation((event) => {
-      if (event.eventType === "agent.run.finished") throw new Error("simulated post-commit publication failure");
+    const injectedFirstAttemptFailures = new Set<HeartbeatPostTerminalStep>([
+      "liveness_classification",
+      "wakeup_finalize",
+      "issue_execution_release",
+      "runtime_state",
+      "task_session",
+    ]);
+    const postTerminalAttempts = new Map<HeartbeatPostTerminalStep, number>();
+    let faultRunId: string | null = null;
+    const heartbeat = heartbeatService(db, {
+      postTerminalStepFaultInjector: ({ runId, step, attempt }) => {
+        if (runId !== faultRunId) return;
+        postTerminalAttempts.set(step, (postTerminalAttempts.get(step) ?? 0) + 1);
+        if (injectedFirstAttemptFailures.has(step) && attempt === 1) {
+          throw new Error(`simulated ${step} failure`);
+        }
+      },
     });
-    const heartbeat = heartbeatService(db);
 
     const queued = await heartbeat.wakeup(agentId, {
       source: "assignment",
@@ -620,6 +633,7 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
       },
     });
     expect(queued).toBeTruthy();
+    faultRunId = queued!.id;
     await firstRunStartedPromise;
 
     const deferredWakeupId = randomUUID();
@@ -718,6 +732,11 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(promotedRun?.errorCode).toBe("issue_terminal_status");
     expect(postTerminalState.runtimeState?.lastRunId).toBe(queued!.id);
     expect(postTerminalState.sessions.some((session) => session.lastRunId === queued!.id)).toBe(true);
+    expect(postTerminalAttempts.get("liveness_classification")).toBe(1);
+    expect(postTerminalAttempts.get("wakeup_finalize")).toBe(2);
+    expect(postTerminalAttempts.get("issue_execution_release")).toBe(2);
+    expect(postTerminalAttempts.get("runtime_state")).toBe(2);
+    expect(postTerminalAttempts.get("task_session")).toBe(2);
 
     finishFollowUpRuns();
     releaseBlockedFollowUps = null;
