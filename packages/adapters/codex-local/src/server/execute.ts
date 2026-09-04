@@ -115,6 +115,17 @@ function signalCodexChild(
   return false;
 }
 
+export function resolveCodexHostKillTarget(
+  meta: { pid: number; processGroupId: number | null },
+  executionTargetIsSandbox: boolean,
+): { pid: number | null; processGroupId: number | null } | null {
+  // Sandbox runners report the PID inside the remote sandbox. Treating that
+  // number as a host PID can signal an unrelated local process after a numeric
+  // collision. Remote execution owns its own timeout/cancellation lifecycle.
+  if (executionTargetIsSandbox) return null;
+  return { pid: meta.pid ?? null, processGroupId: meta.processGroupId };
+}
+
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
   const raw = env[key];
   return typeof raw === "string" && raw.trim().length > 0;
@@ -840,11 +851,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 const message = formatOutputInactivityMonitorErrorMessage(monitorElapsedMs);
                 const elapsedSec = Math.round(monitorElapsedMs / 1000);
                 const timeoutSecLabel = Math.round(monitorResolution.timeoutMs / 1000);
+                const terminationDescription = executionTargetIsSandbox
+                  ? "host signal suppressed for remote sandbox; remote runner timeout/cancellation owns termination"
+                  : "terminating codex child via SIGTERM (5s grace, then SIGKILL)";
                 const logLine =
                   `[paperclip] adapter.invoke ${message}; ` +
                   `timeoutMs=${monitorResolution.timeoutMs} elapsedSinceLastEventMs=${monitorElapsedMs} ` +
                   `parsedEvents=${state.parsedEventCount} (timeout=${timeoutSecLabel}s elapsed=${elapsedSec}s); ` +
-                  `terminating codex child via SIGTERM (5s grace, then SIGKILL).\n`;
+                  `${terminationDescription}.\n`;
                 // Issue the log without awaiting on the kill hot path, but capture
                 // the promise so the surrounding try/finally can await flush before
                 // the run resolves. Without this the diagnostic that explains the
@@ -868,7 +882,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             });
 
       const wrappedOnSpawn = async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => {
-        killTarget = { pid: meta.pid ?? null, processGroupId: meta.processGroupId };
+        killTarget = resolveCodexHostKillTarget(meta, executionTargetIsSandbox);
         if (onSpawn) {
           await onSpawn(meta);
         }
@@ -882,6 +896,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timeoutSec,
           graceSec,
           onSpawn: wrappedOnSpawn,
+          // A killed Codex parent can leave inherited stdio handles open in a
+          // descendant. Bound the wait for `close` so the monitor result still
+          // reaches heartbeat finalization after SIGKILL has had its grace.
+          postExitCloseTimeoutMs: CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS + 250,
           onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: async (stream, chunk) => {
             if (stream === "stdout") {

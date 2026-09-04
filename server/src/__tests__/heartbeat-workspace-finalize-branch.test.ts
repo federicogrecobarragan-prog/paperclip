@@ -450,7 +450,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     expect(finalizeOps[0]).toMatchObject({
       status: "failed",
       executionWorkspaceId,
-      stderrExcerpt: expect.stringContaining("Managed git worktree branch check failed"),
+      stderrExcerpt: expect.stringContaining("raw stderr omitted"),
     });
     expect(finalizeOps[0]?.metadata).toMatchObject({
       managedGitWorktreeBranch: expect.objectContaining({

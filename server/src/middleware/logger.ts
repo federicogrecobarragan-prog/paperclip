@@ -6,6 +6,10 @@ import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
 import { redactSensitive } from "./redact-sensitive.js";
+import {
+  buildSafeHttpErrorLogObject,
+  SAFE_HTTP_ERROR_LOG_MESSAGE,
+} from "./http-error-log-safety.js";
 
 function resolveServerLogDir(): string {
   const envOverride = process.env.PAPERCLIP_LOG_DIR?.trim();
@@ -31,6 +35,15 @@ const sharedOpts = {
 export const logger = pino({
   level: "debug",
   redact: ["req.headers.authorization"],
+  serializers: {
+    // `logger.warn/error({ err })` is used well beyond HTTP middleware. Treat
+    // every raw exception as opaque so provider/plugin/workspace diagnostics
+    // cannot reach either console or server.log through a future callsite.
+    err: () => ({
+      type: "Error",
+      message: SAFE_HTTP_ERROR_LOG_MESSAGE,
+    }),
+  },
 }, pino.transport({
   targets: [
     {
@@ -59,20 +72,21 @@ export const httpLogger = pinoHttp({
   customSuccessMessage(req, res) {
     return `${req.method} ${req.url} ${res.statusCode}`;
   },
-  customErrorMessage(req, res, err) {
-    const ctx = (res as any).__errorContext;
-    const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
-    return `${req.method} ${req.url} ${res.statusCode} — ${errMsg}`;
+  customErrorObject(_req, _res, _err, loggableObject) {
+    return buildSafeHttpErrorLogObject(loggableObject);
+  },
+  customErrorMessage(req, res) {
+    return `${req.method} ${req.url} ${res.statusCode} — ${SAFE_HTTP_ERROR_LOG_MESSAGE}`;
   },
   customProps(req, res) {
     if (res.statusCode >= 400) {
       const ctx = (res as any).__errorContext;
       if (ctx) {
         return {
-          errorContext: ctx.error,
-          reqBody: redactSensitive(ctx.reqBody),
-          reqParams: redactSensitive(ctx.reqParams),
-          reqQuery: redactSensitive(ctx.reqQuery),
+          errorContext: {
+            message: SAFE_HTTP_ERROR_LOG_MESSAGE,
+            name: "RequestError",
+          },
         };
       }
       const props: Record<string, unknown> = {};

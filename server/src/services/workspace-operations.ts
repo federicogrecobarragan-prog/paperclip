@@ -4,11 +4,35 @@ import { workspaceOperations } from "@paperclipai/db";
 import type { WorkspaceOperation, WorkspaceOperationPhase, WorkspaceOperationStatus } from "@paperclipai/shared";
 import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
 import { notFound } from "../errors.js";
-import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import {
+  redactCurrentUserText,
+  redactCurrentUserValue,
+  type CurrentUserRedactionOptions,
+} from "../log-redaction.js";
+import {
+  sanitizeHeartbeatPersistenceText,
+  sanitizeHeartbeatPersistenceValue,
+} from "./heartbeat-persistence-safety.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 
 type WorkspaceOperationRow = typeof workspaceOperations.$inferSelect;
+
+const OMITTED_FAILED_WORKSPACE_STDOUT =
+  "Workspace command failed; raw stdout omitted.\n";
+const OMITTED_FAILED_WORKSPACE_STDERR =
+  "Workspace command failed; raw stderr omitted.\n";
+const GENERIC_WORKSPACE_OPERATION_FAILURE =
+  "Workspace operation failed; raw diagnostic omitted";
+
+export class WorkspaceOperationFailure extends Error {
+  readonly code = "workspace_operation_failed";
+
+  constructor() {
+    super(GENERIC_WORKSPACE_OPERATION_FAILURE);
+    this.name = "WorkspaceOperationFailure";
+  }
+}
 
 function toWorkspaceOperation(row: WorkspaceOperationRow): WorkspaceOperation {
   return {
@@ -50,6 +74,26 @@ function combineMetadata(
     ...(base ?? {}),
     ...(patch ?? {}),
   };
+}
+
+export function sanitizeWorkspaceOperationTextForPersistence(
+  value: string,
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+) {
+  return sanitizeHeartbeatPersistenceText(
+    redactCurrentUserText(value, currentUserRedactionOptions),
+  );
+}
+
+export function sanitizeWorkspaceOperationMetadataForPersistence(
+  value: Record<string, unknown> | null | undefined,
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+) {
+  const secretRedacted = sanitizeHeartbeatPersistenceValue(value ?? null);
+  return redactCurrentUserValue(
+    secretRedacted,
+    currentUserRedactionOptions,
+  ) as Record<string, unknown> | null;
 }
 
 export interface WorkspaceOperationRecorder {
@@ -112,6 +156,10 @@ export function workspaceOperationService(db: Db) {
           const currentUserRedactionOptions = {
             enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
           };
+          const sanitizeText = (value: string) =>
+            sanitizeWorkspaceOperationTextForPersistence(value, currentUserRedactionOptions);
+          const sanitizeMetadata = (value: Record<string, unknown> | null | undefined) =>
+            sanitizeWorkspaceOperationMetadataForPersistence(value, currentUserRedactionOptions);
           const startedAt = new Date();
           const id = randomUUID();
           const handle = await logStore.begin({
@@ -123,7 +171,11 @@ export function workspaceOperationService(db: Db) {
           let stderrExcerpt = "";
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
-            const sanitizedChunk = redactCurrentUserText(chunk, currentUserRedactionOptions);
+            const sanitizedChunk = sanitizeText(chunk);
+            // Explicit command output remains operator-visible evidence and is
+            // sanitized with the normal log policy. The fail-closed boundary is
+            // exception propagation: unexpected thrown diagnostics are never
+            // copied into persistence or HTTP logs below.
             if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
             if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
             await logStore.append(handle, {
@@ -140,24 +192,33 @@ export function workspaceOperationService(db: Db) {
             heartbeatRunId: input.heartbeatRunId ?? null,
             issueId: input.issueId ?? null,
             phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
+            command: recordInput.command == null ? null : sanitizeText(recordInput.command),
+            cwd: recordInput.cwd == null ? null : sanitizeText(recordInput.cwd),
             status: "running",
             logStore: handle.store,
             logRef: handle.logRef,
-            metadata: redactCurrentUserValue(
-              recordInput.metadata ?? null,
-              currentUserRedactionOptions,
-            ) as Record<string, unknown> | null,
+            metadata: sanitizeMetadata(recordInput.metadata),
             startedAt,
           });
           createdIds.push(id);
 
           try {
             const result = await recordInput.run();
+            const failedCommandOutput = result.status === "failed" ||
+              (typeof result.exitCode === "number" && result.exitCode !== 0);
             await append("system", result.system ?? null);
-            await append("stdout", result.stdout ?? null);
-            await append("stderr", result.stderr ?? null);
+            await append(
+              "stdout",
+              failedCommandOutput && result.stdout
+                ? OMITTED_FAILED_WORKSPACE_STDOUT
+                : result.stdout ?? null,
+            );
+            await append(
+              "stderr",
+              failedCommandOutput && result.stderr
+                ? OMITTED_FAILED_WORKSPACE_STDERR
+                : result.stderr ?? null,
+            );
             const finalized = await logStore.finalize(handle);
             const finishedAt = new Date();
             const row = await db
@@ -171,10 +232,7 @@ export function workspaceOperationService(db: Db) {
                 logBytes: finalized.bytes,
                 logSha256: finalized.sha256,
                 logCompressed: finalized.compressed,
-                metadata: redactCurrentUserValue(
-                  combineMetadata(recordInput.metadata, result.metadata),
-                  currentUserRedactionOptions,
-                ) as Record<string, unknown> | null,
+                metadata: sanitizeMetadata(combineMetadata(recordInput.metadata, result.metadata)),
                 finishedAt,
                 updatedAt: finishedAt,
               })
@@ -184,7 +242,9 @@ export function workspaceOperationService(db: Db) {
             if (!row) throw notFound("Workspace operation not found");
             return toWorkspaceOperation(row);
           } catch (error) {
-            await append("stderr", error instanceof Error ? error.message : String(error));
+            // The thrown diagnostic is not trustworthy: providers and hooks
+            // can embed opaque credentials that no heuristic can identify.
+            await append("system", GENERIC_WORKSPACE_OPERATION_FAILURE);
             const finalized = await logStore.finalize(handle).catch(() => null);
             const finishedAt = new Date();
             await db
@@ -201,7 +261,7 @@ export function workspaceOperationService(db: Db) {
                 updatedAt: finishedAt,
               })
               .where(eq(workspaceOperations.id, id));
-            throw error;
+            throw new WorkspaceOperationFailure();
           }
         },
       };

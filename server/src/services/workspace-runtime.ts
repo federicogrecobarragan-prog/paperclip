@@ -74,11 +74,64 @@ export class WorkspaceRuntimeValidationFailure extends Error {
   code = "workspace_validation_failed" as const;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(
+    message: string,
+    resultJson: Record<string, unknown>,
+    authenticityToken?: unknown,
+  ) {
     super(message);
     this.name = "WorkspaceRuntimeValidationFailure";
     this.resultJson = resultJson;
+    if (authenticityToken === WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN) {
+      authenticWorkspaceRuntimeValidationFailures.set(this, {
+        message: this.message,
+        resultJson: snapshotWorkspaceRuntimeValidationResultJson(resultJson),
+      });
+    }
   }
+}
+
+const WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN = Symbol(
+  "paperclip.workspace-runtime-validation-failure",
+);
+const authenticWorkspaceRuntimeValidationFailures =
+  new WeakMap<WorkspaceRuntimeValidationFailure, {
+    message: string;
+    resultJson: Record<string, unknown>;
+  }>();
+
+function snapshotWorkspaceRuntimeValidationResultJson(
+  resultJson: Record<string, unknown>,
+): Record<string, unknown> {
+  try {
+    return structuredClone(resultJson) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function workspaceRuntimeValidationFailure(
+  message: string,
+  resultJson: Record<string, unknown>,
+) {
+  return new WorkspaceRuntimeValidationFailure(
+    message,
+    resultJson,
+    WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN,
+  );
+}
+
+export function readAuthenticWorkspaceRuntimeValidationFailure(
+  error: unknown,
+): { message: string; resultJson: Record<string, unknown> } | null {
+  const snapshot = authenticWorkspaceRuntimeValidationFailures.get(
+    error as WorkspaceRuntimeValidationFailure,
+  );
+  if (!snapshot) return null;
+  return {
+    message: snapshot.message,
+    resultJson: snapshotWorkspaceRuntimeValidationResultJson(snapshot.resultJson),
+  };
 }
 
 export interface RuntimeServiceRef {
@@ -808,7 +861,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
 }
 
 function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoherenceEvidence) {
-  return new WorkspaceRuntimeValidationFailure(
+  return workspaceRuntimeValidationFailure(
     `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
     {
       workspaceValidation: evidence,
@@ -865,9 +918,9 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       successMessage: `Repaired clean git worktree branch mismatch at ${input.worktreePath}: checked out ${expectedBranchName}\n`,
       failureLabel: `git checkout ${expectedBranchName}`,
     });
-  } catch (error) {
+  } catch {
     evidence.safeRepair.succeeded = false;
-    evidence.safeRepair.reason = `safe checkout failed: ${error instanceof Error ? error.message : String(error)}`;
+    evidence.safeRepair.reason = "safe checkout failed; raw diagnostic omitted";
     throw branchIncoherenceValidationFailure(evidence);
   }
 
@@ -1346,12 +1399,8 @@ async function runWorkspaceCommand(input: {
     env: input.env,
   });
   if (proc.code === 0) return;
-
-  const details = [proc.stderr.trim(), proc.stdout.trim()].filter(Boolean).join("\n");
   throw new Error(
-    details.length > 0
-      ? `${input.label} failed: ${details}`
-      : `${input.label} failed with exit code ${proc.code ?? -1}`,
+    `Workspace command failed with exit code ${proc.code ?? -1}; raw diagnostic omitted`,
   );
 }
 
@@ -1371,7 +1420,6 @@ async function recordGitOperation(
   }
 
   let stdout = "";
-  let stderr = "";
   let code: number | null = null;
   await recorder.recordOperation({
     phase: input.phase,
@@ -1385,7 +1433,6 @@ async function recordGitOperation(
         cwd: input.cwd,
       });
       stdout = result.stdout;
-      stderr = result.stderr;
       code = result.code;
       return {
         status: result.code === 0 ? "succeeded" : "failed",
@@ -1407,11 +1454,8 @@ async function recordGitOperation(
   });
 
   if (code !== 0) {
-    const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
     throw new Error(
-      details.length > 0
-        ? `${input.failureLabel ?? `git ${input.args.join(" ")}`} failed: ${details}`
-        : `${input.failureLabel ?? `git ${input.args.join(" ")}`} failed with exit code ${code ?? -1}`,
+      `Git workspace operation failed with exit code ${code ?? -1}; raw diagnostic omitted`,
     );
   }
   return stdout.trim();
@@ -1435,8 +1479,6 @@ async function recordWorkspaceCommandOperation(
     return null;
   }
 
-  let stdout = "";
-  let stderr = "";
   let code: number | null = null;
   const operation = await recorder.recordOperation({
     phase: input.phase,
@@ -1451,8 +1493,6 @@ async function recordWorkspaceCommandOperation(
         cwd: input.cwd,
         env: input.env,
       });
-      stdout = result.stdout;
-      stderr = result.stderr;
       code = result.code;
       return {
         status: result.code === 0 ? "succeeded" : "failed",
@@ -1474,12 +1514,8 @@ async function recordWorkspaceCommandOperation(
   });
 
   if (code === 0) return operation;
-
-  const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
   throw new Error(
-    details.length > 0
-      ? `${input.label} failed: ${details}`
-      : `${input.label} failed with exit code ${code ?? -1}`,
+    `Workspace command failed with exit code ${code ?? -1}; raw diagnostic omitted`,
   );
 }
 
@@ -1877,7 +1913,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       expectedBranchName: realized.branchName,
     });
     if (!validation.valid) {
-      throw new WorkspaceRuntimeValidationFailure(
+      throw workspaceRuntimeValidationFailure(
         `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,
         {
           workspaceValidation: {
