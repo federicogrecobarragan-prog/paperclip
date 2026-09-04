@@ -16,6 +16,11 @@ const MAX_OBJECT_KEYS = 2_000;
 const MAX_STRING_CHARS = 1_000_000;
 const MAX_TOTAL_STRING_CHARS = 4_000_000;
 const MAX_KEY_CHARS = 1_024;
+// Control, format, and lone-surrogate code points are not meaningful
+// separators for security classifiers. Keeping them in classifier input lets
+// an otherwise equivalent `apiKey`, `commandArgs`, CLI flag, or `token=`
+// assignment evade redaction while still producing PostgreSQL-valid output.
+const SECURITY_CLASSIFIER_IGNORABLE_RE = /[\p{Cc}\p{Cf}\p{Cs}]/gu;
 const POSTGRES_INT32_MIN = -2_147_483_648;
 const POSTGRES_INT32_MAX = 2_147_483_647;
 const WINDOWS_UINT32_MAX = 4_294_967_295;
@@ -145,9 +150,21 @@ export function normalizeHeartbeatExitCodeForPersistence(value: unknown): number
   return null;
 }
 
+function canonicalizeSecurityClassifierText(value: string) {
+  return value.normalize("NFKC").replace(SECURITY_CLASSIFIER_IGNORABLE_RE, "");
+}
+
 function prepareBoundedPersistenceText(value: string, maxChars: number) {
   const bounded = value.length > maxChars ? value.slice(0, maxChars) : value;
-  let text = redactSensitiveText(bounded.replace(/\u0000/g, "\uFFFD"));
+  const persistenceSafeText = bounded.replace(/\u0000/g, "\uFFFD");
+  const classifierText = canonicalizeSecurityClassifierText(bounded);
+  const redactedClassifierText = redactSensitiveText(classifierText);
+  // Preserve normal text layout and the established U+FFFD replacement when
+  // canonicalization finds no additional secret. If it does, persist the
+  // canonical redacted form so split secret bytes cannot be mapped back in.
+  let text = redactedClassifierText === classifierText
+    ? redactSensitiveText(persistenceSafeText)
+    : redactedClassifierText;
   const wasTruncated = value.length > maxChars || text.length > maxChars;
   if (wasTruncated && SECRET_TEXT_HINT_RE.test(text)) {
     // redactSensitiveText intentionally expects complete JSON strings. Cover a
@@ -286,8 +303,22 @@ function sanitizePersistenceKey(value: string) {
 }
 
 function isSensitivePayloadKey(value: string) {
-  const normalized = value.replace(/[-_]/g, "").toLowerCase();
-  return !NON_SECRET_USAGE_KEYS.has(normalized) && SECRET_PAYLOAD_KEY_RE.test(value);
+  // The persisted spelling of an oversized key is truncated. Fail closed on
+  // its value instead of risking a sensitive suffix outside that prefix.
+  if (value.length > MAX_KEY_CHARS) return true;
+  const classifierKey = canonicalizeSecurityClassifierText(value);
+  const normalized = classifierKey.replace(/[-_]/g, "").toLowerCase();
+  return !NON_SECRET_USAGE_KEYS.has(normalized) && SECRET_PAYLOAD_KEY_RE.test(classifierKey);
+}
+
+function isCommandArgsPayloadKey(value: string) {
+  if (value.length > MAX_KEY_CHARS) return false;
+  return COMMAND_ARGS_PAYLOAD_KEY_RE.test(canonicalizeSecurityClassifierText(value));
+}
+
+function isCliSecretFlag(value: string) {
+  if (value.length > MAX_KEY_CHARS) return true;
+  return CLI_SECRET_FLAG_RE.test(canonicalizeSecurityClassifierText(value).trim());
 }
 
 function nextCollisionFreeKey(
@@ -386,7 +417,7 @@ function sanitizeValue(
           sanitized = sanitizeValue(null, state, depth + 1);
         } else {
           const entry = descriptor.value;
-          if (options.commandArgs && typeof entry === "string" && CLI_SECRET_FLAG_RE.test(entry.trim())) {
+          if (options.commandArgs && typeof entry === "string" && isCliSecretFlag(entry)) {
             redactNextCommandArg = true;
           }
           sanitized = sanitizeValue(entry, state, depth + 1);
@@ -439,7 +470,7 @@ function sanitizeValue(
         ? REDACTED_EVENT_VALUE
         : descriptor.value;
       const sanitized = sanitizeValue(rawEntry, state, depth + 1, {
-        commandArgs: COMMAND_ARGS_PAYLOAD_KEY_RE.test(key),
+        commandArgs: isCommandArgsPayloadKey(key),
       });
       if (sanitized === OMIT) {
         state.outputBytes -= propertyBytes;
