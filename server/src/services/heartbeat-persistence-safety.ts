@@ -321,6 +321,21 @@ function isCliSecretFlag(value: string) {
   return CLI_SECRET_FLAG_RE.test(canonicalizeSecurityClassifierText(value).trim());
 }
 
+function commandArgRedactsNext(value: unknown): boolean {
+  if (typeof value === "string") return isCliSecretFlag(value);
+  if (value === null || typeof value !== "object") return false;
+  // A proxy can make every reflective read execute attacker-controlled code.
+  // Do not inspect it; redact the following argv slot because it may wrap a
+  // secret flag that cannot be classified safely.
+  if (utilTypes.isProxy(value)) return true;
+  const boxed = sanitizeBoxedPrimitive(value);
+  if (typeof boxed === "string") return isCliSecretFlag(boxed);
+  // Command arguments are strings at the adapter boundary. Unknown objects or
+  // rejected boxed subclasses cannot be classified without coercion, getters,
+  // or toJSON, so fail closed on the following slot.
+  return boxed === OMIT;
+}
+
 function nextCollisionFreeKey(
   target: Record<string, unknown>,
   base: string,
@@ -413,11 +428,14 @@ function sanitizeValue(
         if (options.commandArgs && redactNextCommandArg) {
           redactNextCommandArg = false;
           sanitized = sanitizeValue(REDACTED_EVENT_VALUE, state, depth + 1);
-        } else if (!descriptor || !("value" in descriptor)) {
+        } else if (!descriptor) {
+          sanitized = sanitizeValue(null, state, depth + 1);
+        } else if (!("value" in descriptor)) {
+          if (options.commandArgs) redactNextCommandArg = true;
           sanitized = sanitizeValue(null, state, depth + 1);
         } else {
           const entry = descriptor.value;
-          if (options.commandArgs && typeof entry === "string" && isCliSecretFlag(entry)) {
+          if (options.commandArgs && commandArgRedactsNext(entry)) {
             redactNextCommandArg = true;
           }
           sanitized = sanitizeValue(entry, state, depth + 1);

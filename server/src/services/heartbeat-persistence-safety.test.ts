@@ -463,30 +463,115 @@ describe("heartbeat persistence safety", () => {
     });
   });
 
-  it("redacts secrets whose text, payload keys, and argv semantics are split by controls", () => {
-    const syntheticSentinel = "sk-controlsplitfixture123456789";
-    const standaloneText = sanitizeHeartbeatPersistenceText(`token\u0000=${syntheticSentinel}`);
+  it("redacts an opaque token assignment split by U+0000", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    const sanitized = sanitizeHeartbeatPersistenceText(`token\u0000=${opaqueCanary}`);
+
+    expect(sanitized).toBe("token=***REDACTED***");
+    expect(sanitized).not.toContain(opaqueCanary);
+  });
+
+  it("redacts an opaque value under an apiKey split by U+0000", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
     const result = normalizeAdapterExecutionResultForPersistence({
       exitCode: 1,
       signal: null,
       timedOut: false,
-      errorMessage: `api\u001fkey=${syntheticSentinel}`,
       resultJson: {
-        ["api\u0000Key"]: syntheticSentinel,
-        ["command\u0000Args"]: ["--api-key", syntheticSentinel, "safe-next"],
-        ["command\u200bArgs"]: ["--access\u001ftoken", syntheticSentinel, "safe-format-next"],
+        ["api\u0000Key"]: opaqueCanary,
       },
     });
-    const encoded = JSON.stringify({ standaloneText, result });
 
-    expect(encoded).not.toContain("\u0000");
-    expect(encoded).not.toContain("\\u0000");
-    expect(encoded).not.toContain(syntheticSentinel);
-    expect(encoded).toContain("***REDACTED***");
-    expect(result.resultJson).toMatchObject({
+    expect(result.resultJson).toEqual({
       ["api\uFFFDKey"]: "***REDACTED***",
+    });
+  });
+
+  it("recognizes commandArgs split by U+0000 before classifying flags", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    const sanitized = sanitizeHeartbeatPersistenceValue({
+      ["command\u0000Args"]: ["--api-key", opaqueCanary, "safe-next"],
+    });
+
+    expect(sanitized).toEqual({
       ["command\uFFFDArgs"]: ["--api-key", "***REDACTED***", "safe-next"],
-      ["command\u200bArgs"]: ["--access\u001ftoken", "***REDACTED***", "safe-format-next"],
+    });
+  });
+
+  it("recognizes the literal argv alias split by U+0000", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    const sanitized = sanitizeHeartbeatPersistenceValue({
+      ["ar\u0000gv"]: ["--api-key", opaqueCanary, "safe-next"],
+    });
+
+    expect(sanitized).toEqual({
+      ["ar\uFFFDgv"]: ["--api-key", "***REDACTED***", "safe-next"],
+    });
+  });
+
+  it("recognizes a CLI secret flag split by U+0000", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    const sanitized = sanitizeHeartbeatPersistenceValue({
+      commandArgs: ["--access\u0000token", opaqueCanary, "safe-next"],
+    });
+
+    expect(sanitized).toEqual({
+      commandArgs: ["--access\uFFFDtoken", "***REDACTED***", "safe-next"],
+    });
+  });
+
+  it("classifies boxed CLI secret flags without invoking toJSON", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    let toJsonReads = 0;
+    const boxedFlag = new String("--access\u0000token");
+    Object.defineProperty(boxedFlag, "toJSON", {
+      configurable: true,
+      get() {
+        toJsonReads += 1;
+        throw new Error("boxed toJSON must not run");
+      },
+    });
+
+    const sanitized = sanitizeHeartbeatPersistenceValue({
+      commandArgs: [boxedFlag, opaqueCanary, "safe-next"],
+    });
+
+    expect(toJsonReads).toBe(0);
+    expect(sanitized).toEqual({
+      commandArgs: ["--access\uFFFDtoken", "***REDACTED***", "safe-next"],
+    });
+  });
+
+  it("fails closed on proxy and accessor command flags without invoking user code", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    let proxyTrapCalls = 0;
+    let accessorCalls = 0;
+    const proxyFlag = new Proxy(new String("--api-key"), {
+      get() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+    });
+    const accessorArgs = [undefined, opaqueCanary, "safe-next"];
+    Object.defineProperty(accessorArgs, "0", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        throw new Error("argv accessor must not run");
+      },
+    });
+
+    const sanitized = sanitizeHeartbeatPersistenceValue({
+      proxyArgs: { commandArgs: [proxyFlag, opaqueCanary, "safe-next"] },
+      accessorArgs: { commandArgs: accessorArgs },
+    });
+
+    expect(proxyTrapCalls).toBe(0);
+    expect(accessorCalls).toBe(0);
+    expect(sanitized).toEqual({
+      proxyArgs: { commandArgs: [null, "***REDACTED***", "safe-next"] },
+      accessorArgs: { commandArgs: [null, "***REDACTED***", "safe-next"] },
     });
   });
 

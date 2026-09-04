@@ -404,19 +404,32 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
 
   it("redacts control-split secrets from terminal DB fields, result JSON, wake data, and logs", async () => {
     const { agentId } = await seedAgent();
-    const syntheticSentinel = "sk-controlsplitdbfixture123456789";
+    const opaqueCanaries = {
+      log: "OpaqueValueQ9Z8R7M4V2A",
+      error: "OpaqueValueQ9Z8R7M4V2B",
+      payloadKey: "OpaqueValueQ9Z8R7M4V2C",
+      commandArgs: "OpaqueValueQ9Z8R7M4V2D",
+      argv: "OpaqueValueQ9Z8R7M4V2E",
+      splitFlag: "OpaqueValueQ9Z8R7M4V2F",
+      boxedFlag: "OpaqueValueQ9Z8R7M4V2G",
+    };
     mockAdapterExecute.mockImplementationOnce(async (context: {
       onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     }) => {
-      await context.onLog("stderr", `token\u0000=${syntheticSentinel}`);
+      await context.onLog("stderr", `token\u0000=${opaqueCanaries.log}`);
       return {
         exitCode: 1,
         signal: null,
         timedOut: false,
-        errorMessage: `api\u0000key=${syntheticSentinel}`,
+        errorMessage: `api\u0000key=${opaqueCanaries.error}`,
         resultJson: {
-          ["api\u0000Key"]: syntheticSentinel,
-          ["command\u0000Args"]: ["--api-key", syntheticSentinel, "safe-next"],
+          ["api\u0000Key"]: opaqueCanaries.payloadKey,
+          ["command\u0000Args"]: ["--api-key", opaqueCanaries.commandArgs, "safe-next"],
+          ["ar\u0000gv"]: ["--api-key", opaqueCanaries.argv, "safe-next"],
+          commandArgs: ["--access\u0000token", opaqueCanaries.splitFlag, "safe-next"],
+          boxedArgs: {
+            argv: [new String("--api-key"), opaqueCanaries.boxedFlag, "safe-next"],
+          },
         },
       };
     });
@@ -425,9 +438,10 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     const queued = await heartbeat.wakeup(agentId, {
       source: "on_demand",
       triggerDetail: "system",
-      payload: { ["api\u0000Key"]: syntheticSentinel },
+      payload: { ["api\u0000Key"]: opaqueCanaries.payloadKey },
       contextSnapshot: {
-        ["command\u0000Args"]: ["--api-key", syntheticSentinel, "safe-next"],
+        ["command\u0000Args"]: ["--api-key", opaqueCanaries.commandArgs, "safe-next"],
+        ["ar\u0000gv"]: ["--api-key", opaqueCanaries.argv, "safe-next"],
       },
     });
     expect(queued).toBeTruthy();
@@ -446,7 +460,9 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(terminal?.status).toBe("failed");
     expect(persisted).not.toContain("\u0000");
     expect(persisted).not.toContain("\\u0000");
-    expect(persisted).not.toContain(syntheticSentinel);
+    for (const opaqueCanary of Object.values(opaqueCanaries)) {
+      expect(persisted).not.toContain(opaqueCanary);
+    }
     expect(persisted).toContain("***REDACTED***");
   });
 
