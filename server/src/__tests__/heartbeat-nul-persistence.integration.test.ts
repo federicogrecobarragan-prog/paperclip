@@ -402,6 +402,54 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(persisted).toContain("***REDACTED***");
   });
 
+  it("redacts control-split secrets from terminal DB fields, result JSON, wake data, and logs", async () => {
+    const { agentId } = await seedAgent();
+    const syntheticSentinel = "sk-controlsplitdbfixture123456789";
+    mockAdapterExecute.mockImplementationOnce(async (context: {
+      onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    }) => {
+      await context.onLog("stderr", `token\u0000=${syntheticSentinel}`);
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: `api\u0000key=${syntheticSentinel}`,
+        resultJson: {
+          ["api\u0000Key"]: syntheticSentinel,
+          ["command\u0000Args"]: ["--api-key", syntheticSentinel, "safe-next"],
+        },
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      payload: { ["api\u0000Key"]: syntheticSentinel },
+      contextSnapshot: {
+        ["command\u0000Args"]: ["--api-key", syntheticSentinel, "safe-next"],
+      },
+    });
+    expect(queued).toBeTruthy();
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    const [wakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, queued!.id));
+    const log = await heartbeat.readLog(queued!.id);
+    const persisted = JSON.stringify({ terminal, wakeup, events, log });
+
+    expect(terminal?.status).toBe("failed");
+    expect(persisted).not.toContain("\u0000");
+    expect(persisted).not.toContain("\\u0000");
+    expect(persisted).not.toContain(syntheticSentinel);
+    expect(persisted).toContain("***REDACTED***");
+  });
+
   it("redacts synthetic secrets from thrown adapter errors and workspace-finalize evidence", async () => {
     const { agentId } = await seedAgent();
     const syntheticSentinel = "OpaqueLac1270ValueZ9Q8";

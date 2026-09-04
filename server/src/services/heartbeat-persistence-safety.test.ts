@@ -463,6 +463,33 @@ describe("heartbeat persistence safety", () => {
     });
   });
 
+  it("redacts secrets whose text, payload keys, and argv semantics are split by controls", () => {
+    const syntheticSentinel = "sk-controlsplitfixture123456789";
+    const standaloneText = sanitizeHeartbeatPersistenceText(`token\u0000=${syntheticSentinel}`);
+    const result = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: `api\u001fkey=${syntheticSentinel}`,
+      resultJson: {
+        ["api\u0000Key"]: syntheticSentinel,
+        ["command\u0000Args"]: ["--api-key", syntheticSentinel, "safe-next"],
+        ["command\u200bArgs"]: ["--access\u001ftoken", syntheticSentinel, "safe-format-next"],
+      },
+    });
+    const encoded = JSON.stringify({ standaloneText, result });
+
+    expect(encoded).not.toContain("\u0000");
+    expect(encoded).not.toContain("\\u0000");
+    expect(encoded).not.toContain(syntheticSentinel);
+    expect(encoded).toContain("***REDACTED***");
+    expect(result.resultJson).toMatchObject({
+      ["api\uFFFDKey"]: "***REDACTED***",
+      ["command\uFFFDArgs"]: ["--api-key", "***REDACTED***", "safe-next"],
+      ["command\u200bArgs"]: ["--access\u001ftoken", "***REDACTED***", "safe-format-next"],
+    });
+  });
+
   it("sanitizes standalone text and omits non-JSON behavior", () => {
     expect(sanitizeHeartbeatPersistenceText("a\u0000b")).toBe("a\uFFFDb");
     expect(sanitizeHeartbeatPersistenceValue({ fn: () => "no", symbol: Symbol("no"), value: 1 }))
