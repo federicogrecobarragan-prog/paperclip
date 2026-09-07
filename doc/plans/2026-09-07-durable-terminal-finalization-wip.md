@@ -43,6 +43,10 @@ and does NOT validate the complete checkpoint. A final server typecheck was
 started as session 53258 and completed exit 0 (PASS), including the final
 stream/start/reset/attempt changes. `git diff --check` also passed. This validates
 types/format only, not crash durability, security end-to-end, or database behavior.
+After that typecheck, the streaming unit run found an ANSI sequence spanning a
+newline could consume part of a secret key. The helper now validates complete
+CSI framing before stripping controls. The final focused run passed 14/14 using
+pnpm 9.15.4; the full typecheck was not repeated after that seven-line guard.
 No new PostgreSQL acceptance test was run or added for this durable change.
 Previously green a5 tests are NOT evidence that this WIP is correct.
 

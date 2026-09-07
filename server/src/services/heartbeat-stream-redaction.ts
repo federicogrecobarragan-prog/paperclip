@@ -143,6 +143,13 @@ export function createHeartbeatStreamRedactor(options: {
 
   function takeRecord(state: StreamState, terminal: boolean): string | null {
     const raw = state.pending;
+    // stripVTControlCharacters also accepts some control sequences spanning a
+    // newline. Reject those BEFORE stripping: consuming the next key character
+    // could turn `api ESC[ LF Key=` into an apparently harmless assignment.
+    const withoutCompleteCsi = raw.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    if (/[\u001b\u0090\u009b\u009d]/u.test(withoutCompleteCsi)) {
+      return suppress(state);
+    }
     const unstyled = stripVTControlCharacters(raw);
     // Incomplete ANSI/OSC sequences may hide a delimiter or span multiple
     // lines. Do not treat the unparsed remainder as harmless printable text.
