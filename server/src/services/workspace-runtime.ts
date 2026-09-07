@@ -593,9 +593,51 @@ function formatShortSha(value: string | null | undefined) {
   return value ? value.slice(0, 12) : "unknown";
 }
 
-function gitErrorIncludes(error: unknown, needle: string) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.toLowerCase().includes(needle.toLowerCase());
+type GitWorkspaceFailureSignal =
+  | "branch_already_exists"
+  | "branch_already_checked_out"
+  | "invalid_reference";
+
+const gitWorkspaceFailureSignals = new WeakMap<Error, ReadonlySet<GitWorkspaceFailureSignal>>();
+
+function classifyGitWorkspaceFailureDiagnostic(diagnostic: string): Set<GitWorkspaceFailureSignal> {
+  const normalized = diagnostic.toLowerCase();
+  const signals = new Set<GitWorkspaceFailureSignal>();
+  if (normalized.includes("already exists")) signals.add("branch_already_exists");
+  if (normalized.includes("already checked out")) signals.add("branch_already_checked_out");
+  if (
+    normalized.includes("invalid reference")
+    || normalized.includes("not a commit")
+    || normalized.includes("unknown revision")
+  ) {
+    signals.add("invalid_reference");
+  }
+  return signals;
+}
+
+function createRecordedGitWorkspaceFailure(
+  exitCode: number | null,
+  stdout: string,
+  stderr: string,
+) {
+  const error = new Error(
+    `Git workspace operation failed with exit code ${exitCode ?? -1}; raw diagnostic omitted`,
+  );
+  gitWorkspaceFailureSignals.set(
+    error,
+    classifyGitWorkspaceFailureDiagnostic(`${stderr}\n${stdout}`),
+  );
+  return error;
+}
+
+function gitErrorHasSignal(error: unknown, signal: GitWorkspaceFailureSignal) {
+  if (error instanceof Error) {
+    const recordedSignals = gitWorkspaceFailureSignals.get(error);
+    if (recordedSignals) return recordedSignals.has(signal);
+  }
+  return classifyGitWorkspaceFailureDiagnostic(
+    error instanceof Error ? error.message : String(error),
+  ).has(signal);
 }
 
 function parseRemoteTrackingRef(ref: string): { remote: string; branch: string } | null {
@@ -1420,6 +1462,7 @@ async function recordGitOperation(
   }
 
   let stdout = "";
+  let stderr = "";
   let code: number | null = null;
   await recorder.recordOperation({
     phase: input.phase,
@@ -1433,6 +1476,7 @@ async function recordGitOperation(
         cwd: input.cwd,
       });
       stdout = result.stdout;
+      stderr = result.stderr;
       code = result.code;
       return {
         status: result.code === 0 ? "succeeded" : "failed",
@@ -1454,9 +1498,7 @@ async function recordGitOperation(
   });
 
   if (code !== 0) {
-    throw new Error(
-      `Git workspace operation failed with exit code ${code ?? -1}; raw diagnostic omitted`,
-    );
+    throw createRecordedGitWorkspaceFailure(code, stdout, stderr);
   }
   return stdout.trim();
 }
@@ -1787,7 +1829,7 @@ export async function realizeExecutionWorkspace(input: {
       failureLabel: `git worktree add ${worktreePath}`,
     });
   } catch (error) {
-    if (!gitErrorIncludes(error, "already exists")) {
+    if (!gitErrorHasSignal(error, "branch_already_exists")) {
       throw error;
     }
     try {
@@ -1808,7 +1850,7 @@ export async function realizeExecutionWorkspace(input: {
         failureLabel: `git worktree add ${worktreePath}`,
       });
     } catch (attachError) {
-      if (!gitErrorIncludes(attachError, "already checked out")) {
+      if (!gitErrorHasSignal(attachError, "branch_already_checked_out")) {
         throw attachError;
       }
       const reusablePath = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
@@ -1999,11 +2041,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       failureLabel: `git worktree add ${worktreePath}`,
     });
   } catch (error) {
-    if (
-      !gitErrorIncludes(error, "invalid reference")
-      && !gitErrorIncludes(error, "not a commit")
-      && !gitErrorIncludes(error, "unknown revision")
-    ) {
+    if (!gitErrorHasSignal(error, "invalid_reference")) {
       throw error;
     }
     const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";

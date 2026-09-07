@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parseGeminiJsonl } from "@paperclipai/adapter-gemini-local/server";
 import {
   ADAPTER_EXECUTION_RESULT_FIELDS,
   HEARTBEAT_PERSISTENCE_LIMITS,
@@ -575,10 +576,87 @@ describe("heartbeat persistence safety", () => {
     });
   });
 
+  it("charges the string budget before ignorable padding is canonicalized away", () => {
+    const prefix = "token=synthetic-budget-secret";
+    const paddedSecret = prefix + "\u200B".repeat(
+      HEARTBEAT_PERSISTENCE_LIMITS.maxStringChars - prefix.length,
+    );
+    const chunkCount = Math.ceil(
+      HEARTBEAT_PERSISTENCE_LIMITS.maxTotalStringChars /
+        HEARTBEAT_PERSISTENCE_LIMITS.maxStringChars,
+    ) + 2;
+
+    const result = sanitizeHeartbeatPersistenceRecord({
+      chunks: Array.from({ length: chunkCount }, () => paddedSecret),
+    });
+    const chunks = result.chunks as string[];
+    const fullyInspectedCount = Math.floor(
+      HEARTBEAT_PERSISTENCE_LIMITS.maxTotalStringChars /
+        HEARTBEAT_PERSISTENCE_LIMITS.maxStringChars,
+    );
+
+    expect(chunks).toHaveLength(chunkCount);
+    expect(chunks.slice(0, fullyInspectedCount)).toEqual(
+      Array.from({ length: fullyInspectedCount }, () => "token=***REDACTED***"),
+    );
+    expect(chunks.slice(fullyInspectedCount)).toEqual(
+      Array.from({ length: chunkCount - fullyInspectedCount }, () => ""),
+    );
+    expect(JSON.stringify(result)).not.toContain("synthetic-budget-secret");
+  });
+
   it("sanitizes standalone text and omits non-JSON behavior", () => {
     expect(sanitizeHeartbeatPersistenceText("a\u0000b")).toBe("a\uFFFDb");
     expect(sanitizeHeartbeatPersistenceValue({ fn: () => "no", symbol: Symbol("no"), value: 1 }))
       .toEqual({ value: 1 });
+  });
+
+  it("omits undefined optional fields emitted by Claude and Gemini adapters", () => {
+    const claudeResult = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      errorCode: null,
+      errorMeta: undefined,
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+    });
+
+    expect(claudeResult).not.toHaveProperty("errorMeta");
+    expect(claudeResult).toMatchObject({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "anthropic",
+    });
+
+    const geminiParsed = parseGeminiJsonl(JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [{
+          type: "question",
+          prompt: "Continue?",
+          choices: [{ key: "yes", label: "Yes" }],
+        }],
+      },
+    }));
+    expect(geminiParsed.question?.choices[0]).toHaveProperty("description", undefined);
+
+    const geminiResult = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      question: geminiParsed.question,
+      provider: "google",
+      model: "gemini-2.5-pro",
+    });
+
+    expect(geminiResult.question).toEqual({
+      prompt: "Continue?",
+      choices: [{ key: "yes", label: "Yes" }],
+    });
+    expect(geminiResult.question?.choices[0]).not.toHaveProperty("description");
   });
 
   it("preserves only the exact canonical server-owned wakeup skip reason", () => {

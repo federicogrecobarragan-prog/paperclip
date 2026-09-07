@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -34,9 +37,14 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 import * as activityLogService from "../services/activity-log.ts";
-import { heartbeatService } from "../services/heartbeat.ts";
+import {
+  heartbeatService,
+  type HeartbeatPostTerminalStep,
+  type HeartbeatRuntimeAccountingFaultPhase,
+} from "../services/heartbeat.ts";
 import { logger } from "../middleware/logger.ts";
 import { workspaceOperationService } from "../services/workspace-operations.ts";
+import { costService } from "../services/costs.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -146,15 +154,21 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
   afterEach(async () => {
     releaseBlockedFollowUps?.();
     releaseBlockedFollowUps = null;
-    await waitForHeartbeatQuiescence(db);
-    vi.clearAllMocks();
-    vi.restoreAllMocks();
+    try {
+      await waitForHeartbeatQuiescence(db);
+    } finally {
+      vi.clearAllMocks();
+      vi.restoreAllMocks();
+    }
   });
 
   afterAll(async () => {
-    if (tempDb) await waitForHeartbeatQuiescence(db);
-    await db?.$client.end({ timeout: 0 });
-    await tempDb?.cleanup();
+    try {
+      if (tempDb) await waitForHeartbeatQuiescence(db);
+    } finally {
+      await db?.$client.end({ timeout: 0 });
+      await tempDb?.cleanup();
+    }
   });
 
   async function seedAgent() {
@@ -589,7 +603,314 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(operation.stderrExcerpt).toContain("raw stderr omitted");
   });
 
-  it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization when publication throws", async () => {
+  for (const faultPhase of [
+    "before_transaction",
+    "after_runtime_state",
+    "after_cost_event",
+    "after_commit",
+    "after_budget_evaluation",
+  ] as const satisfies readonly HeartbeatRuntimeAccountingFaultPhase[]) {
+    it(`charges runtime accounting exactly once after a ${faultPhase} failure`, async () => {
+      const { companyId, agentId } = await seedAgent();
+      await db.insert(budgetPolicies).values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 200,
+        warnPercent: 50,
+        hardStopEnabled: false,
+        notifyEnabled: true,
+        isActive: true,
+      });
+      let adapterStarted!: () => void;
+      const adapterStartedPromise = new Promise<void>((resolve) => {
+        adapterStarted = resolve;
+      });
+      let finishAdapter!: () => void;
+      const adapterCanFinish = new Promise<void>((resolve) => {
+        finishAdapter = resolve;
+      });
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        adapterStarted();
+        await adapterCanFinish;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          summary: "accounted once",
+          provider: "test",
+          biller: "test-biller",
+          model: "test-model",
+          billingType: "metered_api",
+          costUsd: 1.23,
+          usage: {
+            inputTokens: 101,
+            cachedInputTokens: 7,
+            outputTokens: 29,
+          },
+        };
+      });
+
+      let faultRunId: string | null = null;
+      let injected = false;
+      let thresholdLogsAtAfterCommit: number | null = null;
+      const heartbeat = heartbeatService(db, {
+        runtimeAccountingFaultInjector: async ({ runId, phase }) => {
+          if (runId !== faultRunId || phase !== faultPhase || injected) return;
+          if (phase === "after_commit") {
+            thresholdLogsAtAfterCommit = await db
+              .select({ id: activityLog.id })
+              .from(activityLog)
+              .where(and(
+                eq(activityLog.companyId, companyId),
+                eq(activityLog.action, "budget.soft_threshold_crossed"),
+              ))
+              .then((rows) => rows.length);
+          }
+          injected = true;
+          throw new Error(`simulated runtime accounting ${phase} failure`);
+        },
+      });
+      const queued = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "system",
+        reason: `runtime_accounting_${faultPhase}`,
+      });
+      expect(queued).toBeTruthy();
+      faultRunId = queued!.id;
+      await adapterStartedPromise;
+      finishAdapter();
+
+      const terminal = await waitForTerminalRun(heartbeat, queued!.id, 10_000);
+      const accountingSettled = await waitForCondition(async () => {
+        const [run, runtimeState, event, thresholdLog, currentAgent] = await Promise.all([
+          db
+            .select({ runtimeAccountedAt: heartbeatRuns.runtimeAccountedAt })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, queued!.id))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ lastRunId: agentRuntimeState.lastRunId })
+            .from(agentRuntimeState)
+            .where(eq(agentRuntimeState.agentId, agentId))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ id: costEvents.id })
+            .from(costEvents)
+            .where(eq(costEvents.heartbeatRunId, queued!.id))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ id: activityLog.id })
+            .from(activityLog)
+            .where(and(
+              eq(activityLog.companyId, companyId),
+              eq(activityLog.action, "budget.soft_threshold_crossed"),
+            ))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ status: agents.status })
+            .from(agents)
+            .where(eq(agents.id, agentId))
+            .then((rows) => rows[0] ?? null),
+        ]);
+        return Boolean(run?.runtimeAccountedAt) &&
+          runtimeState?.lastRunId === queued!.id &&
+          Boolean(event) &&
+          Boolean(thresholdLog) &&
+          currentAgent?.status === "idle";
+      }, 10_000);
+      expect(accountingSettled).toBe(true);
+
+      const [run, runtimeState, agent, company, events, thresholdLogs] = await Promise.all([
+        db
+          .select({ runtimeAccountedAt: heartbeatRuns.runtimeAccountedAt })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, queued!.id))
+          .then((rows) => rows[0]),
+        db
+          .select()
+          .from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, agentId))
+          .then((rows) => rows[0]),
+        db
+          .select({ spentMonthlyCents: agents.spentMonthlyCents })
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .then((rows) => rows[0]),
+        db
+          .select({ spentMonthlyCents: companies.spentMonthlyCents })
+          .from(companies)
+          .where(eq(companies.id, companyId))
+          .then((rows) => rows[0]),
+        db
+          .select()
+          .from(costEvents)
+          .where(eq(costEvents.heartbeatRunId, queued!.id)),
+        db
+          .select()
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, "budget.soft_threshold_crossed"),
+          )),
+      ]);
+
+      expect(terminal?.status).toBe("succeeded");
+      expect(injected).toBe(true);
+      if (faultPhase === "after_commit") {
+        expect(thresholdLogsAtAfterCommit).toBe(0);
+      }
+      expect(run?.runtimeAccountedAt).toBeInstanceOf(Date);
+      expect(runtimeState).toMatchObject({
+        lastRunId: queued!.id,
+        totalInputTokens: 101,
+        totalCachedInputTokens: 7,
+        totalOutputTokens: 29,
+        totalCostCents: 123,
+      });
+      expect(events).toHaveLength(1);
+      expect(thresholdLogs).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        heartbeatRunId: queued!.id,
+        agentId,
+        provider: "test",
+        biller: "test-biller",
+        billingType: "metered_api",
+        model: "test-model",
+        inputTokens: 101,
+        cachedInputTokens: 7,
+        outputTokens: 29,
+        costCents: 123,
+      });
+      expect(agent?.spentMonthlyCents).toBe(123);
+      expect(company?.spentMonthlyCents).toBe(123);
+    }, 20_000);
+  }
+
+  for (const otherWriter of ["heartbeat", "manual cost report"] as const) {
+  it(`preserves company spend with a concurrent ${otherWriter}`, async () => {
+    const { companyId, agentId } = await seedAgent();
+    const secondAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: secondAgentId,
+      companyId,
+      name: "Concurrent accounting adapter",
+      role: "test",
+      status: "idle",
+      adapterType: "http",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    mockAdapterExecute.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "test",
+      model: "concurrent-cost-model",
+      billingType: "metered_api",
+      costUsd: 1.23,
+      usage: { inputTokens: 101, outputTokens: 29 },
+    });
+    let firstCostReady!: () => void;
+    const firstCostReached = new Promise<void>((resolve) => { firstCostReady = resolve; });
+    let secondRuntimeReady!: () => void;
+    const secondRuntimeReached = new Promise<void>((resolve) => { secondRuntimeReady = resolve; });
+    releaseBlockedFollowUps = secondRuntimeReady;
+    let firstRunId: string | null = null;
+    const heartbeat = heartbeatService(db, {
+      runtimeAccountingFaultInjector: async ({ runId, phase }) => {
+        if (phase === "before_transaction" && firstRunId === null) firstRunId = runId;
+        if (phase === "after_runtime_state" && runId !== firstRunId) secondRuntimeReady();
+        if (phase === "after_cost_event" && runId === firstRunId) {
+          firstCostReady();
+          await secondRuntimeReached;
+          // Give the second transaction time to contend with the first one's
+          // uncommitted ledger row and company rollup.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      },
+    });
+    const firstRun = await heartbeat.wakeup(agentId, {
+      source: "on_demand", triggerDetail: "system", reason: "concurrent_accounting",
+    });
+    await firstCostReached;
+    expect(firstRun).toBeTruthy();
+    if (otherWriter === "heartbeat") {
+      const secondRun = await heartbeat.wakeup(secondAgentId, {
+        source: "on_demand", triggerDetail: "system", reason: "concurrent_accounting",
+      });
+      expect(secondRun).toBeTruthy();
+    } else {
+      secondRuntimeReady();
+      await costService(db).createEvent(companyId, {
+        agentId: secondAgentId,
+        provider: "test",
+        model: "manual-cost-model",
+        billingType: "metered_api",
+        costCents: 123,
+        occurredAt: new Date(),
+      });
+    }
+    expect(await waitForCondition(async () => {
+      const rows = await db.select().from(agents).where(inArray(agents.id, [agentId, secondAgentId]));
+      return rows.length === 2 && rows.every((agent) => agent.status === "idle");
+    }, 10_000)).toBe(true);
+    const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
+    const events = await db.select().from(costEvents).where(eq(costEvents.companyId, companyId));
+    expect(events).toHaveLength(2);
+    expect(company.spentMonthlyCents).toBe(246);
+    expect(events.reduce((sum, event) => sum + event.costCents, 0)).toBe(246);
+  }, 20_000);
+  }
+
+  it("continues post-terminal finalization when publishPluginDomainEvent throws", async () => {
+    const { agentId } = await seedAgent();
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      summary: "terminal persisted",
+      provider: "test",
+      model: "test-model",
+      sessionId: "publication-failure-session",
+    });
+    const publishSpy = vi
+      .spyOn(activityLogService, "publishPluginDomainEvent")
+      .mockImplementation((event) => {
+        if (event.eventType === "agent.run.finished") {
+          throw new Error("simulated post-commit publication failure");
+        }
+      });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      reason: "publication_failure",
+      contextSnapshot: {
+        taskKey: "publication-failure-task",
+      },
+    });
+    expect(queued).toBeTruthy();
+
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id, 10_000);
+    const postTerminalState = await waitForPostTerminalState(db, agentId, queued!.id, 10_000);
+    const [wakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+
+    expect(terminal?.status).toBe("succeeded");
+    expect(wakeup?.status).toBe("completed");
+    expect(postTerminalState.runtimeState?.lastRunId).toBe(queued!.id);
+    expect(postTerminalState.sessions.some((session) => session.lastRunId === queued!.id)).toBe(true);
+    expect(publishSpy.mock.calls.some(([event]) => event.eventType === "agent.run.finished")).toBe(true);
+  }, 20_000);
+
+  it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization across injected step failures", async () => {
     const { companyId, agentId } = await seedAgent();
     const dependentAgentId = randomUUID();
     const blockerIssueId = randomUUID();
@@ -667,10 +988,24 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
         model: "test-model",
       };
     });
-    vi.spyOn(activityLogService, "publishPluginDomainEvent").mockImplementation((event) => {
-      if (event.eventType === "agent.run.finished") throw new Error("simulated post-commit publication failure");
+    const injectedFirstAttemptFailures = new Set<HeartbeatPostTerminalStep>([
+      "liveness_classification",
+      "wakeup_finalize",
+      "issue_execution_release",
+      "runtime_state",
+      "task_session",
+    ]);
+    const postTerminalAttempts = new Map<HeartbeatPostTerminalStep, number>();
+    let faultRunId: string | null = null;
+    const heartbeat = heartbeatService(db, {
+      postTerminalStepFaultInjector: ({ runId, step, attempt }) => {
+        if (runId !== faultRunId) return;
+        postTerminalAttempts.set(step, (postTerminalAttempts.get(step) ?? 0) + 1);
+        if (injectedFirstAttemptFailures.has(step) && attempt === 1) {
+          throw new Error(`simulated ${step} failure`);
+        }
+      },
     });
-    const heartbeat = heartbeatService(db);
 
     const queued = await heartbeat.wakeup(agentId, {
       source: "assignment",
@@ -684,6 +1019,7 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
       },
     });
     expect(queued).toBeTruthy();
+    faultRunId = queued!.id;
     await firstRunStartedPromise;
 
     const deferredWakeupId = randomUUID();
@@ -782,6 +1118,11 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(promotedRun?.errorCode).toBe("issue_terminal_status");
     expect(postTerminalState.runtimeState?.lastRunId).toBe(queued!.id);
     expect(postTerminalState.sessions.some((session) => session.lastRunId === queued!.id)).toBe(true);
+    expect(postTerminalAttempts.get("liveness_classification")).toBe(1);
+    expect(postTerminalAttempts.get("wakeup_finalize")).toBe(2);
+    expect(postTerminalAttempts.get("issue_execution_release")).toBe(2);
+    expect(postTerminalAttempts.get("runtime_state")).toBe(2);
+    expect(postTerminalAttempts.get("task_session")).toBe(2);
 
     finishFollowUpRuns();
     releaseBlockedFollowUps = null;

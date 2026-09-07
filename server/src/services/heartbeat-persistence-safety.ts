@@ -156,6 +156,9 @@ function canonicalizeSecurityClassifierText(value: string) {
 
 function prepareBoundedPersistenceText(value: string, maxChars: number) {
   const bounded = value.length > maxChars ? value.slice(0, maxChars) : value;
+  // Charge callers for the source text inspected below, before canonicalization
+  // or redaction can collapse attacker-controlled padding to a short string.
+  const inspectedChars = bounded.length;
   const persistenceSafeText = bounded.replace(/\u0000/g, "\uFFFD");
   const classifierText = canonicalizeSecurityClassifierText(bounded);
   const redactedClassifierText = redactSensitiveText(classifierText);
@@ -172,7 +175,7 @@ function prepareBoundedPersistenceText(value: string, maxChars: number) {
     text = text.replace(DANGLING_JSON_SECRET_RE, `$1${REDACTED_EVENT_VALUE}`);
   }
   if (text.length > maxChars) text = text.slice(0, maxChars);
-  return { text, wasTruncated };
+  return { text, wasTruncated, inspectedChars };
 }
 
 function appendTruncationMarker(value: string, maxChars: number) {
@@ -291,7 +294,7 @@ function truncateString(value: string, state: SanitizerState): string | typeof O
   }
 
   if (!consumeLeaf(state, contentBytes + 2)) return OMIT;
-  state.stringChars += result.length;
+  state.stringChars += prepared.inspectedChars;
   return result;
 }
 
@@ -566,6 +569,9 @@ function readContractField(
     return { present: false as const, value: undefined };
   }
   if (!("value" in descriptor)) invalidContract(`${path}.${field} must be a data property`);
+  if (!required && descriptor.value === undefined) {
+    return { present: false as const, value: undefined };
+  }
   return { present: true as const, value: descriptor.value };
 }
 
@@ -833,7 +839,9 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
 
   for (const field of ADAPTER_EXECUTION_RESULT_FIELDS.slice(3)) {
     const candidate = candidates.get(field);
-    if (candidate?.present) candidate.value = canonicalizeOptionalField(field, candidate.value);
+    if (candidate?.present && candidate.value !== undefined) {
+      candidate.value = canonicalizeOptionalField(field, candidate.value);
+    }
   }
 
   const state = createState();
@@ -876,7 +884,7 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
   storeField("timedOut", rawTimedOut, true);
   for (const field of PRIORITIZED_OPTIONAL_FIELDS) {
     const candidate = candidates.get(field);
-    if (candidate?.present) storeField(field, candidate.value);
+    if (candidate?.present && candidate.value !== undefined) storeField(field, candidate.value);
   }
 
   const encodedBytes = Buffer.byteLength(JSON.stringify(output), "utf8");

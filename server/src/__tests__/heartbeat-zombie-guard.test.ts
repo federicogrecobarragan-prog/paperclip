@@ -18,13 +18,18 @@ import {
 import { WorkspaceRuntimeValidationFailure } from "../services/workspace-runtime.ts";
 
 describe("heartbeat process namespace classification", () => {
-  it("only treats explicitly local sessioned adapters as host-local children", () => {
+  it("treats local and SSH sessioned adapters as host-local children", () => {
     expect(heartbeatRunTracksHostLocalChildProcess({
       adapterType: "codex_local",
       contextSnapshot: { paperclipEnvironment: { driver: "local" } },
     })).toBe(true);
 
-    for (const driver of ["sandbox", "ssh", "plugin", "unknown"]) {
+    expect(heartbeatRunTracksHostLocalChildProcess({
+      adapterType: "codex_local",
+      contextSnapshot: { paperclipEnvironment: { driver: "ssh" } },
+    })).toBe(true);
+
+    for (const driver of ["sandbox", "plugin", "unknown"]) {
       expect(heartbeatRunTracksHostLocalChildProcess({
         adapterType: "codex_local",
         contextSnapshot: { paperclipEnvironment: { driver } },

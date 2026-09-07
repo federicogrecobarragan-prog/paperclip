@@ -11,7 +11,10 @@ type SelectResult = unknown[];
 
 function createDbStub(selectResults: SelectResult[]) {
   const pendingSelects = [...selectResults];
-  const selectWhere = vi.fn(async () => pendingSelects.shift() ?? []);
+  const selectWhere = vi.fn(() => {
+    const rows = Promise.resolve(pendingSelects.shift() ?? []);
+    return Object.assign(rows, { for: () => rows });
+  });
   const selectThen = vi.fn((resolve: (value: unknown[]) => unknown) => Promise.resolve(resolve(pendingSelects.shift() ?? [])));
   const selectOrderBy = vi.fn(async () => pendingSelects.shift() ?? []);
   const selectFrom = vi.fn(() => ({
@@ -42,12 +45,14 @@ function createDbStub(selectResults: SelectResult[]) {
   const pendingInserts: unknown[][] = [];
   const pendingUpdates: unknown[][] = [];
 
-  return {
-    db: {
+  const db = {
       select,
       insert,
       update,
-    },
+      transaction: async (work: (tx: unknown) => unknown): Promise<unknown> => work(db),
+  };
+  return {
+    db,
     queueInsert: (rows: unknown[]) => {
       pendingInserts.push(rows);
     },
@@ -83,6 +88,7 @@ describe("budgetService", () => {
     const dbStub = createDbStub([
       [policy],
       [{ total: 150 }],
+      [], // policy row lock
       [],
       [{
         companyId: "company-1",
@@ -143,6 +149,7 @@ describe("budgetService", () => {
         action: "budget.hard_threshold_crossed",
         entityId: "incident-1",
       }),
+      expect.objectContaining({ deferPublish: expect.any(Function) }),
     );
     expect(cancelWorkForScope).toHaveBeenCalledWith({
       companyId: "company-1",

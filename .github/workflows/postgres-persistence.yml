@@ -7,6 +7,12 @@ on:
     paths:
       - ".github/workflows/postgres-persistence.yml"
       - "server/src/__tests__/heartbeat-nul-persistence.integration.test.ts"
+      - "server/src/__tests__/budgets-service.test.ts"
+      - "server/src/__tests__/budget-accounting.integration.test.ts"
+      - "server/src/__tests__/costs-service.test.ts"
+      - "server/src/services/budgets.ts"
+      - "server/src/services/costs.ts"
+      - "server/src/services/activity-log.ts"
       - "server/src/__tests__/heartbeat-zombie-guard.test.ts"
       - "server/src/__tests__/heartbeat-workspace-session.test.ts"
       - "server/src/__tests__/heartbeat-process-recovery.test.ts"
@@ -54,7 +60,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685 # PostgreSQL 16.15-alpine
         env:
           POSTGRES_DB: paperclip_test
           POSTGRES_USER: paperclip
@@ -69,15 +75,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 9.15.4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
           cache: pnpm
@@ -131,6 +137,9 @@ jobs:
           }
 
           run_suite @paperclipai/server server/src/__tests__/heartbeat-nul-persistence.integration.test.ts
+          run_suite @paperclipai/server server/src/__tests__/budgets-service.test.ts
+          run_suite @paperclipai/server server/src/__tests__/budget-accounting.integration.test.ts
+          run_suite @paperclipai/server server/src/__tests__/costs-service.test.ts
           run_suite @paperclipai/server server/src/__tests__/heartbeat-zombie-guard.test.ts
           run_suite @paperclipai/server server/src/__tests__/heartbeat-workspace-session.test.ts
           run_suite @paperclipai/server server/src/__tests__/heartbeat-process-recovery.test.ts

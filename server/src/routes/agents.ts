@@ -3384,6 +3384,10 @@ export function agentRoutes(
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
     }
+    if (typeof body.triggerDetail === "string" && body.triggerDetail.includes("\u0000")) {
+      res.status(400).json({ error: "triggerDetail must not contain U+0000" });
+      return;
+    }
     const wakeOpts: Parameters<typeof heartbeat.wakeup>[1] = {
       source: "on_demand",
       triggerDetail: typeof body.triggerDetail === "string" ? body.triggerDetail as "manual" | "system" | "ping" | "callback" : "manual",
