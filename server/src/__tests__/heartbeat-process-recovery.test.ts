@@ -2701,6 +2701,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it.each(["run", "agent"] as const)("retains running ownership when %s tree termination fails", async (scope) => {
+    const { agentId, runId } = await seedRunFixture({ agentStatus: "running", includeIssue: false });
+    const heartbeat = heartbeatService(db);
+    const tracked = { child: { pid: 12345 } as ChildProcess, graceSec: 1, processGroupId: null };
+    runningProcesses.set(runId, tracked);
+    mockTerminateLocalService.mockRejectedValueOnce(new Error("tree termination failed"));
+    try {
+      const cancel = scope === "run" ? heartbeat.cancelRun(runId) : heartbeat.cancelActiveForAgent(agentId);
+      await expect(cancel).rejects.toThrow("tree termination failed");
+      expect(runningProcesses.get(runId)).toBe(tracked);
+      expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    } finally {
+      runningProcesses.delete(runId);
+    }
+  });
+
   it("records manual cancellation stop metadata", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",

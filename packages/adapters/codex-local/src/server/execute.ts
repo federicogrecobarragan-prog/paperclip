@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { terminateWindowsProcessTree } from "@paperclipai/adapter-utils/windows-process-tree";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -92,11 +93,14 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
-function signalCodexChild(
+export async function signalCodexChild(
   target: { pid: number | null; processGroupId: number | null },
   signal: NodeJS.Signals,
-): boolean {
-  if (process.platform !== "win32" && target.processGroupId && target.processGroupId > 0) {
+): Promise<boolean> {
+  if (process.platform === "win32") {
+    return target.pid ? terminateWindowsProcessTree(target.pid) : false;
+  }
+  if (target.processGroupId && target.processGroupId > 0) {
     try {
       process.kill(-target.processGroupId, signal);
       return true;
@@ -838,6 +842,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
       let monitorLogPromise: Promise<unknown> | null = null;
+      let monitorTerminationPromise: Promise<void> = Promise.resolve();
+      const signalMonitorTarget = (target: { pid: number | null; processGroupId: number | null }, signal: NodeJS.Signals) => {
+        const termination = signalCodexChild(target, signal)
+          .then((sent) => { if (sent) monitorTerminationSignal = signal; })
+          .catch(() => onLog("stderr", "[paperclip] failed to terminate codex process tree\n"))
+          .then(() => undefined);
+        monitorTerminationPromise = Promise.all([monitorTerminationPromise, termination]).then(() => undefined);
+      };
 
       const monitor =
         monitorResolution.mode === "disabled"
@@ -868,12 +880,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 if (!target || (target.pid == null && target.processGroupId == null)) {
                   return;
                 }
-                const sentSig = signalCodexChild(target, "SIGTERM");
-                if (sentSig) monitorTerminationSignal = "SIGTERM";
+                signalMonitorTarget(target, "SIGTERM");
                 sigkillTimer = setTimeout(() => {
                   sigkillTimer = null;
-                  const stillSent = signalCodexChild(target, "SIGKILL");
-                  if (stillSent) monitorTerminationSignal = "SIGKILL";
+                  signalMonitorTarget(target, "SIGKILL");
                 }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
                 if (typeof (sigkillTimer as { unref?: () => void }).unref === "function") {
                   (sigkillTimer as { unref: () => void }).unref();
@@ -913,6 +923,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           },
           runLogTail: paperclipBridge?.runLogTail,
         });
+        await monitorTerminationPromise;
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
           proc: {
@@ -940,6 +951,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           await monitorLogPromise;
           monitorLogPromise = null;
         }
+        await monitorTerminationPromise;
       }
     };
 

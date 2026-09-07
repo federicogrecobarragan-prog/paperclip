@@ -5,14 +5,28 @@ import {
   createCodexOutputInactivityMonitor,
   formatOutputInactivityMonitorErrorMessage,
 } from "./output-inactivity-monitor.js";
-import { resolveCodexHostKillTarget } from "./execute.js";
+import { resolveCodexHostKillTarget, signalCodexChild } from "./execute.js";
+
+const DESCENDANT_SCRIPT = `
+process.stderr.write("descendant:" + process.pid + "\\n");
+setTimeout(() => process.exit(0), 30_000);
+`;
+const CHILD_SCRIPT = `
+require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(DESCENDANT_SCRIPT)}], {
+  stdio: ["ignore", "inherit", "inherit"], windowsHide: true,
+});
+${DESCENDANT_SCRIPT}
+`;
 
 const FAKE_CODEX_SCRIPT = `
+require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(CHILD_SCRIPT)}], {
+  stdio: ["ignore", "inherit", "inherit"], windowsHide: true,
+});
 process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "abc" }) + "\\n");
 // Simulate a wedged codex: read stdin forever, never write again.
 process.stdin.resume();
 process.stdin.on("data", () => {});
-setInterval(() => {}, 60_000);
+setTimeout(() => process.exit(0), 30_000);
 `;
 
 describe("codex inactivity monitor process ownership", () => {
@@ -48,27 +62,14 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
       let terminationSignal: NodeJS.Signals | null = null;
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
       let elapsedMs = 0;
+      let termination = Promise.resolve();
 
       const kill = (signal: NodeJS.Signals) => {
         const target = killTarget;
-        if (!target) return false;
-        if (target.processGroupId && target.processGroupId > 0) {
-          try {
-            process.kill(-target.processGroupId, signal);
-            return true;
-          } catch {
-            /* fall through */
-          }
-        }
-        if (target.pid && target.pid > 0) {
-          try {
-            process.kill(target.pid, signal);
-            return true;
-          } catch {
-            return false;
-          }
-        }
-        return false;
+        if (!target) return;
+        termination = signalCodexChild(target, signal).then((sent) => {
+          if (sent) terminationSignal = signal;
+        });
       };
 
       const monitor = createCodexOutputInactivityMonitor({
@@ -76,9 +77,9 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
         onFire: (state) => {
           monitorFired = true;
           elapsedMs = (state.firedAt ?? Date.now()) - state.lastEventAt;
-          if (kill("SIGTERM")) terminationSignal = "SIGTERM";
+          kill("SIGTERM");
           sigkillTimer = setTimeout(() => {
-            if (kill("SIGKILL")) terminationSignal = "SIGKILL";
+            kill("SIGKILL");
           }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
         },
       });
@@ -99,6 +100,7 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
             }
           },
         });
+        await termination;
 
         expect(monitorFired, "monitor should fire when codex goes silent").toBe(true);
         // Process was killed by our signal, not by hitting timeoutSec.
@@ -118,6 +120,14 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
         );
         // We should have observed exactly one parsed JSONL event before silence.
         expect(monitor.state().parsedEventCount).toBe(1);
+        const descendants = Array.from(logs.map((entry) => entry.chunk).join("").matchAll(/descendant:(\d+)/g),
+          (match) => Number(match[1]));
+        expect(descendants).toHaveLength(2);
+        if (process.platform === "win32") {
+          for (const pid of descendants) {
+            expect(() => process.kill(pid, 0)).toThrow();
+          }
+        }
       } finally {
         monitor.stop();
         if (sigkillTimer) clearTimeout(sigkillTimer);
