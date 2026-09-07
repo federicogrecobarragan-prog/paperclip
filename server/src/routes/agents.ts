@@ -3384,13 +3384,16 @@ export function agentRoutes(
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
     }
-    if (typeof body.triggerDetail === "string" && body.triggerDetail.includes("\u0000")) {
-      res.status(400).json({ error: "triggerDetail must not contain U+0000" });
+    // Keep legacy empty-body/default behavior, but share the modern endpoint's
+    // enum contract. Do not echo an invalid value into the response or audit log.
+    const triggerDetail = wakeAgentSchema.shape.triggerDetail.safeParse(body.triggerDetail);
+    if (!triggerDetail.success) {
+      res.status(400).json({ error: "Invalid triggerDetail" });
       return;
     }
     const wakeOpts: Parameters<typeof heartbeat.wakeup>[1] = {
       source: "on_demand",
-      triggerDetail: typeof body.triggerDetail === "string" ? body.triggerDetail as "manual" | "system" | "ping" | "callback" : "manual",
+      triggerDetail: triggerDetail.data ?? "manual",
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
       contextSnapshot,

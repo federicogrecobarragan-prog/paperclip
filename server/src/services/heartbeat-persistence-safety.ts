@@ -620,8 +620,11 @@ function canonicalizeUsage(value: unknown) {
     ["usage.outputTokens", outputTokens],
     ...(cachedInputTokens.present ? [["usage.cachedInputTokens", cachedInputTokens.value]] : []),
   ] as Array<[string, unknown]>) {
-    if (typeof tokenCount !== "number" || !Number.isFinite(tokenCount) || tokenCount < 0) {
-      invalidContract(`${path} must be a finite non-negative number`);
+    // Each ledger field is PostgreSQL int4. Reject before a successful terminal
+    // commit; clamping here would silently under-report an invalid adapter result.
+    if (typeof tokenCount !== "number" || !Number.isInteger(tokenCount) ||
+      tokenCount < 0 || tokenCount > POSTGRES_INT32_MAX) {
+      invalidContract(`${path} must be a non-negative PostgreSQL int4 integer`);
     }
   }
   return {
@@ -768,8 +771,11 @@ function canonicalizeOptionalField(field: AdapterExecutionResultField, value: un
     return value;
   }
   if (field === "costUsd") {
-    if (value !== null && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
-      invalidContract("costUsd must be a finite non-negative number or null");
+    // Match the ledger conversion exactly, including sub-cent rounding. A finite
+    // USD amount can still overflow multiplication or PostgreSQL's cents column.
+    if (value !== null && (typeof value !== "number" || !Number.isFinite(value) || value < 0 ||
+      !Number.isSafeInteger(Math.round(value * 100)) || Math.round(value * 100) > POSTGRES_INT32_MAX)) {
+      invalidContract("costUsd must round to non-negative PostgreSQL int4 cents or be null");
     }
     return value;
   }

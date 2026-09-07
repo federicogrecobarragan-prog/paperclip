@@ -275,6 +275,37 @@ describe("heartbeat persistence safety", () => {
     }
   });
 
+  it("rejects ledger token counts outside PostgreSQL int4 before terminal persistence", () => {
+    for (const field of ["inputTokens", "outputTokens", "cachedInputTokens"] as const) {
+      for (const value of [0.5, -1, 2_147_483_648, Number.MAX_SAFE_INTEGER, Number.MAX_VALUE, Infinity, NaN]) {
+        expect(() => normalizeAdapterExecutionResultForPersistence({
+          exitCode: 0, signal: null, timedOut: false,
+          usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, [field]: value },
+        }), `${field}: ${value}`).toThrow(/PostgreSQL int4/);
+      }
+    }
+  });
+
+  it("rejects finite USD costs whose rounded cents overflow the ledger", () => {
+    for (const costUsd of [21_474_836.48, Number.MAX_SAFE_INTEGER / 100, Number.MAX_VALUE, Infinity, NaN, -1]) {
+      expect(() => normalizeAdapterExecutionResultForPersistence({
+        exitCode: 0, signal: null, timedOut: false, costUsd,
+      }), `costUsd: ${costUsd}`).toThrow(/PostgreSQL int4 cents/);
+    }
+  });
+
+  it("preserves exact ledger boundaries and valid sub-cent amounts without clamping", () => {
+    const usage = { inputTokens: 2_147_483_647, outputTokens: 2_147_483_647, cachedInputTokens: 2_147_483_647 };
+    for (const costUsd of [null, 0, 0.004, 0.005, 21_474_836.47]) {
+      const result = normalizeAdapterExecutionResultForPersistence({
+        exitCode: 0, signal: null, timedOut: false, usage, costUsd,
+      });
+      expect(result.usage).toEqual(usage);
+      expect(result.costUsd).toBe(costUsd);
+      if (costUsd !== null) expect(Math.round(costUsd * 100)).toBeLessThanOrEqual(2_147_483_647);
+    }
+  });
+
   it("rejects nested contract accessors without executing them", () => {
     for (const [label, build] of [
       ["usage", (getter: () => unknown) => {

@@ -644,16 +644,32 @@ describe("agent live run routes", () => {
     });
   });
 
-  it("rejects U+0000 in legacy heartbeat invoke triggerDetail before enqueueing", async () => {
+  it.each([
+    "manual\u0000poison", "man\u200bual", "manual\ncredential=opaque-canary", "unexpected",
+    "", " manual", null, false, 1, {}, ["manual"],
+  ])("rejects an invalid legacy triggerDetail without enqueueing or reflecting it: %j", async (triggerDetail) => {
     const res = await requestApp(
       await createApp(),
       (baseUrl) => request(baseUrl)
         .post(`/api/agents/${routeAgentId}/heartbeat/invoke?companyId=company-1`)
-        .send({ triggerDetail: "manual\u0000poison" }),
+        .send({ triggerDetail }),
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(400);
-    expect(res.body).toEqual({ error: "triggerDetail must not contain U+0000" });
+    expect(res.body).toEqual({ error: "Invalid triggerDetail" });
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it.each(["manual", "system", "ping", "callback"])("accepts the shared triggerDetail enum: %s", async (triggerDetail) => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/heartbeat/invoke?companyId=company-1`)
+        .send({ triggerDetail }),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+      source: "on_demand", triggerDetail,
+    }));
   }, 10_000);
 });
