@@ -405,6 +405,48 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("settles after child exit when a descendant keeps stdout open", async () => {
+    const runId = randomUUID();
+    let descendantPid: number | null = null;
+    const startedAt = Date.now();
+
+    try {
+      const result = await runChildProcess(
+        runId,
+        process.execPath,
+        [
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'ignore'] });",
+            "process.stdout.write(`descendant:${child.pid}\\n`);",
+            "setTimeout(() => process.exit(0), 25);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 10,
+          graceSec: 1,
+          postExitCloseTimeoutMs: 100,
+          onLog: async () => {},
+        },
+      );
+
+      descendantPid = Number.parseInt(result.stdout.match(/descendant:(\d+)/)?.[1] ?? "", 10);
+      expect(result.exitCode).toBe(0);
+      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      if (!descendantPid) throw new Error("Expected a descendant pid");
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(75);
+      expect(runningProcesses.has(runId)).toBe(false);
+    } finally {
+      if (descendantPid && isPidAlive(descendantPid)) {
+        process.kill(descendantPid, "SIGKILL");
+        await waitForPidExit(descendantPid);
+      }
+    }
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();

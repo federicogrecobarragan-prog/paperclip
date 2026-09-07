@@ -1,0 +1,39 @@
+name: Windows process tree
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-process-tree.yml"
+      - "packages/adapter-utils/src/**"
+      - "packages/adapters/codex-local/src/server/**"
+      - "server/src/services/heartbeat.ts"
+      - "server/src/services/local-service-supervisor.ts"
+      - "server/src/__tests__/local-service-supervisor-windows.test.ts"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  process_tree:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Exercise real Windows descendants and reject skipped tests
+        shell: pwsh
+        run: |
+          pnpm exec vitest run packages/adapter-utils/src/windows-process-tree.test.ts packages/adapter-utils/src/windows-process-tree-identity.test.ts server/src/__tests__/local-service-supervisor-windows.test.ts packages/adapters/codex-local/src/server/output-inactivity-monitor.integration.test.ts packages/adapters/codex-local/src/server/windows-process-ownership.test.ts --reporter=default --reporter=junit --outputFile.junit=windows-process-tree.junit.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          [xml]$report = Get-Content -LiteralPath windows-process-tree.junit.xml -Raw
+          if ($report.SelectNodes('//testcase').Count -lt 17 -or $report.SelectNodes('//skipped | //failure | //error').Count -gt 0) {
+            throw 'Windows process-tree suite must execute every required case without skips or failures'
+          }

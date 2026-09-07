@@ -74,11 +74,64 @@ export class WorkspaceRuntimeValidationFailure extends Error {
   code = "workspace_validation_failed" as const;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(
+    message: string,
+    resultJson: Record<string, unknown>,
+    authenticityToken?: unknown,
+  ) {
     super(message);
     this.name = "WorkspaceRuntimeValidationFailure";
     this.resultJson = resultJson;
+    if (authenticityToken === WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN) {
+      authenticWorkspaceRuntimeValidationFailures.set(this, {
+        message: this.message,
+        resultJson: snapshotWorkspaceRuntimeValidationResultJson(resultJson),
+      });
+    }
   }
+}
+
+const WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN = Symbol(
+  "paperclip.workspace-runtime-validation-failure",
+);
+const authenticWorkspaceRuntimeValidationFailures =
+  new WeakMap<WorkspaceRuntimeValidationFailure, {
+    message: string;
+    resultJson: Record<string, unknown>;
+  }>();
+
+function snapshotWorkspaceRuntimeValidationResultJson(
+  resultJson: Record<string, unknown>,
+): Record<string, unknown> {
+  try {
+    return structuredClone(resultJson) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function workspaceRuntimeValidationFailure(
+  message: string,
+  resultJson: Record<string, unknown>,
+) {
+  return new WorkspaceRuntimeValidationFailure(
+    message,
+    resultJson,
+    WORKSPACE_RUNTIME_VALIDATION_FAILURE_TOKEN,
+  );
+}
+
+export function readAuthenticWorkspaceRuntimeValidationFailure(
+  error: unknown,
+): { message: string; resultJson: Record<string, unknown> } | null {
+  const snapshot = authenticWorkspaceRuntimeValidationFailures.get(
+    error as WorkspaceRuntimeValidationFailure,
+  );
+  if (!snapshot) return null;
+  return {
+    message: snapshot.message,
+    resultJson: snapshotWorkspaceRuntimeValidationResultJson(snapshot.resultJson),
+  };
 }
 
 export interface RuntimeServiceRef {
@@ -540,9 +593,51 @@ function formatShortSha(value: string | null | undefined) {
   return value ? value.slice(0, 12) : "unknown";
 }
 
-function gitErrorIncludes(error: unknown, needle: string) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.toLowerCase().includes(needle.toLowerCase());
+type GitWorkspaceFailureSignal =
+  | "branch_already_exists"
+  | "branch_already_checked_out"
+  | "invalid_reference";
+
+const gitWorkspaceFailureSignals = new WeakMap<Error, ReadonlySet<GitWorkspaceFailureSignal>>();
+
+function classifyGitWorkspaceFailureDiagnostic(diagnostic: string): Set<GitWorkspaceFailureSignal> {
+  const normalized = diagnostic.toLowerCase();
+  const signals = new Set<GitWorkspaceFailureSignal>();
+  if (normalized.includes("already exists")) signals.add("branch_already_exists");
+  if (normalized.includes("already checked out")) signals.add("branch_already_checked_out");
+  if (
+    normalized.includes("invalid reference")
+    || normalized.includes("not a commit")
+    || normalized.includes("unknown revision")
+  ) {
+    signals.add("invalid_reference");
+  }
+  return signals;
+}
+
+function createRecordedGitWorkspaceFailure(
+  exitCode: number | null,
+  stdout: string,
+  stderr: string,
+) {
+  const error = new Error(
+    `Git workspace operation failed with exit code ${exitCode ?? -1}; raw diagnostic omitted`,
+  );
+  gitWorkspaceFailureSignals.set(
+    error,
+    classifyGitWorkspaceFailureDiagnostic(`${stderr}\n${stdout}`),
+  );
+  return error;
+}
+
+function gitErrorHasSignal(error: unknown, signal: GitWorkspaceFailureSignal) {
+  if (error instanceof Error) {
+    const recordedSignals = gitWorkspaceFailureSignals.get(error);
+    if (recordedSignals) return recordedSignals.has(signal);
+  }
+  return classifyGitWorkspaceFailureDiagnostic(
+    error instanceof Error ? error.message : String(error),
+  ).has(signal);
 }
 
 function parseRemoteTrackingRef(ref: string): { remote: string; branch: string } | null {
@@ -808,7 +903,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
 }
 
 function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoherenceEvidence) {
-  return new WorkspaceRuntimeValidationFailure(
+  return workspaceRuntimeValidationFailure(
     `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
     {
       workspaceValidation: evidence,
@@ -865,9 +960,9 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       successMessage: `Repaired clean git worktree branch mismatch at ${input.worktreePath}: checked out ${expectedBranchName}\n`,
       failureLabel: `git checkout ${expectedBranchName}`,
     });
-  } catch (error) {
+  } catch {
     evidence.safeRepair.succeeded = false;
-    evidence.safeRepair.reason = `safe checkout failed: ${error instanceof Error ? error.message : String(error)}`;
+    evidence.safeRepair.reason = "safe checkout failed; raw diagnostic omitted";
     throw branchIncoherenceValidationFailure(evidence);
   }
 
@@ -1346,12 +1441,8 @@ async function runWorkspaceCommand(input: {
     env: input.env,
   });
   if (proc.code === 0) return;
-
-  const details = [proc.stderr.trim(), proc.stdout.trim()].filter(Boolean).join("\n");
   throw new Error(
-    details.length > 0
-      ? `${input.label} failed: ${details}`
-      : `${input.label} failed with exit code ${proc.code ?? -1}`,
+    `Workspace command failed with exit code ${proc.code ?? -1}; raw diagnostic omitted`,
   );
 }
 
@@ -1407,12 +1498,7 @@ async function recordGitOperation(
   });
 
   if (code !== 0) {
-    const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
-    throw new Error(
-      details.length > 0
-        ? `${input.failureLabel ?? `git ${input.args.join(" ")}`} failed: ${details}`
-        : `${input.failureLabel ?? `git ${input.args.join(" ")}`} failed with exit code ${code ?? -1}`,
-    );
+    throw createRecordedGitWorkspaceFailure(code, stdout, stderr);
   }
   return stdout.trim();
 }
@@ -1435,8 +1521,6 @@ async function recordWorkspaceCommandOperation(
     return null;
   }
 
-  let stdout = "";
-  let stderr = "";
   let code: number | null = null;
   const operation = await recorder.recordOperation({
     phase: input.phase,
@@ -1451,8 +1535,6 @@ async function recordWorkspaceCommandOperation(
         cwd: input.cwd,
         env: input.env,
       });
-      stdout = result.stdout;
-      stderr = result.stderr;
       code = result.code;
       return {
         status: result.code === 0 ? "succeeded" : "failed",
@@ -1474,12 +1556,8 @@ async function recordWorkspaceCommandOperation(
   });
 
   if (code === 0) return operation;
-
-  const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
   throw new Error(
-    details.length > 0
-      ? `${input.label} failed: ${details}`
-      : `${input.label} failed with exit code ${code ?? -1}`,
+    `Workspace command failed with exit code ${code ?? -1}; raw diagnostic omitted`,
   );
 }
 
@@ -1751,7 +1829,7 @@ export async function realizeExecutionWorkspace(input: {
       failureLabel: `git worktree add ${worktreePath}`,
     });
   } catch (error) {
-    if (!gitErrorIncludes(error, "already exists")) {
+    if (!gitErrorHasSignal(error, "branch_already_exists")) {
       throw error;
     }
     try {
@@ -1772,7 +1850,7 @@ export async function realizeExecutionWorkspace(input: {
         failureLabel: `git worktree add ${worktreePath}`,
       });
     } catch (attachError) {
-      if (!gitErrorIncludes(attachError, "already checked out")) {
+      if (!gitErrorHasSignal(attachError, "branch_already_checked_out")) {
         throw attachError;
       }
       const reusablePath = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
@@ -1877,7 +1955,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       expectedBranchName: realized.branchName,
     });
     if (!validation.valid) {
-      throw new WorkspaceRuntimeValidationFailure(
+      throw workspaceRuntimeValidationFailure(
         `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,
         {
           workspaceValidation: {
@@ -1963,11 +2041,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       failureLabel: `git worktree add ${worktreePath}`,
     });
   } catch (error) {
-    if (
-      !gitErrorIncludes(error, "invalid reference")
-      && !gitErrorIncludes(error, "not a commit")
-      && !gitErrorIncludes(error, "unknown revision")
-    ) {
+    if (!gitErrorHasSignal(error, "invalid_reference")) {
       throw error;
     }
     const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
@@ -2961,19 +3035,11 @@ async function stopRuntimeService(serviceId: string) {
   const record = runtimeServicesById.get(serviceId);
   if (!record) return;
   clearIdleTimer(record);
-  record.status = "stopped";
-  record.healthStatus = "unknown";
-  record.lastUsedAt = new Date().toISOString();
-  record.stoppedAt = new Date().toISOString();
-  runtimeServicesById.delete(serviceId);
-  if (record.reuseKey && runtimeServicesByReuseKey.get(record.reuseKey) === record.id) {
-    runtimeServicesByReuseKey.delete(record.reuseKey);
-  }
   if (record.child && record.child.pid) {
     await terminateLocalService({
       pid: record.child.pid,
       processGroupId: record.processGroupId ?? record.child.pid,
-    });
+    }, { child: record.child });
   } else if (record.providerRef) {
     const pid = Number.parseInt(record.providerRef, 10);
     if (Number.isInteger(pid) && pid > 0) {
@@ -2982,6 +3048,16 @@ async function stopRuntimeService(serviceId: string) {
         processGroupId: record.processGroupId,
       });
     }
+  }
+  // A Windows PID-only adoption cannot prove ownership after a restart. Keep
+  // the service record available for diagnosis if safe termination rejects.
+  record.status = "stopped";
+  record.healthStatus = "unknown";
+  record.lastUsedAt = new Date().toISOString();
+  record.stoppedAt = new Date().toISOString();
+  runtimeServicesById.delete(serviceId);
+  if (record.reuseKey && runtimeServicesByReuseKey.get(record.reuseKey) === record.id) {
+    runtimeServicesByReuseKey.delete(record.reuseKey);
   }
   await removeLocalServiceRegistryRecord(record.serviceKey);
   await persistRuntimeServiceRecord(record.db, record);

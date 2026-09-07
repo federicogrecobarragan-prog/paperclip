@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { pinoHttp } from "pino-http";
 
 /**
  * Regression test for https://github.com/paperclipai/paperclip/issues/2879
@@ -63,6 +64,51 @@ describe("logger translateTime respects TZ environment variable", () => {
     for (const target of targets) {
       expect(target.options.translateTime).toBe("SYS:HH:MM:ss");
     }
+
+    const rootLoggerOptions = mockPino.mock.calls[0][0] as {
+      serializers?: { err?: (error: unknown) => unknown };
+    };
+    const rootLogSentinel = "OpaqueRootLoggerValueH8L1";
+    const serializedRootError = rootLoggerOptions.serializers?.err?.(
+      new Error(rootLogSentinel),
+    );
+    expect(JSON.stringify(serializedRootError)).not.toContain(rootLogSentinel);
+    expect(serializedRootError).toMatchObject({
+      type: "Error",
+      message: "Request failed; raw diagnostic omitted",
+    });
+
+    const httpOptions = vi.mocked(pinoHttp).mock.calls[0]?.[0] as {
+      customErrorObject?: (req: unknown, res: unknown, error: Error, value: unknown) => unknown;
+      customErrorMessage?: (req: any, res: any, error: Error) => string;
+      customProps?: (req: any, res: any) => unknown;
+    };
+    const syntheticSentinel = "OpaqueHttpLoggerValueQ6P3";
+    const safeErrorObject = httpOptions.customErrorObject?.(
+      {},
+      { statusCode: 500 },
+      new Error(syntheticSentinel),
+      {
+        res: { statusCode: 500 },
+        err: new Error(syntheticSentinel),
+        responseTime: 7,
+      },
+    );
+    const safeMessage = httpOptions.customErrorMessage?.(
+      { method: "POST", url: "/api/workspaces" },
+      { statusCode: 500 },
+      new Error(syntheticSentinel),
+    );
+    const safeProps = httpOptions.customProps?.({}, {
+      statusCode: 500,
+      __errorContext: {
+        error: { message: syntheticSentinel, stack: syntheticSentinel },
+        reqBody: { detail: syntheticSentinel },
+      },
+    });
+
+    expect(JSON.stringify({ safeErrorObject, safeMessage, safeProps })).not.toContain(syntheticSentinel);
+    expect(safeMessage).toContain("raw diagnostic omitted");
   });
 
   it("SYS: prefix produces timezone-sensitive output: UTC epoch formats differently under UTC vs UTC+8", () => {

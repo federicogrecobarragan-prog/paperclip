@@ -1244,7 +1244,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             ? processGroupId
             : null,
         },
-        running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
+        running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000, child: running.child } : undefined,
       );
       runningProcesses.delete(input.run.id);
       const stillAlive =

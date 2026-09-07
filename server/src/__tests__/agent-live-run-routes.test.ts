@@ -643,4 +643,17 @@ describe("agent live run routes", () => {
       },
     });
   });
+
+  it("rejects U+0000 in legacy heartbeat invoke triggerDetail before enqueueing", async () => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/heartbeat/invoke?companyId=company-1`)
+        .send({ triggerDetail: "manual\u0000poison" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body).toEqual({ error: "triggerDetail must not contain U+0000" });
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  }, 10_000);
 });

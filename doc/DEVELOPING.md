@@ -124,6 +124,13 @@ These browser suites are intended for targeted local verification and CI, not th
 
 For normal issue work, start with the smallest targeted check that proves the change. Reserve repo-wide typecheck/build/test runs for PR-ready handoff or changes broad enough that narrow checks do not cover the risk.
 
+On slower Windows hosts, embedded PostgreSQL initialization can exceed its
+default 10-second probe timeout. Set
+`PAPERCLIP_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS=60000` for database integration
+tests, and verify that their output reports executed tests rather than skips.
+The setting only changes the startup timeout; test databases remain disposable
+and separate from the configured Paperclip instance.
+
 ## One-Command Local Run
 
 For a first-time local install, you can bootstrap and run in one command:
@@ -276,6 +283,29 @@ Paperclip also persists an empty `OPENAI_API_KEY` override for those agents so a
 If the `codex` CLI is not installed or not on `PATH`, `codex_local` agent runs fail at execution time with a clear adapter error. Quota polling uses a short-lived `codex app-server` subprocess: when `codex` cannot be spawned, that provider reports `ok: false` in aggregated quota results and the API server keeps running (it must not exit on a missing binary).
 
 Local adapters require their corresponding CLI/session setup on the machine running Paperclip. External adapters are installed through the adapter/plugin flow and should not require hardcoded imports in `server/` or `ui/`.
+
+On Windows, Board cancellation, local process timeouts, and the Codex inactivity
+monitor terminate the owned process tree with the system `taskkill /PID /T /F`
+command. This is immediate because Windows does not provide POSIX process-group
+signals. Killing only a CLI wrapper can leave its agent binary running, so the
+tree operation must finish before cancellation releases the run. Two bounded
+PID/parent/birth-time snapshots reject recycled process identities and ambiguous
+older-orphan parent links before invoking taskkill. Both are additionally bound
+to the original live Node child process handle, captured at spawn: a PID from a
+database record or registry is never sufficient authority to terminate on Windows.
+The original native handle is queried before and after snapshots; an exited
+child cannot be replaced by a new process with the same number while logs drain.
+Tool failures are reported
+instead of falling back to a wrapper-only kill. An already orphaned
+process from an older server needs identity-verified operator cleanup; restarting
+the server alone does not stop orphaned descendants.
+
+After a hard restart, a still-live persisted Windows PID without its original
+in-memory handle remains a diagnostic/ownership hold. Cancel returns an explicit
+ownership error; it does not mark the run, wakeup or workspace service stopped,
+release the issue, or claim budget cancellation succeeded. An operator must
+verify process identity independently before cleanup; do not repeatedly retry
+PID-only cancellation or clear its tracking to make the Board appear green.
 
 ## Config Freshness
 

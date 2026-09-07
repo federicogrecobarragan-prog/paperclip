@@ -1,9 +1,10 @@
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { terminateWindowsProcessTree } from "@paperclipai/adapter-utils/windows-process-tree";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -349,10 +350,14 @@ export async function touchLocalServiceRegistryRecord(
 
 export async function terminateLocalService(
   record: Pick<LocalServiceRegistryRecord, "pid" | "processGroupId">,
-  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number },
+  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number; child?: ChildProcess },
 ) {
   const signal = opts?.signal ?? "SIGTERM";
-  const targetProcessGroup = process.platform !== "win32" && record.processGroupId && record.processGroupId > 0;
+  if (process.platform === "win32") {
+    await terminateWindowsProcessTree(record.pid, opts?.child);
+    return;
+  }
+  const targetProcessGroup = record.processGroupId && record.processGroupId > 0;
   try {
     if (targetProcessGroup) {
       process.kill(-record.processGroupId!, signal);
