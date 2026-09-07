@@ -1,11 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
-  CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
   createCodexOutputInactivityMonitor,
   formatOutputInactivityMonitorErrorMessage,
 } from "./output-inactivity-monitor.js";
-import { resolveCodexHostKillTarget, signalCodexChild } from "./execute.js";
+import { resolveCodexHostKillTarget, scheduleCodexForceKill, signalCodexChild } from "./execute.js";
 
 const DESCENDANT_SCRIPT = `
 process.stderr.write("descendant:" + process.pid + "\\n");
@@ -30,6 +29,22 @@ setTimeout(() => process.exit(0), 30_000);
 `;
 
 describe("codex inactivity monitor process ownership", () => {
+  it("only schedules a stronger follow-up signal on POSIX", () => {
+    vi.useFakeTimers();
+    try {
+      const forceKill = vi.fn();
+      const timer = scheduleCodexForceKill(forceKill);
+      vi.runAllTimers();
+      if (process.platform === "win32") {
+        expect(timer).toBeNull();
+        expect(forceKill).not.toHaveBeenCalled();
+      } else {
+        expect(timer).not.toBeNull();
+        expect(forceKill).toHaveBeenCalledOnce();
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
   it("never maps a sandbox-reported remote pid to a host kill target", () => {
     const remotePidCollidingWithThisHost = process.pid;
 
@@ -78,9 +93,9 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
           monitorFired = true;
           elapsedMs = (state.firedAt ?? Date.now()) - state.lastEventAt;
           kill("SIGTERM");
-          sigkillTimer = setTimeout(() => {
+          sigkillTimer = scheduleCodexForceKill(() => {
             kill("SIGKILL");
-          }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
+          });
         },
       });
 

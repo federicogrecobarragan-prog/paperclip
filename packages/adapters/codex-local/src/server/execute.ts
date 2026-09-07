@@ -119,6 +119,15 @@ export async function signalCodexChild(
   return false;
 }
 
+export function scheduleCodexForceKill(onForceKill: () => void): ReturnType<typeof setTimeout> | null {
+  // Windows termination already uses /T /F. A delayed retry has no stronger
+  // signal to send and could target a recycled PID while run logs are draining.
+  if (process.platform === "win32") return null;
+  const timer = setTimeout(onForceKill, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
+  timer.unref?.();
+  return timer;
+}
+
 export function resolveCodexHostKillTarget(
   meta: { pid: number; processGroupId: number | null },
   executionTargetIsSandbox: boolean,
@@ -881,13 +890,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                   return;
                 }
                 signalMonitorTarget(target, "SIGTERM");
-                sigkillTimer = setTimeout(() => {
+                sigkillTimer = scheduleCodexForceKill(() => {
                   sigkillTimer = null;
                   signalMonitorTarget(target, "SIGKILL");
-                }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
-                if (typeof (sigkillTimer as { unref?: () => void }).unref === "function") {
-                  (sigkillTimer as { unref: () => void }).unref();
-                }
+                });
               },
             });
 
