@@ -47,11 +47,11 @@ describe("compactRunLogChunk", () => {
   });
 
   it("redacts a credential assignment split by U+0000 before log persistence", () => {
-    const syntheticSentinel = "sk-controlsplitlogfixture123456789";
-    const compacted = compactRunLogChunk(`token\u0000=${syntheticSentinel}`);
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    const compacted = compactRunLogChunk(`token\u0000=${opaqueCanary}`);
 
     expect(compacted).not.toContain("\u0000");
-    expect(compacted).not.toContain(syntheticSentinel);
+    expect(compacted).not.toContain(opaqueCanary);
     expect(compacted).toContain("***REDACTED***");
   });
 });
