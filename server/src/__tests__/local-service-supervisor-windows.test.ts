@@ -19,12 +19,20 @@ it.runIf(process.platform === "win32")("Board cancellation stops the real wrappe
     while (!output.includes("tree-ready") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
     expect(pids()).toHaveLength(3);
     expect(pids().every(isAlive)).toBe(true);
-    await terminateLocalService({ pid: child.pid!, processGroupId: null }, { forceAfterMs: 100 });
+    await terminateLocalService({ pid: child.pid!, processGroupId: null }, { forceAfterMs: 100, child });
     expect(pids().every((pid) => !isAlive(pid))).toBe(true);
   } finally {
-    // Each PID was emitted by our isolated fixture, never discovered globally.
-    for (const pid of [...pids(), child.pid]) {
-      if (pid && isAlive(pid)) await terminateLocalService({ pid, processGroupId: null });
-    }
+    if (child.pid && isAlive(child.pid)) await terminateLocalService({ pid: child.pid, processGroupId: null }, { child });
   }
 }, 15_000);
+
+it.runIf(process.platform === "win32")("refuses a persisted-only PID even when it belongs to a live neighboring process", async () => {
+  const neighbor = spawn(process.execPath, ["-e", "setTimeout(()=>{},30000)"], { windowsHide: true, stdio: "ignore" });
+  try {
+    await expect(terminateLocalService({ pid: neighbor.pid!, processGroupId: null }))
+      .rejects.toThrow("original child handle required");
+    expect(() => process.kill(neighbor.pid!, 0)).not.toThrow();
+  } finally {
+    if (neighbor.exitCode === null) neighbor.kill(); // original native handle, no PID-based discovery
+  }
+});

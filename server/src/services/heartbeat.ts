@@ -4541,6 +4541,7 @@ async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
+  child?: import("node:child_process").ChildProcess;
 }) {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
@@ -4557,7 +4558,7 @@ async function terminateHeartbeatRunProcess(input: {
           ? processGroupId
           : null,
     },
-    input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
+    { forceAfterMs: input.graceMs, child: input.child },
   );
 }
 
@@ -14333,6 +14334,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         pid: running.child.pid ?? run.processPid,
         processGroupId: running.processGroupId ?? run.processGroupId,
         graceMs: Math.max(1, running.graceSec) * 1000,
+        child: running.child,
       });
     } else if (run.processPid || run.processGroupId) {
       await terminateHeartbeatRunProcess({
@@ -14387,6 +14389,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           pid: running.child.pid ?? run.processPid,
           processGroupId: running.processGroupId ?? run.processGroupId,
           graceMs: Math.max(1, running.graceSec) * 1000,
+          child: running.child,
         });
         runningProcesses.delete(run.id);
       } else if (run.processPid || run.processGroupId) {

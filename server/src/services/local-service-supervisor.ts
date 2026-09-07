@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -350,11 +350,11 @@ export async function touchLocalServiceRegistryRecord(
 
 export async function terminateLocalService(
   record: Pick<LocalServiceRegistryRecord, "pid" | "processGroupId">,
-  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number },
+  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number; child?: ChildProcess },
 ) {
   const signal = opts?.signal ?? "SIGTERM";
   if (process.platform === "win32") {
-    await terminateWindowsProcessTree(record.pid);
+    await terminateWindowsProcessTree(record.pid, opts?.child);
     return;
   }
   const targetProcessGroup = record.processGroupId && record.processGroupId > 0;

@@ -35,14 +35,16 @@ describe("Windows process tree termination", () => {
       const pids = [root.pid!, ...pidsIn(output)];
       expect(pids).toHaveLength(3);
       expect(pids.every(isAlive)).toBe(true);
-      const first = terminateWindowsProcessTree(root.pid!);
-      expect(terminateWindowsProcessTree(root.pid!)).toBe(first);
+      const first = terminateWindowsProcessTree(root.pid!, root);
+      expect(terminateWindowsProcessTree(root.pid!, root)).toBe(first);
       await first;
       await waitFor(() => pids.every((pid) => !isAlive(pid)));
       expect(isAlive(neighbor.pid!)).toBe(true);
     } finally {
-      for (const pid of [...pidsIn(output), root.pid, neighbor.pid]) {
-        if (pid && isAlive(pid)) await terminateWindowsProcessTree(pid);
+      // Never reconstruct ownership from the emitted PID alone. Fixtures also
+      // self-expire after 30s if a failed test has already lost its wrapper.
+      for (const child of [root, neighbor]) {
+        if (child.pid && isAlive(child.pid)) await terminateWindowsProcessTree(child.pid, child);
       }
     }
   }, 15_000);
@@ -63,7 +65,8 @@ describe("Windows process tree termination", () => {
       expect(pidsIn(output).every((pid) => !isAlive(pid))).toBe(true);
       expect(runningProcesses.has(runId)).toBe(false);
     } finally {
-      for (const pid of pidsIn(output)) if (isAlive(pid)) await terminateWindowsProcessTree(pid);
+      const child = runningProcesses.get(runId)?.child;
+      if (child?.pid && isAlive(child.pid)) await terminateWindowsProcessTree(child.pid, child);
     }
   }, 15_000);
 

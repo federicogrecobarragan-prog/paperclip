@@ -1,9 +1,21 @@
-import { execFile } from "node:child_process";
+import { ChildProcess, execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const pendingTerminations = new Map<number, Promise<boolean>>();
+const pendingTerminations = new WeakMap<ChildProcess, Promise<boolean>>();
+
+function assertOriginalWindowsChild(pid: number, child: ChildProcess) {
+  // A live PID (even with two consistent birth snapshots) does not prove it
+  // belongs to this run. Node's native process handle refers to the original
+  // Windows HANDLE; a zero signal queries that handle, not a reopened PID.
+  // Use the native query because ChildProcess.kill(0) also changes .killed.
+  const handle = (child as ChildProcess & { _handle?: { kill?: (signal: number) => number } })._handle;
+  if (child.pid !== pid || child.exitCode !== null || child.signalCode !== null
+    || !handle || typeof handle.kill !== "function" || handle.kill(0) !== 0) {
+    throw new Error("Windows process ownership lost: original child is not live; identity-verified operator cleanup required");
+  }
+}
 
 type ProcessIdentity = { pid: number; parentPid: number; createdAt: bigint };
 
@@ -64,24 +76,29 @@ function isPidAlive(pid: number) {
  * wrapper disappears, while Windows can still resolve descendant ownership.
  * Never fall back to killing only the wrapper: that strands its descendants.
  */
-export function terminateWindowsProcessTree(pid: number): Promise<boolean> {
+export function terminateWindowsProcessTree(pid: number, child?: ChildProcess): Promise<boolean> {
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) {
     return Promise.reject(new Error("Refusing an invalid or self process-tree target"));
   }
   if (process.platform !== "win32") {
     return Promise.reject(new Error("Windows process-tree termination requires Windows"));
   }
-  const pending = pendingTerminations.get(pid);
+  if (!(child instanceof ChildProcess) || child.pid !== pid) {
+    return Promise.reject(new Error("Windows process ownership unavailable: original child handle required; identity-verified operator cleanup required"));
+  }
+  const pending = pendingTerminations.get(child);
   if (pending) return pending;
 
   const termination = (async () => {
-    if (!isPidAlive(pid)) return false;
+    assertOriginalWindowsChild(pid, child);
     const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
     if (!systemRoot || !path.isAbsolute(systemRoot)) {
       throw new Error("Cannot resolve Windows system directory for process-tree termination");
     }
     const observed = await snapshotTree(systemRoot, pid);
+    assertOriginalWindowsChild(pid, child);
     const current = await snapshotTree(systemRoot, pid);
+    assertOriginalWindowsChild(pid, child);
     if (current[0]!.createdAt !== observed[0]!.createdAt) {
       throw new Error("Windows process-tree root identity changed before termination");
     }
@@ -106,7 +123,7 @@ export function terminateWindowsProcessTree(pid: number): Promise<boolean> {
       if (ownedPids.every((ownedPid) => !isPidAlive(ownedPid))) return true;
       throw new Error(`Failed to terminate Windows process tree for PID ${pid}`);
     }
-  })().finally(() => pendingTerminations.delete(pid));
-  pendingTerminations.set(pid, termination);
+  })().finally(() => pendingTerminations.delete(child));
+  pendingTerminations.set(child, termination);
   return termination;
 }

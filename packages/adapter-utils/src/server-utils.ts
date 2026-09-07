@@ -70,7 +70,7 @@ async function signalRunningProcess(
 ) {
   if (process.platform === "win32") {
     if (running.child.pid && running.child.exitCode === null && running.child.signalCode === null) {
-      await terminateWindowsProcessTree(running.child.pid);
+      await terminateWindowsProcessTree(running.child.pid, running.child);
     }
     return;
   }
@@ -2914,14 +2914,16 @@ export async function runChildProcess(
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
+        // onSpawn consumers must capture this original ChildProcess before
+        // asynchronous log draining or a subsequent run can change tracking.
+        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
+
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
             ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
               onLogError(err, runId, "failed to record child process metadata");
             })
             : Promise.resolve();
-
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
 
         let timedOut = false;
         let stdout = "";

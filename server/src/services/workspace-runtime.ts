@@ -3035,19 +3035,11 @@ async function stopRuntimeService(serviceId: string) {
   const record = runtimeServicesById.get(serviceId);
   if (!record) return;
   clearIdleTimer(record);
-  record.status = "stopped";
-  record.healthStatus = "unknown";
-  record.lastUsedAt = new Date().toISOString();
-  record.stoppedAt = new Date().toISOString();
-  runtimeServicesById.delete(serviceId);
-  if (record.reuseKey && runtimeServicesByReuseKey.get(record.reuseKey) === record.id) {
-    runtimeServicesByReuseKey.delete(record.reuseKey);
-  }
   if (record.child && record.child.pid) {
     await terminateLocalService({
       pid: record.child.pid,
       processGroupId: record.processGroupId ?? record.child.pid,
-    });
+    }, { child: record.child });
   } else if (record.providerRef) {
     const pid = Number.parseInt(record.providerRef, 10);
     if (Number.isInteger(pid) && pid > 0) {
@@ -3056,6 +3048,16 @@ async function stopRuntimeService(serviceId: string) {
         processGroupId: record.processGroupId,
       });
     }
+  }
+  // A Windows PID-only adoption cannot prove ownership after a restart. Keep
+  // the service record available for diagnosis if safe termination rejects.
+  record.status = "stopped";
+  record.healthStatus = "unknown";
+  record.lastUsedAt = new Date().toISOString();
+  record.stoppedAt = new Date().toISOString();
+  runtimeServicesById.delete(serviceId);
+  if (record.reuseKey && runtimeServicesByReuseKey.get(record.reuseKey) === record.id) {
+    runtimeServicesByReuseKey.delete(record.reuseKey);
   }
   await removeLocalServiceRegistryRecord(record.serviceKey);
   await persistRuntimeServiceRecord(record.db, record);

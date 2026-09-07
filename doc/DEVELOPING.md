@@ -290,10 +290,22 @@ command. This is immediate because Windows does not provide POSIX process-group
 signals. Killing only a CLI wrapper can leave its agent binary running, so the
 tree operation must finish before cancellation releases the run. Two bounded
 PID/parent/birth-time snapshots reject recycled process identities and ambiguous
-older-orphan parent links before invoking taskkill. Tool failures are reported
+older-orphan parent links before invoking taskkill. Both are additionally bound
+to the original live Node child process handle, captured at spawn: a PID from a
+database record or registry is never sufficient authority to terminate on Windows.
+The original native handle is queried before and after snapshots; an exited
+child cannot be replaced by a new process with the same number while logs drain.
+Tool failures are reported
 instead of falling back to a wrapper-only kill. An already orphaned
 process from an older server needs identity-verified operator cleanup; restarting
 the server alone does not stop orphaned descendants.
+
+After a hard restart, a still-live persisted Windows PID without its original
+in-memory handle remains a diagnostic/ownership hold. Cancel returns an explicit
+ownership error; it does not mark the run, wakeup or workspace service stopped,
+release the issue, or claim budget cancellation succeeded. An operator must
+verify process identity independently before cleanup; do not repeatedly retry
+PID-only cancellation or clear its tracking to make the Board appear green.
 
 ## Config Freshness
 

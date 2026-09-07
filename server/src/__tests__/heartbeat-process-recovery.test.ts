@@ -2735,17 +2735,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it.each(["run", "agent"] as const)("retains running ownership when %s tree termination fails", async (scope) => {
-    const { agentId, runId } = await seedRunFixture({ agentStatus: "running", includeIssue: false });
+  it.each(["run", "agent", "budget"] as const)("retains running ownership when %s tree termination fails", async (scope) => {
+    const { companyId, agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({ agentStatus: "running" });
     const heartbeat = heartbeatService(db);
     const tracked = { child: { pid: 12345 } as ChildProcess, graceSec: 1, processGroupId: null };
     runningProcesses.set(runId, tracked);
     mockTerminateLocalService.mockRejectedValueOnce(new Error("tree termination failed"));
     try {
-      const cancel = scope === "run" ? heartbeat.cancelRun(runId) : heartbeat.cancelActiveForAgent(agentId);
+      const cancel = scope === "run" ? heartbeat.cancelRun(runId)
+        : scope === "agent" ? heartbeat.cancelActiveForAgent(agentId)
+          : heartbeat.cancelBudgetScopeWork({ companyId, scopeType: "agent", scopeId: agentId });
       await expect(cancel).rejects.toThrow("tree termination failed");
       expect(runningProcesses.get(runId)).toBe(tracked);
       expect((await heartbeat.getRun(runId))?.status).toBe("running");
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+      expect(issue).toMatchObject({ checkoutRunId: runId, executionRunId: runId });
+      const wakeup = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId)).then((rows) => rows[0]);
+      expect(wakeup?.status).toBe("claimed");
     } finally {
       runningProcesses.delete(runId);
     }

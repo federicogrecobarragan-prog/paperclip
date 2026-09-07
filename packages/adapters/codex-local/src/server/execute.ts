@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { ChildProcess } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { terminateWindowsProcessTree } from "@paperclipai/adapter-utils/windows-process-tree";
@@ -34,6 +35,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
   renderTemplate,
+  runningProcesses,
   renderPaperclipWakePrompt,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -94,11 +96,11 @@ function firstNonEmptyLine(text: string): string {
 }
 
 export async function signalCodexChild(
-  target: { pid: number | null; processGroupId: number | null },
+  target: { pid: number | null; processGroupId: number | null; child?: ChildProcess },
   signal: NodeJS.Signals,
 ): Promise<boolean> {
   if (process.platform === "win32") {
-    return target.pid ? terminateWindowsProcessTree(target.pid) : false;
+    return target.pid ? terminateWindowsProcessTree(target.pid, target.child) : false;
   }
   if (target.processGroupId && target.processGroupId > 0) {
     try {
@@ -848,11 +850,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let monitorTerminationSignal: NodeJS.Signals | null = null;
       let monitorElapsedMs = 0;
       let monitorTimeoutMs = 0;
-      let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
+      let killTarget: { pid: number | null; processGroupId: number | null; child?: ChildProcess } | null = null;
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
       let monitorLogPromise: Promise<unknown> | null = null;
       let monitorTerminationPromise: Promise<void> = Promise.resolve();
-      const signalMonitorTarget = (target: { pid: number | null; processGroupId: number | null }, signal: NodeJS.Signals) => {
+      const signalMonitorTarget = (target: NonNullable<typeof killTarget>, signal: NodeJS.Signals) => {
         const termination = signalCodexChild(target, signal)
           .then((sent) => { if (sent) monitorTerminationSignal = signal; })
           .catch(() => onLog("stderr", "[paperclip] failed to terminate codex process tree\n"))
@@ -874,7 +876,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 const timeoutSecLabel = Math.round(monitorResolution.timeoutMs / 1000);
                 const terminationDescription = executionTargetIsSandbox
                   ? "host signal suppressed for remote sandbox; remote runner timeout/cancellation owns termination"
-                  : "terminating codex child via SIGTERM (5s grace, then SIGKILL)";
+                  : process.platform === "win32"
+                    ? "requesting tree termination with original Windows child ownership"
+                    : "terminating codex child via SIGTERM (5s grace, then SIGKILL)";
                 const logLine =
                   `[paperclip] adapter.invoke ${message}; ` +
                   `timeoutMs=${monitorResolution.timeoutMs} elapsedSinceLastEventMs=${monitorElapsedMs} ` +
@@ -898,7 +902,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             });
 
       const wrappedOnSpawn = async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => {
-        killTarget = resolveCodexHostKillTarget(meta, executionTargetIsSandbox);
+        const target = resolveCodexHostKillTarget(meta, executionTargetIsSandbox);
+        killTarget = target ? { ...target, child: runningProcesses.get(runId)?.child } : null;
         if (onSpawn) {
           await onSpawn(meta);
         }

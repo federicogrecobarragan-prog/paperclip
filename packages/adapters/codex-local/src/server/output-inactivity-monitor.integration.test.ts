@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
+import type { ChildProcess } from "node:child_process";
+import { runChildProcess, runningProcesses } from "@paperclipai/adapter-utils/server-utils";
 import {
   createCodexOutputInactivityMonitor,
   formatOutputInactivityMonitorErrorMessage,
@@ -72,7 +73,7 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
       // default while avoiding a pre-first-event race on slower hosts.
       const timeoutMs = 2_000;
       const logs: Array<{ stream: string; chunk: string }> = [];
-      let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
+      let killTarget: { pid: number | null; processGroupId: number | null; child?: ChildProcess } | null = null;
       let monitorFired = false;
       let terminationSignal: NodeJS.Signals | null = null;
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
@@ -106,7 +107,7 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
           timeoutSec: 30,
           graceSec: 1,
           onSpawn: async (meta) => {
-            killTarget = { pid: meta.pid, processGroupId: meta.processGroupId };
+            killTarget = { pid: meta.pid, processGroupId: meta.processGroupId, child: runningProcesses.get(runId)?.child };
           },
           onLog: async (stream, chunk) => {
             logs.push({ stream, chunk });
