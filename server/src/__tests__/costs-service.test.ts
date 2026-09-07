@@ -415,7 +415,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     db = createDb(tempDb.connectionString);
     costs = costService(db);
     finance = financeService(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(financeEvents);
@@ -429,6 +429,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
   });
 
   afterAll(async () => {
+    await db?.$client.end({ timeout: 0 });
     await tempDb?.cleanup();
   });
 

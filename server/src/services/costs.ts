@@ -11,6 +11,7 @@ export interface CostDateRange {
 }
 
 export interface CostEventCreateOptions {
+  /** Enclosing transaction owners pass false and enforce budgets after commit. */
   evaluateBudgets?: boolean;
 }
 
@@ -60,49 +61,58 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       data: Omit<typeof costEvents.$inferInsert, "companyId">,
       options: CostEventCreateOptions = {},
     ) => {
-      const agent = await db
-        .select()
-        .from(agents)
-        .where(eq(agents.id, data.agentId))
-        .then((rows) => rows[0] ?? null);
+      const event = await db.transaction(async (transaction) => {
+        const tx = transaction as unknown as Db;
+        // All ledger writers share this lock, including manual cost reports and
+        // heartbeat accounting. A savepoint keeps this valid inside the latter's
+        // larger transaction without publishing budget hooks before commit.
+        await tx.select({ id: companies.id }).from(companies)
+          .where(eq(companies.id, companyId)).for("no key update");
+        const agent = await tx
+          .select()
+          .from(agents)
+          .where(eq(agents.id, data.agentId))
+          .then((rows) => rows[0] ?? null);
 
-      if (!agent) throw notFound("Agent not found");
-      if (agent.companyId !== companyId) {
-        throw unprocessable("Agent does not belong to company");
-      }
+        if (!agent) throw notFound("Agent not found");
+        if (agent.companyId !== companyId) {
+          throw unprocessable("Agent does not belong to company");
+        }
 
-      const event = await db
-        .insert(costEvents)
-        .values({
-          ...data,
-          companyId,
-          biller: data.biller ?? data.provider,
-          billingType: data.billingType ?? "unknown",
-          cachedInputTokens: data.cachedInputTokens ?? 0,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+        const event = await tx
+          .insert(costEvents)
+          .values({
+            ...data,
+            companyId,
+            biller: data.biller ?? data.provider,
+            billingType: data.billingType ?? "unknown",
+            cachedInputTokens: data.cachedInputTokens ?? 0,
+          })
+          .returning()
+          .then((rows) => rows[0]);
 
-      const [agentMonthSpend, companyMonthSpend] = await Promise.all([
-        getMonthlySpendTotal(db, { companyId, agentId: event.agentId }),
-        getMonthlySpendTotal(db, { companyId }),
-      ]);
+        const [agentMonthSpend, companyMonthSpend] = await Promise.all([
+          getMonthlySpendTotal(tx, { companyId, agentId: event.agentId }),
+          getMonthlySpendTotal(tx, { companyId }),
+        ]);
 
-      await db
-        .update(agents)
-        .set({
-          spentMonthlyCents: agentMonthSpend,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, event.agentId));
+        await tx
+          .update(agents)
+          .set({
+            spentMonthlyCents: agentMonthSpend,
+            updatedAt: new Date(),
+          })
+          .where(eq(agents.id, event.agentId));
 
-      await db
-        .update(companies)
-        .set({
-          spentMonthlyCents: companyMonthSpend,
-          updatedAt: new Date(),
-        })
-        .where(eq(companies.id, companyId));
+        await tx
+          .update(companies)
+          .set({
+            spentMonthlyCents: companyMonthSpend,
+            updatedAt: new Date(),
+          })
+          .where(eq(companies.id, companyId));
+        return event;
+      });
 
       if (options.evaluateBudgets !== false) {
         await budgets.evaluateCostEvent(event);

@@ -25,6 +25,7 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -398,65 +399,97 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     amountObserved: number,
   ) {
     const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
-    const existing = await db
-      .select()
-      .from(budgetIncidents)
-      .where(
-        and(
-          eq(budgetIncidents.policyId, policy.id),
-          eq(budgetIncidents.windowStart, start),
-          eq(budgetIncidents.thresholdType, thresholdType),
-          ne(budgetIncidents.status, "dismissed"),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-    if (existing) return { incident: existing, created: false };
+    let publishThresholdActivity: (() => void) | undefined;
+    const result = await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      // Serialize one policy/window before creating its approval, incident, and
+      // audit record. Concurrent evaluations must never leave orphan approvals.
+      await tx.select({ id: budgetPolicies.id }).from(budgetPolicies)
+        .where(and(eq(budgetPolicies.id, policy.id), eq(budgetPolicies.companyId, policy.companyId)))
+        .for("no key update");
+      const existing = await tx
+        .select()
+        .from(budgetIncidents)
+        .where(
+          and(
+            eq(budgetIncidents.policyId, policy.id),
+            eq(budgetIncidents.windowStart, start),
+            eq(budgetIncidents.thresholdType, thresholdType),
+            ne(budgetIncidents.status, "dismissed"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (existing) return { incident: existing, created: false };
 
-    const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
-    const payload = buildApprovalPayload({
-      policy,
-      scopeName: normalizeScopeName(policy.scopeType as BudgetScopeType, scope.name),
-      thresholdType,
-      amountObserved,
-      windowStart: start,
-      windowEnd: end,
-    });
-
-    const approval = thresholdType === "hard"
-      ? await db
-        .insert(approvals)
-        .values({
-          companyId: policy.companyId,
-          type: "budget_override_required",
-          requestedByUserId: null,
-          requestedByAgentId: null,
-          status: "pending",
-          payload,
-        })
-        .returning()
-        .then((rows) => rows[0] ?? null)
-      : null;
-
-    const incident = await db
-      .insert(budgetIncidents)
-      .values({
-        companyId: policy.companyId,
-        policyId: policy.id,
-        scopeType: policy.scopeType,
-        scopeId: policy.scopeId,
-        metric: policy.metric,
-        windowKind: policy.windowKind,
+      const scope = await resolveScopeRecord(tx, policy.scopeType as BudgetScopeType, policy.scopeId);
+      const payload = buildApprovalPayload({
+        policy,
+        scopeName: normalizeScopeName(policy.scopeType as BudgetScopeType, scope.name),
+        thresholdType,
+        amountObserved,
         windowStart: start,
         windowEnd: end,
-        thresholdType,
-        amountLimit: policy.amount,
-        amountObserved,
-        status: "open",
-        approvalId: approval?.id ?? null,
-      })
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    return { incident, created: Boolean(incident) };
+      });
+
+      const approval = thresholdType === "hard"
+        ? await tx
+          .insert(approvals)
+          .values({
+            companyId: policy.companyId,
+            type: "budget_override_required",
+            requestedByUserId: null,
+            requestedByAgentId: null,
+            status: "pending",
+            payload,
+          })
+          .returning()
+          .then((rows) => rows[0] ?? null)
+        : null;
+
+      const incident = await tx
+        .insert(budgetIncidents)
+        .values({
+          companyId: policy.companyId,
+          policyId: policy.id,
+          scopeType: policy.scopeType,
+          scopeId: policy.scopeId,
+          metric: policy.metric,
+          windowKind: policy.windowKind,
+          windowStart: start,
+          windowEnd: end,
+          thresholdType,
+          amountLimit: policy.amount,
+          amountObserved,
+          status: "open",
+          approvalId: approval?.id ?? null,
+        })
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (incident) {
+        await logActivity(tx, {
+          companyId: policy.companyId,
+          actorType: "system",
+          actorId: "budget_service",
+          action: `budget.${thresholdType}_threshold_crossed`,
+          entityType: "budget_incident",
+          entityId: incident.id,
+          details: {
+            scopeType: policy.scopeType,
+            scopeId: policy.scopeId,
+            amountObserved,
+            amountLimit: policy.amount,
+            ...(thresholdType === "hard" ? { approvalId: incident.approvalId ?? null } : {}),
+          },
+        }, { deferPublish: (publish) => { publishThresholdActivity = publish; } });
+      }
+      return { incident, created: Boolean(incident) };
+    });
+    try {
+      publishThresholdActivity?.();
+    } catch {
+      logger.warn({ policyId: policy.id }, "budget activity publication failed after commit");
+    }
+    return result;
   }
 
   async function resolveOpenSoftIncidents(policyId: string) {
@@ -716,46 +749,13 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         const softThreshold = Math.ceil((policy.amount * policy.warnPercent) / 100);
 
         if (policy.notifyEnabled && observedAmount >= softThreshold) {
-          const softIncident = await createIncidentIfNeeded(policy, "soft", observedAmount);
-          if (softIncident.created && softIncident.incident) {
-            await logActivity(db, {
-              companyId: policy.companyId,
-              actorType: "system",
-              actorId: "budget_service",
-              action: "budget.soft_threshold_crossed",
-              entityType: "budget_incident",
-              entityId: softIncident.incident.id,
-              details: {
-                scopeType: policy.scopeType,
-                scopeId: policy.scopeId,
-                amountObserved: observedAmount,
-                amountLimit: policy.amount,
-              },
-            });
-          }
+          await createIncidentIfNeeded(policy, "soft", observedAmount);
         }
 
         if (policy.hardStopEnabled && observedAmount >= policy.amount) {
           await resolveOpenSoftIncidents(policy.id);
-          const hardIncident = await createIncidentIfNeeded(policy, "hard", observedAmount);
+          await createIncidentIfNeeded(policy, "hard", observedAmount);
           await pauseAndCancelScopeForBudget(policy);
-          if (hardIncident.created && hardIncident.incident) {
-            await logActivity(db, {
-              companyId: policy.companyId,
-              actorType: "system",
-              actorId: "budget_service",
-              action: "budget.hard_threshold_crossed",
-              entityType: "budget_incident",
-              entityId: hardIncident.incident.id,
-              details: {
-                scopeType: policy.scopeType,
-                scopeId: policy.scopeId,
-                amountObserved: observedAmount,
-                amountLimit: policy.amount,
-                approvalId: hardIncident.incident.approvalId ?? null,
-              },
-            });
-          }
         }
       }
     },

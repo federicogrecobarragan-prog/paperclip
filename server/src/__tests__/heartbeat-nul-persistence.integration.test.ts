@@ -44,6 +44,7 @@ import {
 } from "../services/heartbeat.ts";
 import { logger } from "../middleware/logger.ts";
 import { workspaceOperationService } from "../services/workspace-operations.ts";
+import { costService } from "../services/costs.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -153,15 +154,21 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
   afterEach(async () => {
     releaseBlockedFollowUps?.();
     releaseBlockedFollowUps = null;
-    await waitForHeartbeatQuiescence(db);
-    vi.clearAllMocks();
-    vi.restoreAllMocks();
+    try {
+      await waitForHeartbeatQuiescence(db);
+    } finally {
+      vi.clearAllMocks();
+      vi.restoreAllMocks();
+    }
   });
 
   afterAll(async () => {
-    if (tempDb) await waitForHeartbeatQuiescence(db);
-    await db?.$client.end({ timeout: 0 });
-    await tempDb?.cleanup();
+    try {
+      if (tempDb) await waitForHeartbeatQuiescence(db);
+    } finally {
+      await db?.$client.end({ timeout: 0 });
+      await tempDb?.cleanup();
+    }
   });
 
   async function seedAgent() {
@@ -780,6 +787,83 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
       expect(agent?.spentMonthlyCents).toBe(123);
       expect(company?.spentMonthlyCents).toBe(123);
     }, 20_000);
+  }
+
+  for (const otherWriter of ["heartbeat", "manual cost report"] as const) {
+  it(`preserves company spend with a concurrent ${otherWriter}`, async () => {
+    const { companyId, agentId } = await seedAgent();
+    const secondAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: secondAgentId,
+      companyId,
+      name: "Concurrent accounting adapter",
+      role: "test",
+      status: "idle",
+      adapterType: "http",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    mockAdapterExecute.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "test",
+      model: "concurrent-cost-model",
+      billingType: "metered_api",
+      costUsd: 1.23,
+      usage: { inputTokens: 101, outputTokens: 29 },
+    });
+    let firstCostReady!: () => void;
+    const firstCostReached = new Promise<void>((resolve) => { firstCostReady = resolve; });
+    let secondRuntimeReady!: () => void;
+    const secondRuntimeReached = new Promise<void>((resolve) => { secondRuntimeReady = resolve; });
+    releaseBlockedFollowUps = secondRuntimeReady;
+    let firstRunId: string | null = null;
+    const heartbeat = heartbeatService(db, {
+      runtimeAccountingFaultInjector: async ({ runId, phase }) => {
+        if (phase === "before_transaction" && firstRunId === null) firstRunId = runId;
+        if (phase === "after_runtime_state" && runId !== firstRunId) secondRuntimeReady();
+        if (phase === "after_cost_event" && runId === firstRunId) {
+          firstCostReady();
+          await secondRuntimeReached;
+          // Give the second transaction time to contend with the first one's
+          // uncommitted ledger row and company rollup.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      },
+    });
+    const firstRun = await heartbeat.wakeup(agentId, {
+      source: "on_demand", triggerDetail: "system", reason: "concurrent_accounting",
+    });
+    await firstCostReached;
+    expect(firstRun).toBeTruthy();
+    if (otherWriter === "heartbeat") {
+      const secondRun = await heartbeat.wakeup(secondAgentId, {
+        source: "on_demand", triggerDetail: "system", reason: "concurrent_accounting",
+      });
+      expect(secondRun).toBeTruthy();
+    } else {
+      secondRuntimeReady();
+      await costService(db).createEvent(companyId, {
+        agentId: secondAgentId,
+        provider: "test",
+        model: "manual-cost-model",
+        billingType: "metered_api",
+        costCents: 123,
+        occurredAt: new Date(),
+      });
+    }
+    expect(await waitForCondition(async () => {
+      const rows = await db.select().from(agents).where(inArray(agents.id, [agentId, secondAgentId]));
+      return rows.length === 2 && rows.every((agent) => agent.status === "idle");
+    }, 10_000)).toBe(true);
+    const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
+    const events = await db.select().from(costEvents).where(eq(costEvents.companyId, companyId));
+    expect(events).toHaveLength(2);
+    expect(company.spentMonthlyCents).toBe(246);
+    expect(events.reduce((sum, event) => sum + event.costCents, 0)).toBe(246);
+  }, 20_000);
   }
 
   it("continues post-terminal finalization when publishPluginDomainEvent throws", async () => {

@@ -406,7 +406,10 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
       password: "paperclip",
       port,
       persistent: true,
-      initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+      // This cluster is disposable and has no pre-existing data to protect.
+      // Avoid the expensive initial fsync on Windows; normal server durability
+      // settings still apply once PostgreSQL starts.
+      initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C", "--no-sync"],
       onLog: () => {},
       onError: () => {},
     });
