@@ -5,30 +5,49 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const pendingTerminations = new Map<number, Promise<boolean>>();
 
-async function snapshotTreePids(systemRoot: string, rootPid: number): Promise<number[]> {
+type ProcessIdentity = { pid: number; parentPid: number; createdAt: bigint };
+
+async function snapshotTree(systemRoot: string, rootPid: number): Promise<ProcessIdentity[]> {
   const { stdout } = await execFileAsync(path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
     ["-NoProfile", "-NonInteractive", "-Command",
-      "@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId -ErrorAction Stop | Select-Object ProcessId,ParentProcessId) | ConvertTo-Json -Compress"],
+      "@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,@{Name='CreatedTicks';Expression={if ($_.CreationDate) {$_.CreationDate.ToUniversalTime().Ticks.ToString()}}}) | ConvertTo-Json -Compress"],
     { windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
   const rows: unknown = JSON.parse(stdout);
   if (!Array.isArray(rows)) throw new Error("Invalid Windows process-tree snapshot");
-  const children = new Map<number, number[]>();
+  const children = new Map<number, ProcessIdentity[]>();
+  let root: ProcessIdentity | undefined;
   for (const row of rows) {
     if (!row || typeof row !== "object") throw new Error("Invalid Windows process-tree entry");
-    const { ProcessId: pid, ParentProcessId: parentPid } = row;
+    const { ProcessId: pid, ParentProcessId: parentPid, CreatedTicks: createdTicks } = row;
     if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(parentPid)) {
       throw new Error("Invalid Windows process-tree identity");
     }
+    // Windows' idle/system entries may not expose a creation time. They are
+    // never eligible run descendants; fail closed if one is linked to this tree.
+    const createdAt = typeof createdTicks === "string" && /^\d+$/.test(createdTicks)
+      ? BigInt(createdTicks) : 0n;
+    const entry = { pid, parentPid, createdAt };
+    if (pid === rootPid) root = entry;
     const siblings = children.get(parentPid) ?? [];
-    siblings.push(pid);
+    siblings.push(entry);
     children.set(parentPid, siblings);
   }
-  const owned = new Set([rootPid]);
-  for (const pid of owned) {
-    for (const child of children.get(pid) ?? []) if (child > 0) owned.add(child);
+  if (!root || root.createdAt <= 0n) throw new Error("Windows process-tree root identity is unavailable");
+  const owned = new Map([[root.pid, root]]);
+  for (const parent of owned.values()) {
+    for (const child of children.get(parent.pid) ?? []) {
+      if (child.pid <= 0) continue;
+      // PPID alone can link an older orphan to a recycled parent PID. taskkill
+      // walks its own tree, so refusing ambiguity is safer than merely omitting
+      // that orphan from our verification snapshot and still using /T.
+      if (child.createdAt <= 0n || child.createdAt < parent.createdAt || owned.has(child.pid)) {
+        throw new Error("Refusing ambiguous Windows process-tree ownership");
+      }
+      owned.set(child.pid, child);
+    }
   }
   if (owned.has(process.pid)) throw new Error("Refusing to terminate the current process ancestor");
-  return [...owned];
+  return [...owned.values()];
 }
 
 function isPidAlive(pid: number) {
@@ -61,7 +80,17 @@ export function terminateWindowsProcessTree(pid: number): Promise<boolean> {
     if (!systemRoot || !path.isAbsolute(systemRoot)) {
       throw new Error("Cannot resolve Windows system directory for process-tree termination");
     }
-    const ownedPids = await snapshotTreePids(systemRoot, pid);
+    const observed = await snapshotTree(systemRoot, pid);
+    const current = await snapshotTree(systemRoot, pid);
+    if (current[0]!.createdAt !== observed[0]!.createdAt) {
+      throw new Error("Windows process-tree root identity changed before termination");
+    }
+    const currentByPid = new Map(current.map((entry) => [entry.pid, entry]));
+    if (observed.some((entry) => currentByPid.has(entry.pid)
+      && currentByPid.get(entry.pid)!.createdAt !== entry.createdAt)) {
+      throw new Error("Windows process-tree descendant identity changed before termination");
+    }
+    const ownedPids = [...new Set([...observed, ...current].map((entry) => entry.pid))];
     try {
       await execFileAsync(path.join(systemRoot, "System32", "taskkill.exe"),
         ["/PID", String(pid), "/T", "/F"],

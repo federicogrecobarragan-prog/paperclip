@@ -69,7 +69,9 @@ async function signalRunningProcess(
   signal: NodeJS.Signals,
 ) {
   if (process.platform === "win32") {
-    if (running.child.pid) await terminateWindowsProcessTree(running.child.pid);
+    if (running.child.pid && running.child.exitCode === null && running.child.signalCode === null) {
+      await terminateWindowsProcessTree(running.child.pid);
+    }
     return;
   }
   if (running.processGroupId && running.processGroupId > 0) {
@@ -2927,6 +2929,7 @@ export async function runChildProcess(
         let logChain: Promise<void> = Promise.resolve();
         let terminationChain: Promise<void> = Promise.resolve();
         const signalChild = (signal: NodeJS.Signals) => {
+          if (settled) return;
           const termination = signalRunningProcess({ child, processGroupId }, signal)
             .catch((err) => onLogError(err, runId, "failed to terminate child process tree"));
           terminationChain = Promise.all([terminationChain, termination]).then(() => undefined);
@@ -2936,6 +2939,7 @@ export async function runChildProcess(
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
         let postExitCloseTimer: NodeJS.Timeout | null = null;
+        let timeoutKillTimer: NodeJS.Timeout | null = null;
         let settled = false;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
@@ -2956,6 +2960,8 @@ export async function runChildProcess(
           if (settled) return;
           settled = true;
           if (timeout) clearTimeout(timeout);
+          if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
+          timeoutKillTimer = null;
           clearTerminalCleanupTimers();
           clearPostExitCloseTimer();
           void Promise.all([logChain, terminationChain]).finally(() => {
@@ -3017,7 +3023,8 @@ export async function runChildProcess(
                 timedOut = true;
                 clearTerminalCleanupTimers();
                 signalChild("SIGTERM");
-                setTimeout(() => {
+                timeoutKillTimer = setTimeout(() => {
+                  timeoutKillTimer = null;
                   signalChild("SIGKILL");
                 }, Math.max(1, opts.graceSec) * 1000);
               }, opts.timeoutSec * 1000)
@@ -3068,6 +3075,8 @@ export async function runChildProcess(
           if (settled) return;
           settled = true;
           if (timeout) clearTimeout(timeout);
+          if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
+          timeoutKillTimer = null;
           clearTerminalCleanupTimers();
           clearPostExitCloseTimer();
           runningProcesses.delete(runId);

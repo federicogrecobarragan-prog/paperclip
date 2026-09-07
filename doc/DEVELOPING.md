@@ -281,8 +281,10 @@ On Windows, Board cancellation, local process timeouts, and the Codex inactivity
 monitor terminate the owned process tree with the system `taskkill /PID /T /F`
 command. This is immediate because Windows does not provide POSIX process-group
 signals. Killing only a CLI wrapper can leave its agent binary running, so the
-tree operation must finish before cancellation releases the run. Tool failures
-are reported instead of falling back to a wrapper-only kill. An already orphaned
+tree operation must finish before cancellation releases the run. Two bounded
+PID/parent/birth-time snapshots reject recycled process identities and ambiguous
+older-orphan parent links before invoking taskkill. Tool failures are reported
+instead of falling back to a wrapper-only kill. An already orphaned
 process from an older server needs identity-verified operator cleanup; restarting
 the server alone does not stop orphaned descendants.
 

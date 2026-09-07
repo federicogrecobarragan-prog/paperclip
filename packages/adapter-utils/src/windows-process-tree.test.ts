@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runChildProcess, runningProcesses } from "./server-utils.js";
 import { terminateWindowsProcessTree } from "./windows-process-tree.js";
 
@@ -66,4 +66,30 @@ describe("Windows process tree termination", () => {
       for (const pid of pidsIn(output)) if (isAlive(pid)) await terminateWindowsProcessTree(pid);
     }
   }, 15_000);
+
+  it.runIf(process.platform === "win32")("clears the force-kill timer when timeout termination finishes", async () => {
+    const setTimer = vi.spyOn(globalThis, "setTimeout");
+    const clearTimer = vi.spyOn(globalThis, "clearTimeout");
+    try {
+      const result = await runChildProcess(`windows-tree-timer-${Date.now()}`, process.execPath,
+        ["-e", "setTimeout(()=>{},30000)"], {
+          cwd: process.cwd(), env: process.env as Record<string, string>,
+          timeoutSec: 1, graceSec: 20, onLog: async () => {},
+        });
+      expect(result.timedOut).toBe(true);
+      const timerIndex = setTimer.mock.calls.findIndex((call) => call[1] === 20_000);
+      expect(timerIndex).toBeGreaterThanOrEqual(0);
+      const timer = setTimer.mock.results[timerIndex]!.value;
+      expect(clearTimer).toHaveBeenCalledWith(timer);
+      // Invoking a callback already queued at the close boundary is also inert.
+      const killSpy = vi.spyOn(process, "kill");
+      try {
+        (setTimer.mock.calls[timerIndex]![0] as () => void)();
+        expect(killSpy).not.toHaveBeenCalled();
+      } finally { killSpy.mockRestore(); }
+    } finally {
+      setTimer.mockRestore();
+      clearTimer.mockRestore();
+    }
+  }, 20_000);
 });
