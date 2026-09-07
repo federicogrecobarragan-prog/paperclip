@@ -4793,6 +4793,13 @@ export type HeartbeatPostTerminalStep =
   | "task_session"
   | "agent_status";
 
+export type HeartbeatRuntimeAccountingFaultPhase =
+  | "before_transaction"
+  | "after_runtime_state"
+  | "after_cost_event"
+  | "after_commit"
+  | "after_budget_evaluation";
+
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
@@ -4801,6 +4808,11 @@ export interface HeartbeatServiceOptions {
     runId: string;
     step: HeartbeatPostTerminalStep;
     attempt: number;
+  }) => void | Promise<void>;
+  /** @internal Deterministic fault injection around the runtime accounting transaction. */
+  runtimeAccountingFaultInjector?: (input: {
+    runId: string;
+    phase: HeartbeatRuntimeAccountingFaultPhase;
   }) => void | Promise<void>;
 }
 
@@ -9823,38 +9835,116 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const biller = resolveLedgerBiller(result);
     const ledgerScope = await resolveLedgerScopeForRun(db, agent.companyId, run);
 
-    await db
-      .update(agentRuntimeState)
-      .set({
-        adapterType: agent.adapterType,
-        sessionId: session.legacySessionId,
-        lastRunId: run.id,
-        lastRunStatus: run.status,
-        lastError: result.errorMessage ?? null,
-        totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
-        totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
-        totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
-        totalCostCents: sql`${agentRuntimeState.totalCostCents} + ${additionalCostCents}`,
-        updatedAt: new Date(),
-      })
-      .where(eq(agentRuntimeState.agentId, agent.id));
+    await options.runtimeAccountingFaultInjector?.({
+      runId: run.id,
+      phase: "before_transaction",
+    });
+    const accounting = await db.transaction(async (tx) => {
+      const accountedAt = new Date();
+      const claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          runtimeAccountedAt: accountedAt,
+          updatedAt: accountedAt,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          isNull(heartbeatRuns.runtimeAccountedAt),
+        ))
+        .returning({ id: heartbeatRuns.id })
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) {
+        return {
+          applied: false as const,
+          costEvent: null as typeof costEvents.$inferSelect | null,
+        };
+      }
 
-    if (additionalCostCents > 0 || hasTokenUsage) {
-      const costs = costService(db, budgetHooks);
-      await costs.createEvent(agent.companyId, {
-        heartbeatRunId: run.id,
-        agentId: agent.id,
-        issueId: ledgerScope.issueId,
-        projectId: ledgerScope.projectId,
-        provider,
-        biller,
-        billingType,
-        model: result.model ?? "unknown",
-        inputTokens,
-        cachedInputTokens,
-        outputTokens,
-        costCents: additionalCostCents,
-        occurredAt: new Date(),
+      const runtimeUpdated = await tx
+        .update(agentRuntimeState)
+        .set({
+          adapterType: agent.adapterType,
+          sessionId: session.legacySessionId,
+          lastRunId: run.id,
+          lastRunStatus: run.status,
+          lastError: result.errorMessage ?? null,
+          totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
+          totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
+          totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
+          totalCostCents: sql`${agentRuntimeState.totalCostCents} + ${additionalCostCents}`,
+          updatedAt: accountedAt,
+        })
+        .where(eq(agentRuntimeState.agentId, agent.id))
+        .returning({ agentId: agentRuntimeState.agentId })
+        .then((rows) => rows[0] ?? null);
+      if (!runtimeUpdated) {
+        throw new Error(`Runtime state disappeared while accounting run ${run.id}`);
+      }
+
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_runtime_state",
+      });
+
+      let costEvent: typeof costEvents.$inferSelect | null = null;
+      if (additionalCostCents > 0 || hasTokenUsage) {
+        // Keep database accounting atomic, but defer budget evaluation and its
+        // process-cancellation hooks until after commit so an aborted
+        // transaction cannot leak an irreversible side effect.
+        const costs = costService(tx as unknown as Db);
+        costEvent = await costs.createEvent(agent.companyId, {
+          heartbeatRunId: run.id,
+          agentId: agent.id,
+          issueId: ledgerScope.issueId,
+          projectId: ledgerScope.projectId,
+          provider,
+          biller,
+          billingType,
+          model: result.model ?? "unknown",
+          inputTokens,
+          cachedInputTokens,
+          outputTokens,
+          costCents: additionalCostCents,
+          occurredAt: accountedAt,
+        }, { evaluateBudgets: false });
+      }
+
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_cost_event",
+      });
+      return { applied: true as const, costEvent };
+    });
+
+    if (accounting.applied) {
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_commit",
+      });
+    }
+
+    // A retry after an ambiguous post-commit failure no longer owns the claim,
+    // so reload its event and finish the recoverable budget-enforcement phase.
+    // evaluateCostEvent is idempotent for persisted incidents/logs, while its
+    // cancellation hook safely converges already-cancelled work.
+    const persistedCostEvent = accounting.costEvent ?? (
+      additionalCostCents > 0 || hasTokenUsage
+        ? await db
+          .select()
+          .from(costEvents)
+          .where(and(
+            eq(costEvents.companyId, agent.companyId),
+            eq(costEvents.heartbeatRunId, run.id),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+        : null
+    );
+    if (persistedCostEvent) {
+      await budgets.evaluateCostEvent(persistedCostEvent);
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_budget_evaluation",
       });
     }
   }
@@ -11832,7 +11922,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const terminalSideEffectProgress = {
         wakeup: false,
         issueExecution: false,
-        runtimeAttempted: false,
+        runtimeState: false,
         taskSession: taskKey == null,
         agentStatus: false,
       };
@@ -11859,16 +11949,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         terminalSideEffectProgress.issueExecution = true;
       };
       const finalizeTerminalRuntimeState = async () => {
-        if (terminalSideEffectProgress.runtimeAttempted) return;
+        if (terminalSideEffectProgress.runtimeState) return;
         const terminalRun = await loadTerminalRunForSideEffects();
         if (!terminalRun) return;
-        // updateRuntimeState can increment accounting totals. Mark it attempted
-        // immediately before entry so recovery never double-applies a partial
-        // write; failures in the injected pre-call seam remain retryable.
-        terminalSideEffectProgress.runtimeAttempted = true;
         await updateRuntimeState(agent, terminalRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
+        terminalSideEffectProgress.runtimeState = true;
       };
       const finalizeTerminalTaskSession = async () => {
         if (terminalSideEffectProgress.taskSession || !taskKey) return;
@@ -11925,7 +12012,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             attempts: 2,
           });
         }
-        if (!terminalSideEffectProgress.runtimeAttempted) {
+        if (!terminalSideEffectProgress.runtimeState) {
           await settlePostTerminalStep({
             runId: run.id,
             step: "runtime_state",

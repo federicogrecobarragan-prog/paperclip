@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -33,7 +36,12 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-import { heartbeatService, type HeartbeatPostTerminalStep } from "../services/heartbeat.ts";
+import * as activityLogService from "../services/activity-log.ts";
+import {
+  heartbeatService,
+  type HeartbeatPostTerminalStep,
+  type HeartbeatRuntimeAccountingFaultPhase,
+} from "../services/heartbeat.ts";
 import { logger } from "../middleware/logger.ts";
 import { workspaceOperationService } from "../services/workspace-operations.ts";
 
@@ -571,6 +579,236 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(operation.stdoutExcerpt).toContain("raw stdout omitted");
     expect(operation.stderrExcerpt).toContain("raw stderr omitted");
   });
+
+  for (const faultPhase of [
+    "before_transaction",
+    "after_runtime_state",
+    "after_cost_event",
+    "after_commit",
+    "after_budget_evaluation",
+  ] as const satisfies readonly HeartbeatRuntimeAccountingFaultPhase[]) {
+    it(`charges runtime accounting exactly once after a ${faultPhase} failure`, async () => {
+      const { companyId, agentId } = await seedAgent();
+      await db.insert(budgetPolicies).values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 200,
+        warnPercent: 50,
+        hardStopEnabled: false,
+        notifyEnabled: true,
+        isActive: true,
+      });
+      let adapterStarted!: () => void;
+      const adapterStartedPromise = new Promise<void>((resolve) => {
+        adapterStarted = resolve;
+      });
+      let finishAdapter!: () => void;
+      const adapterCanFinish = new Promise<void>((resolve) => {
+        finishAdapter = resolve;
+      });
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        adapterStarted();
+        await adapterCanFinish;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          summary: "accounted once",
+          provider: "test",
+          biller: "test-biller",
+          model: "test-model",
+          billingType: "metered_api",
+          costUsd: 1.23,
+          usage: {
+            inputTokens: 101,
+            cachedInputTokens: 7,
+            outputTokens: 29,
+          },
+        };
+      });
+
+      let faultRunId: string | null = null;
+      let injected = false;
+      let thresholdLogsAtAfterCommit: number | null = null;
+      const heartbeat = heartbeatService(db, {
+        runtimeAccountingFaultInjector: async ({ runId, phase }) => {
+          if (runId !== faultRunId || phase !== faultPhase || injected) return;
+          if (phase === "after_commit") {
+            thresholdLogsAtAfterCommit = await db
+              .select({ id: activityLog.id })
+              .from(activityLog)
+              .where(and(
+                eq(activityLog.companyId, companyId),
+                eq(activityLog.action, "budget.soft_threshold_crossed"),
+              ))
+              .then((rows) => rows.length);
+          }
+          injected = true;
+          throw new Error(`simulated runtime accounting ${phase} failure`);
+        },
+      });
+      const queued = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "system",
+        reason: `runtime_accounting_${faultPhase}`,
+      });
+      expect(queued).toBeTruthy();
+      faultRunId = queued!.id;
+      await adapterStartedPromise;
+      finishAdapter();
+
+      const terminal = await waitForTerminalRun(heartbeat, queued!.id, 10_000);
+      const accountingSettled = await waitForCondition(async () => {
+        const [run, runtimeState, event, thresholdLog, currentAgent] = await Promise.all([
+          db
+            .select({ runtimeAccountedAt: heartbeatRuns.runtimeAccountedAt })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, queued!.id))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ lastRunId: agentRuntimeState.lastRunId })
+            .from(agentRuntimeState)
+            .where(eq(agentRuntimeState.agentId, agentId))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ id: costEvents.id })
+            .from(costEvents)
+            .where(eq(costEvents.heartbeatRunId, queued!.id))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ id: activityLog.id })
+            .from(activityLog)
+            .where(and(
+              eq(activityLog.companyId, companyId),
+              eq(activityLog.action, "budget.soft_threshold_crossed"),
+            ))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({ status: agents.status })
+            .from(agents)
+            .where(eq(agents.id, agentId))
+            .then((rows) => rows[0] ?? null),
+        ]);
+        return Boolean(run?.runtimeAccountedAt) &&
+          runtimeState?.lastRunId === queued!.id &&
+          Boolean(event) &&
+          Boolean(thresholdLog) &&
+          currentAgent?.status === "idle";
+      }, 10_000);
+      expect(accountingSettled).toBe(true);
+
+      const [run, runtimeState, agent, company, events, thresholdLogs] = await Promise.all([
+        db
+          .select({ runtimeAccountedAt: heartbeatRuns.runtimeAccountedAt })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, queued!.id))
+          .then((rows) => rows[0]),
+        db
+          .select()
+          .from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, agentId))
+          .then((rows) => rows[0]),
+        db
+          .select({ spentMonthlyCents: agents.spentMonthlyCents })
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .then((rows) => rows[0]),
+        db
+          .select({ spentMonthlyCents: companies.spentMonthlyCents })
+          .from(companies)
+          .where(eq(companies.id, companyId))
+          .then((rows) => rows[0]),
+        db
+          .select()
+          .from(costEvents)
+          .where(eq(costEvents.heartbeatRunId, queued!.id)),
+        db
+          .select()
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, "budget.soft_threshold_crossed"),
+          )),
+      ]);
+
+      expect(terminal?.status).toBe("succeeded");
+      expect(injected).toBe(true);
+      if (faultPhase === "after_commit") {
+        expect(thresholdLogsAtAfterCommit).toBe(0);
+      }
+      expect(run?.runtimeAccountedAt).toBeInstanceOf(Date);
+      expect(runtimeState).toMatchObject({
+        lastRunId: queued!.id,
+        totalInputTokens: 101,
+        totalCachedInputTokens: 7,
+        totalOutputTokens: 29,
+        totalCostCents: 123,
+      });
+      expect(events).toHaveLength(1);
+      expect(thresholdLogs).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        heartbeatRunId: queued!.id,
+        agentId,
+        provider: "test",
+        biller: "test-biller",
+        billingType: "metered_api",
+        model: "test-model",
+        inputTokens: 101,
+        cachedInputTokens: 7,
+        outputTokens: 29,
+        costCents: 123,
+      });
+      expect(agent?.spentMonthlyCents).toBe(123);
+      expect(company?.spentMonthlyCents).toBe(123);
+    }, 20_000);
+  }
+
+  it("continues post-terminal finalization when publishPluginDomainEvent throws", async () => {
+    const { agentId } = await seedAgent();
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      summary: "terminal persisted",
+      provider: "test",
+      model: "test-model",
+      sessionId: "publication-failure-session",
+    });
+    const publishSpy = vi
+      .spyOn(activityLogService, "publishPluginDomainEvent")
+      .mockImplementation((event) => {
+        if (event.eventType === "agent.run.finished") {
+          throw new Error("simulated post-commit publication failure");
+        }
+      });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      reason: "publication_failure",
+      contextSnapshot: {
+        taskKey: "publication-failure-task",
+      },
+    });
+    expect(queued).toBeTruthy();
+
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id, 10_000);
+    const postTerminalState = await waitForPostTerminalState(db, agentId, queued!.id, 10_000);
+    const [wakeup] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, queued!.id));
+
+    expect(terminal?.status).toBe("succeeded");
+    expect(wakeup?.status).toBe("completed");
+    expect(postTerminalState.runtimeState?.lastRunId).toBe(queued!.id);
+    expect(postTerminalState.sessions.some((session) => session.lastRunId === queued!.id)).toBe(true);
+    expect(publishSpy.mock.calls.some(([event]) => event.eventType === "agent.run.finished")).toBe(true);
+  }, 20_000);
 
   it("continues wake, lock promotion, dependency scheduling, runtime, and session finalization across injected step failures", async () => {
     const { companyId, agentId } = await seedAgent();

@@ -48,6 +48,7 @@ export const heartbeatRuns = pgTable(
     issueCommentStatus: text("issue_comment_status").notNull().default("not_applicable"),
     issueCommentSatisfiedByCommentId: uuid("issue_comment_satisfied_by_comment_id"),
     issueCommentRetryQueuedAt: timestamp("issue_comment_retry_queued_at", { withTimezone: true }),
+    runtimeAccountedAt: timestamp("runtime_accounted_at", { withTimezone: true }),
     livenessState: text("liveness_state"),
     livenessReason: text("liveness_reason"),
     continuationAttempt: integer("continuation_attempt").notNull().default(0),

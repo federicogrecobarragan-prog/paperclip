@@ -491,6 +491,35 @@ describe("heartbeat persistence safety", () => {
     });
   });
 
+  it("charges the string budget before ignorable padding is canonicalized away", () => {
+    const prefix = "token=synthetic-budget-secret";
+    const paddedSecret = prefix + "\u200B".repeat(
+      HEARTBEAT_PERSISTENCE_LIMITS.maxStringChars - prefix.length,
+    );
+    const chunkCount = Math.ceil(
+      HEARTBEAT_PERSISTENCE_LIMITS.maxTotalStringChars /
+        HEARTBEAT_PERSISTENCE_LIMITS.maxStringChars,
+    ) + 2;
+
+    const result = sanitizeHeartbeatPersistenceRecord({
+      chunks: Array.from({ length: chunkCount }, () => paddedSecret),
+    });
+    const chunks = result.chunks as string[];
+    const fullyInspectedCount = Math.floor(
+      HEARTBEAT_PERSISTENCE_LIMITS.maxTotalStringChars /
+        HEARTBEAT_PERSISTENCE_LIMITS.maxStringChars,
+    );
+
+    expect(chunks).toHaveLength(chunkCount);
+    expect(chunks.slice(0, fullyInspectedCount)).toEqual(
+      Array.from({ length: fullyInspectedCount }, () => "token=***REDACTED***"),
+    );
+    expect(chunks.slice(fullyInspectedCount)).toEqual(
+      Array.from({ length: chunkCount - fullyInspectedCount }, () => ""),
+    );
+    expect(JSON.stringify(result)).not.toContain("synthetic-budget-secret");
+  });
+
   it("sanitizes standalone text and omits non-JSON behavior", () => {
     expect(sanitizeHeartbeatPersistenceText("a\u0000b")).toBe("a\uFFFDb");
     expect(sanitizeHeartbeatPersistenceValue({ fn: () => "no", symbol: Symbol("no"), value: 1 }))

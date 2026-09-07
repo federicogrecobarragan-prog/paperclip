@@ -10,6 +10,10 @@ export interface CostDateRange {
   to?: Date;
 }
 
+export interface CostEventCreateOptions {
+  evaluateBudgets?: boolean;
+}
+
 const METERED_BILLING_TYPE = "metered_api";
 const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overage"] as const;
 
@@ -51,7 +55,11 @@ async function getMonthlySpendTotal(
 export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
   const budgets = budgetService(db, budgetHooks);
   return {
-    createEvent: async (companyId: string, data: Omit<typeof costEvents.$inferInsert, "companyId">) => {
+    createEvent: async (
+      companyId: string,
+      data: Omit<typeof costEvents.$inferInsert, "companyId">,
+      options: CostEventCreateOptions = {},
+    ) => {
       const agent = await db
         .select()
         .from(agents)
@@ -96,7 +104,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         })
         .where(eq(companies.id, companyId));
 
-      await budgets.evaluateCostEvent(event);
+      if (options.evaluateBudgets !== false) {
+        await budgets.evaluateCostEvent(event);
+      }
 
       return event;
     },
