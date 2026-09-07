@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -199,6 +199,7 @@ import {
   sanitizeHeartbeatPersistenceValue,
   sanitizeHeartbeatWakeupSkipReasonForPersistence,
 } from "./heartbeat-persistence-safety.js";
+import { createHeartbeatStreamRedactor } from "./heartbeat-stream-redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -4800,6 +4801,63 @@ export type HeartbeatRuntimeAccountingFaultPhase =
   | "after_commit"
   | "after_budget_evaluation";
 
+type TerminalFinalizationPayload = {
+  version: 1;
+  adapterType: string | null;
+  ledger: {
+    usage: UsageTotals | null;
+    costUsd: number | null;
+    provider: string;
+    biller: string;
+    billingType: BillingType;
+    model: string;
+  } | null;
+  session: {
+    generation: number;
+    taskGeneration: number;
+    legacySessionId: string | null;
+    taskKey: string | null;
+    mode: "upsert" | "clear" | "none";
+    params: Record<string, unknown> | null;
+    displayId: string | null;
+  } | null;
+  completed: Record<string, boolean>;
+};
+
+const heartbeatLogFlushers = new Map<string, () => Promise<void>>();
+
+function emptyTerminalFinalizationPayload(): TerminalFinalizationPayload {
+  // Absence of measured usage is not evidence of zero usage. Cancellation and
+  // setup failures still require durable ownership cleanup, but must not invent
+  // accounting entries for an adapter result that never reached this process.
+  return { version: 1, adapterType: null, ledger: null, session: null, completed: {} };
+}
+
+function buildTerminalFinalizationPayload(input: {
+  adapterType: string;
+  result: AdapterExecutionResult;
+  usage?: UsageTotals | null;
+  session: NonNullable<TerminalFinalizationPayload["session"]>;
+}): TerminalFinalizationPayload {
+  // Explicit projection: never retain adapter result/context/diagnostic objects
+  // or executable codec behavior in the recovery journal. Sanitize the final
+  // serialized session too, including values produced by adapter codecs.
+  return sanitizeHeartbeatPersistenceRecord({
+    version: 1,
+    adapterType: input.adapterType,
+    ledger: {
+      usage: input.usage ?? normalizeUsageTotals(input.result.usage),
+      costUsd: input.result.costUsd ?? null,
+      provider: input.result.provider ?? "unknown",
+      biller: resolveLedgerBiller(input.result),
+      billingType: normalizeLedgerBillingType(input.result.billingType),
+      model: input.result.model ?? "unknown",
+    },
+    session: input.session,
+    completed: {},
+  }) as TerminalFinalizationPayload;
+}
+
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
@@ -4814,6 +4872,11 @@ export interface HeartbeatServiceOptions {
     runId: string;
     phase: HeartbeatRuntimeAccountingFaultPhase;
   }) => void | Promise<void>;
+  /** @internal Simulates loss of the service instance, not a retriable step error. */
+  deferTerminalFinalization?: (input: {
+    runId: string;
+    phase: "after_terminal_commit" | "after_accounting_commit";
+  }) => boolean | Promise<boolean>;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -6450,12 +6513,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    opts?: { expectedStatuses?: readonly string[] },
   ) {
-    const sanitizedPatch = sanitizeHeartbeatRunPatch(patch);
+    const sanitizedPatch = sanitizeHeartbeatRunPatch(isHeartbeatRunTerminalStatus(status)
+      ? { ...patch, terminalFinalizationJson: patch?.terminalFinalizationJson ?? emptyTerminalFinalizationPayload() }
+      : patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, runId))
+      .set({ status, ...sanitizedPatch,
+        ...(isHeartbeatRunTerminalStatus(status) ? {
+          terminalFinalizationJson: sql`case when ${heartbeatRuns.status} in ('succeeded','failed','cancelled','timed_out')
+            then ${heartbeatRuns.terminalFinalizationJson}
+            else coalesce(${heartbeatRuns.terminalFinalizationJson}, ${JSON.stringify(sanitizedPatch?.terminalFinalizationJson)}::jsonb) end`,
+        } : {}), updatedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, runId),
+        ...(opts?.expectedStatuses ? [inArray(heartbeatRuns.status, [...opts.expectedStatuses])] : [])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -6470,10 +6542,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
     options: { publish?: boolean } = {},
   ) {
-    const sanitizedPatch = sanitizeHeartbeatRunPatch(patch);
+    const sanitizedPatch = sanitizeHeartbeatRunPatch(isHeartbeatRunTerminalStatus(status)
+      ? { ...patch, terminalFinalizationJson: patch?.terminalFinalizationJson ?? emptyTerminalFinalizationPayload() }
+      : patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch,
+        ...(isHeartbeatRunTerminalStatus(status) ? {
+          terminalFinalizationJson: sql`coalesce(${heartbeatRuns.terminalFinalizationJson}, ${JSON.stringify(sanitizedPatch?.terminalFinalizationJson)}::jsonb)`,
+        } : {}), updatedAt: new Date() })
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -6512,6 +6589,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? sanitizeHeartbeatPersistenceText(patch.error)
         : null;
       persisted = await setRunStatusIfRunning(runId, status, {
+        terminalFinalizationJson: patch.terminalFinalizationJson ?? emptyTerminalFinalizationPayload(),
         finishedAt: patch.finishedAt instanceof Date ? patch.finishedAt : new Date(),
         error: status === "succeeded" ? null : safeError,
         errorCode: typeof patch.errorCode === "string"
@@ -8954,16 +9032,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const claimedAt = new Date();
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimed = await db.transaction(async (tx) => {
+      await lockAgentTerminalState(tx as unknown as Db, run.agentId);
+      return tx.update(heartbeatRuns).set({
+        status: "running", startedAt: run.startedAt ?? claimedAt, updatedAt: claimedAt,
+      }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
+        sql`exists (select 1 from agents start_agent where start_agent.id = ${run.agentId}
+          and start_agent.status not in ('paused','terminated','pending_approval'))`,
+      )).returning().then((rows) => rows[0] ?? null);
+    });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -9816,6 +9893,212 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileIssueGraphLiveness(opts);
   }
 
+  function noNewerStartedRun(run: typeof heartbeatRuns.$inferSelect) {
+    return sql`not exists (
+      select 1 from heartbeat_runs newer
+      where newer.company_id = ${run.companyId} and newer.agent_id = ${run.agentId}
+        and newer.started_at is not null and newer.id <> ${run.id}
+        and (newer.started_at, newer.created_at, newer.id) >
+          (${run.startedAt ?? run.createdAt}::timestamptz, ${run.createdAt}::timestamptz, ${run.id}::uuid)
+    )`;
+  }
+
+  async function claimTerminalPhase(tx: Db, runId: string, phase: string) {
+    const owner = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    if (!owner) return false;
+    await lockAgentTerminalState(tx, owner.agentId);
+    const claimed = await tx.update(heartbeatRuns).set({
+      terminalFinalizationJson: sql`jsonb_set(${heartbeatRuns.terminalFinalizationJson}, '{completed}',
+        coalesce(${heartbeatRuns.terminalFinalizationJson}->'completed', '{}'::jsonb) || jsonb_build_object(${phase}::text, true))`,
+    }).where(and(
+      eq(heartbeatRuns.id, runId),
+      isNull(heartbeatRuns.terminalFinalizedAt),
+      sql`${heartbeatRuns.terminalFinalizationJson}->>'version' = '1'`,
+      sql`${heartbeatRuns.terminalFinalizationJson}->'completed'->>${phase} is distinct from 'true'`,
+    )).returning({ id: heartbeatRuns.id });
+    return claimed.length > 0;
+  }
+
+  async function lockAgentTerminalState(tx: Db, agentId: string) {
+    // Serialize run-start visibility, session resets and terminal projections
+    // across server instances. Unlike a long-lived lease, this lock disappears
+    // automatically on rollback/disconnection and is never held across hooks.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-terminal:${agentId}`}, 0))`);
+  }
+
+  async function finalizeDurableWakeup(run: typeof heartbeatRuns.$inferSelect) {
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "wakeup")) return;
+      if (!run.wakeupRequestId) return;
+      await tx.update(agentWakeupRequests).set({
+        status: run.status === "succeeded" ? "completed" : run.status,
+        finishedAt: run.finishedAt,
+        error: run.error,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, run.companyId),
+        or(eq(agentWakeupRequests.runId, run.id), isNull(agentWakeupRequests.runId)),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "running"]),
+      ));
+    });
+  }
+
+  async function finalizeDurableTaskSession(run: typeof heartbeatRuns.$inferSelect, payload: TerminalFinalizationPayload) {
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "taskSession")) return;
+      const session = payload.session;
+      if (!session?.taskKey || session.mode === "none" || !payload.adapterType) return;
+      // The same runtime-row lock is used by global and task-specific resets.
+      // A reset during execute invalidates the generation captured before it.
+      const runtime = await tx.select().from(agentRuntimeState)
+        .where(and(eq(agentRuntimeState.agentId, run.agentId), eq(agentRuntimeState.companyId, run.companyId)))
+        .for("no key update").then((rows) => rows[0] ?? null);
+      if (!runtime || runtime.sessionGeneration !== session.generation) return;
+      const patch = {
+        sessionParamsJson: session.mode === "clear" ? null : session.params,
+        sessionDisplayId: session.mode === "clear" ? null : session.displayId,
+        lastRunId: run.id,
+        lastError: run.status === "succeeded" ? null : run.error,
+        updatedAt: new Date(),
+      };
+      // A clear is a tombstone, not a DELETE: lastRunId/generation must survive
+      // so an older pending finalizer cannot resurrect the cleared session.
+      await tx.insert(agentTaskSessions).values({
+        companyId: run.companyId, agentId: run.agentId, adapterType: payload.adapterType,
+        taskKey: session.taskKey, sessionGeneration: session.taskGeneration, ...patch,
+      }).onConflictDoUpdate({
+        target: [agentTaskSessions.companyId, agentTaskSessions.agentId, agentTaskSessions.adapterType, agentTaskSessions.taskKey],
+        set: patch,
+        setWhere: and(
+          eq(agentTaskSessions.sessionGeneration, session.taskGeneration),
+          sql`not exists (select 1 from heartbeat_runs prior
+            where prior.id = ${agentTaskSessions.lastRunId}
+              and (coalesce(prior.started_at, prior.created_at), prior.created_at, prior.id) >
+                (${run.startedAt ?? run.createdAt}::timestamptz, ${run.createdAt}::timestamptz, ${run.id}::uuid))`,
+        ),
+      });
+    });
+  }
+
+  async function finalizeDurableRuntime(run: typeof heartbeatRuns.$inferSelect, payload: TerminalFinalizationPayload) {
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "runtime")) return;
+      const session = payload.session;
+      await tx.update(agentRuntimeState).set({
+        ...(payload.adapterType ? { adapterType: payload.adapterType } : {}),
+        ...(session ? { sessionId: session.legacySessionId } : {}),
+        lastRunId: run.id, lastRunStatus: run.status, lastError: run.error, updatedAt: new Date(),
+      }).where(and(
+        eq(agentRuntimeState.agentId, run.agentId), eq(agentRuntimeState.companyId, run.companyId),
+        noNewerStartedRun(run),
+        session ? eq(agentRuntimeState.sessionGeneration, session.generation) : sql`true`,
+        session?.taskKey ? sql`not exists (select 1 from agent_task_sessions reset_session
+          where reset_session.company_id = ${run.companyId} and reset_session.agent_id = ${run.agentId}
+            and reset_session.adapter_type = ${payload.adapterType}
+            and reset_session.task_key = ${session.taskKey}
+            and reset_session.session_generation <> ${session.taskGeneration})` : sql`true`,
+        sql`not exists (select 1 from heartbeat_runs prior where prior.id = ${agentRuntimeState.lastRunId}
+          and (coalesce(prior.started_at, prior.created_at), prior.created_at, prior.id) >
+            (${run.startedAt ?? run.createdAt}::timestamptz, ${run.createdAt}::timestamptz, ${run.id}::uuid))`,
+      ));
+    });
+  }
+
+  async function finalizeDurableAgent(run: typeof heartbeatRuns.$inferSelect) {
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "agent")) return;
+      const anyRunning = sql`exists (select 1 from heartbeat_runs active
+        where active.company_id = ${run.companyId} and active.agent_id = ${run.agentId} and active.status = 'running')`;
+      const failure = run.status === "failed" || run.status === "timed_out";
+      await tx.update(agents).set({
+        status: sql`case when ${anyRunning} then 'running' else ${failure ? "error" : "idle"} end`,
+        errorReason: sql`case when ${anyRunning} then null else ${failure ? truncateAgentErrorReason(run.error) : null} end`,
+        lastHeartbeatAt: run.finishedAt ?? new Date(),
+        updatedAt: new Date(),
+      }).where(and(
+        eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
+        notInArray(agents.status, ["paused", "terminated", "pending_approval"]),
+        noNewerStartedRun(run),
+      ));
+    });
+  }
+
+  async function reconcileTerminalFinalization(runId: string, opts?: { deferIssueRelease?: boolean }): Promise<boolean> {
+    let run = await getRun(runId);
+    if (!run || !isHeartbeatRunTerminalStatus(run.status) || run.terminalFinalizedAt) return true;
+    const payload = run.terminalFinalizationJson as TerminalFinalizationPayload | null;
+    if (!payload || payload.version !== 1) return false;
+    const agent = await getAgent(run.agentId);
+    if (agent) await ensureRuntimeState(agent);
+    if (agent && payload.ledger) {
+      const ledger = payload.ledger;
+      const completed = await updateRuntimeState(agent, run, {
+        exitCode: run.exitCode, signal: run.signal, timedOut: run.status === "timed_out",
+        provider: ledger.provider, biller: ledger.biller, model: ledger.model,
+        billingType: ledger.billingType, costUsd: ledger.costUsd ?? undefined,
+        errorMessage: run.error ?? undefined,
+      }, { legacySessionId: payload.session?.legacySessionId ?? null }, ledger.usage);
+      if (!completed) return false;
+    } else if (!run.budgetEnforcedAt) {
+      // No measured ledger payload: do not fabricate usage or re-account legacy
+      // rows. A known event, if any, still has to finish its enforcement phase.
+      const events = await db.select().from(costEvents).where(and(
+        eq(costEvents.companyId, run.companyId), eq(costEvents.heartbeatRunId, run.id),
+      ));
+      for (const event of events) await budgets.evaluateCostEvent(event);
+      await db.update(heartbeatRuns).set({ budgetEnforcedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    }
+    await finalizeDurableWakeup(run);
+    await finalizeDurableRuntime(run, payload);
+    await finalizeDurableTaskSession(run, payload);
+    await finalizeDurableAgent(run);
+    if (opts?.deferIssueRelease) return true;
+    // Never promote more work until accounting/enforcement and session state
+    // are durable. The release transaction marks its own phase atomically.
+    await releaseIssueExecutionAndPromote(run, { durableFinalization: true });
+    await db.update(heartbeatRuns).set({ terminalFinalizedAt: new Date() }).where(and(
+      eq(heartbeatRuns.id, run.id), isNotNull(heartbeatRuns.budgetEnforcedAt),
+      sql`${heartbeatRuns.terminalFinalizationJson}->'completed' @> '{"wakeup":true,"runtime":true,"taskSession":true,"agent":true,"issueExecution":true}'::jsonb`,
+    ));
+    run = await getRun(run.id);
+    return Boolean(run?.terminalFinalizedAt);
+  }
+
+  async function shouldDeferDurableTerminal(runId: string) {
+    return await options.deferTerminalFinalization?.({ runId, phase: "after_terminal_commit" }) === true;
+  }
+
+  let terminalRecoveryInFlight: Promise<{ completed: number; pending: number }> | null = null;
+  async function reconcileTerminalRuns(opts?: { limit?: number }) {
+    if (terminalRecoveryInFlight) return terminalRecoveryInFlight;
+    const operation = (async () => {
+      const pending = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        isNotNull(heartbeatRuns.terminalFinalizationJson), isNull(heartbeatRuns.terminalFinalizedAt),
+        inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out"]),
+      )).orderBy(sql`${heartbeatRuns.terminalFinalizationAttemptedAt} asc nulls first`, asc(heartbeatRuns.id))
+        .limit(Math.max(1, Math.min(opts?.limit ?? 100, 1000)));
+      let completed = 0;
+      for (const run of pending) {
+        try {
+          await db.update(heartbeatRuns).set({ terminalFinalizationAttemptedAt: new Date() })
+            .where(eq(heartbeatRuns.id, run.id));
+          if (await reconcileTerminalFinalization(run.id)) completed += 1;
+        } catch (err) {
+          logger.warn({ runId: run.id, err: sanitizeHeartbeatErrorForLog(err) }, "durable terminal heartbeat recovery remains pending");
+        }
+      }
+      return { completed, pending: pending.length - completed };
+    })();
+    terminalRecoveryInFlight = operation;
+    try { return await operation; } finally { if (terminalRecoveryInFlight === operation) terminalRecoveryInFlight = null; }
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -9863,11 +10146,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const runtimeUpdated = await tx
         .update(agentRuntimeState)
         .set({
-          adapterType: agent.adapterType,
-          sessionId: session.legacySessionId,
-          lastRunId: run.id,
-          lastRunStatus: run.status,
-          lastError: result.errorMessage ?? null,
           totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
           totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
           totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
@@ -9905,7 +10183,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           cachedInputTokens,
           outputTokens,
           costCents: additionalCostCents,
-          occurredAt: accountedAt,
+          occurredAt: run.finishedAt ?? run.startedAt ?? run.createdAt,
         }, { evaluateBudgets: false });
       }
 
@@ -9922,6 +10200,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         phase: "after_commit",
       });
     }
+
+    if (await options.deferTerminalFinalization?.({ runId: run.id, phase: "after_accounting_commit" })) {
+      return false;
+    }
+    const budgetAlreadyEnforced = await db.select({ at: heartbeatRuns.budgetEnforcedAt }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id)).then((rows) => Boolean(rows[0]?.at));
+    if (budgetAlreadyEnforced) return true;
 
     // A retry after an ambiguous post-commit failure no longer owns the claim,
     // so reload its event and finish the recoverable budget-enforcement phase.
@@ -9947,6 +10232,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         phase: "after_budget_evaluation",
       });
     }
+    await db.update(heartbeatRuns).set({ budgetEnforcedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, run.id), isNull(heartbeatRuns.budgetEnforcedAt)));
+    return true;
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
@@ -11182,6 +11470,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let reconcilePersistedTerminalSideEffects: (() => Promise<void>) | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
+    let flushAdapterLogs: () => Promise<void> = async () => {};
     let outputSeq = Number(run.lastOutputSeq ?? 0);
     let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
     let lastLogRuntimeStatusTouchMs = 0;
@@ -11299,15 +11588,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-      const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const safeStream: "stdout" | "stderr" = stream === "stdout" ? "stdout" : "stderr";
-        const safeChunkValue = sanitizeHeartbeatPersistenceValue(chunk);
-        const safeChunk = typeof safeChunkValue === "string"
-          ? safeChunkValue
-          : "[paperclip omitted non-string adapter log chunk]";
-        const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(safeChunk, currentUserRedactionOptions),
-        );
+      const streamRedactor = createHeartbeatStreamRedactor({
+        redactAdditionalText: (safeText) => compactRunLogChunk(redactCurrentUserText(safeText, currentUserRedactionOptions)),
+      });
+      let logWriteChain: Promise<void> = Promise.resolve();
+      const emitSafeLog = async (safeStream: "stdout" | "stderr", sanitizedChunk: string) => {
         if (safeStream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (safeStream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         const ts = new Date().toISOString();
@@ -11371,6 +11656,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
         });
       };
+      const writeSafeLogs = (chunks: ReturnType<typeof streamRedactor.write>) => {
+        logWriteChain = logWriteChain.catch(() => undefined).then(async () => {
+          for (const entry of chunks) await emitSafeLog(entry.stream, entry.chunk);
+        });
+        return logWriteChain;
+      };
+      const onLog = (stream: "stdout" | "stderr", chunk: string) =>
+        writeSafeLogs(streamRedactor.write(stream === "stdout" ? "stdout" : "stderr", chunk));
+      flushAdapterLogs = () => writeSafeLogs(streamRedactor.flush());
+      heartbeatLogFlushers.set(run.id, flushAdapterLogs);
       if (runScopedMentionedSkillKeys.length > 0) {
         await onLog(
           "stdout",
@@ -11828,6 +12123,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
+        await flushAdapterLogs();
         logSummary = await runLogStore.finalize(handle);
       }
       const finalLogBytes = logSummary?.bytes;
@@ -11892,6 +12188,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
 
       const persistedRunWrite = await setTerminalRunStatusIfRunning(run.id, status, {
+        terminalFinalizationJson: buildTerminalFinalizationPayload({
+          adapterType: agent.adapterType,
+          result: adapterResult,
+          usage: normalizedUsage,
+          session: {
+            generation: runtime.sessionGeneration,
+            taskGeneration: taskSession?.sessionGeneration ?? 0,
+            legacySessionId: nextSessionState.legacySessionId,
+            taskKey,
+            mode: !taskKey ? "none" : adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId) ? "clear" : "upsert",
+            params: attachPaperclipSessionMetadataToSessionParams(nextSessionState.params, configuredModel, sessionConfigMetadata),
+            displayId: nextSessionState.displayId,
+          },
+        }),
         finishedAt: new Date(),
         error: runErrorMessage,
         errorCode: runErrorCode,
@@ -11918,6 +12228,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return;
       }
       terminalOutcomePersisted = outcome;
+      if (await options.deferTerminalFinalization?.({ runId: run.id, phase: "after_terminal_commit" })) return;
+      reconcilePersistedTerminalSideEffects = async () => { await reconcileTerminalFinalization(run.id); };
+      if (!await reconcileTerminalFinalization(run.id, { deferIssueRelease: true })) return;
 
       const terminalSideEffectProgress = {
         wakeup: false,
@@ -11935,62 +12248,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       const finalizeTerminalWakeup = async () => {
         if (terminalSideEffectProgress.wakeup) return;
-        await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
-          finishedAt: new Date(),
-          error: runErrorMessage,
-        });
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await finalizeDurableWakeup(terminalRun);
         terminalSideEffectProgress.wakeup = true;
       };
       const finalizeTerminalIssueExecution = async () => {
         if (terminalSideEffectProgress.issueExecution) return;
         const terminalRun = await loadTerminalRunForSideEffects();
         if (!terminalRun) return;
-        await releaseIssueExecutionAndPromote(terminalRun);
+        await releaseIssueExecutionAndPromote(terminalRun, { durableFinalization: true });
         terminalSideEffectProgress.issueExecution = true;
       };
       const finalizeTerminalRuntimeState = async () => {
         if (terminalSideEffectProgress.runtimeState) return;
         const terminalRun = await loadTerminalRunForSideEffects();
         if (!terminalRun) return;
-        await updateRuntimeState(agent, terminalRun, adapterResult, {
-          legacySessionId: nextSessionState.legacySessionId,
-        }, normalizedUsage);
+        await finalizeDurableRuntime(terminalRun, terminalRun.terminalFinalizationJson as TerminalFinalizationPayload);
         terminalSideEffectProgress.runtimeState = true;
       };
       const finalizeTerminalTaskSession = async () => {
         if (terminalSideEffectProgress.taskSession || !taskKey) return;
         const terminalRun = await loadTerminalRunForSideEffects();
         if (!terminalRun) return;
-        if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-          await clearTaskSessions(agent.companyId, agent.id, {
-            taskKey,
-            adapterType: agent.adapterType,
-          });
-        } else {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-              nextSessionState.params,
-              configuredModel,
-              sessionConfigMetadata,
-            ),
-            sessionDisplayId: nextSessionState.displayId,
-            lastRunId: terminalRun.id,
-            lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
-          });
-        }
+        await finalizeDurableTaskSession(terminalRun, terminalRun.terminalFinalizationJson as TerminalFinalizationPayload);
         terminalSideEffectProgress.taskSession = true;
       };
       const finalizeTerminalAgent = async () => {
         if (terminalSideEffectProgress.agentStatus) return;
-        await finalizeAgentStatus(
-          agent.id,
-          outcome,
-          outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
-        );
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await finalizeDurableAgent(terminalRun);
         terminalSideEffectProgress.agentStatus = true;
       };
       reconcilePersistedTerminalSideEffects = async () => {
@@ -12323,6 +12611,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       logger.error({ err: sanitizeHeartbeatErrorForLog(err), runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
+      await flushAdapterLogs().catch((flushErr) => {
+        logger.warn({ err: sanitizeHeartbeatErrorForLog(flushErr), runId }, "failed to flush safe adapter logs after error");
+      });
       if (handle) {
         try {
           logSummary = await runLogStore.finalize(handle);
@@ -12345,6 +12636,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       const failedRunWrite = await setTerminalRunStatusIfRunning(run.id, "failed", {
+        terminalFinalizationJson: sanitizeHeartbeatPersistenceRecord({
+          ...emptyTerminalFinalizationPayload(),
+          adapterType: agent.adapterType,
+          session: {
+            generation: runtime.sessionGeneration,
+            taskGeneration: taskSession?.sessionGeneration ?? 0,
+            legacySessionId: runtimeForAdapter.sessionId,
+            taskKey,
+            mode: taskKey && (previousSessionParams || previousSessionDisplayId || taskSession) ? "upsert" : "none",
+            params: attachPaperclipSessionMetadataToSessionParams(previousSessionParams, configuredModel, sessionConfigMetadata),
+            displayId: previousSessionDisplayId,
+          },
+        }),
         error: message,
         errorCode: failureErrorCode,
         finishedAt: new Date(),
@@ -12372,6 +12676,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const failedRun = failedRunWrite.run;
+      terminalOutcomePersisted = "failed";
+      if (await options.deferTerminalFinalization?.({ runId: run.id, phase: "after_terminal_commit" })) return;
+      reconcilePersistedTerminalSideEffects = async () => { await reconcileTerminalFinalization(run.id); };
+      if (!await reconcileTerminalFinalization(run.id, { deferIssueRelease: true })) return;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
         error: message,
@@ -12391,34 +12699,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         await releaseIssueExecutionAndPromote(livenessRun);
 
-        await updateRuntimeState(agent, livenessRun, {
-          exitCode: null,
-          signal: null,
-          timedOut: false,
-          errorMessage: message,
-        }, {
-          legacySessionId: runtimeForAdapter.sessionId,
-        });
-
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-              previousSessionParams,
-              configuredModel,
-              sessionConfigMetadata,
-            ),
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
-          });
-        }
+        await reconcileTerminalFinalization(run.id);
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      if (failedRun) await finalizeDurableAgent(failedRun);
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
@@ -12505,6 +12789,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           runningProcesses.delete(run.id);
           activeRunExecutions.delete(run.id);
+          heartbeatLogFlushers.delete(run.id);
           deadLocalProcessFirstObservedAt.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
@@ -12566,7 +12851,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; durableFinalization?: boolean } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -12583,6 +12868,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
+      const durableRun = await tx.select({ payload: heartbeatRuns.terminalFinalizationJson, finishedAt: heartbeatRuns.finishedAt })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).then((rows) => rows[0] ?? null);
+      const durableFinalization = options.durableFinalization || durableRun?.payload?.version === 1;
+      if (durableFinalization && !await claimTerminalPhase(tx as unknown as Db, run.id, "issueExecution")) return null;
       // Lock the context issue (if any) AND every issue that still references this run.
       //
       // A single run can hold execution locks on multiple issues: the caller's context
@@ -12715,6 +13004,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ...(durableFinalization && durableRun?.finishedAt ? [lte(agentWakeupRequests.requestedAt, durableRun.finishedAt)] : []),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             ),
           )
@@ -14328,30 +14618,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : options.resultJson;
 
     const running = runningProcesses.get(run.id);
-    try {
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
-    } finally {
-      runningProcesses.delete(run.id);
+    if (running) {
+      await terminateHeartbeatRunProcess({
+        pid: running.child.pid ?? run.processPid,
+        processGroupId: running.processGroupId ?? run.processGroupId,
+        graceMs: Math.max(1, running.graceSec) * 1000,
+      });
+    } else if (run.processPid || run.processGroupId) {
+      await terminateHeartbeatRunProcess({ pid: run.processPid, processGroupId: run.processGroupId });
     }
+    // Preserve ownership on failed termination. A retry must still be able to
+    // find/cancel the live child before the run becomes terminal.
+    runningProcesses.delete(run.id);
 
     const finishedAt = new Date();
+    await heartbeatLogFlushers.get(run.id)?.();
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt,
       error: reason,
       errorCode,
       ...(resultJson ? { resultJson } : {}),
-    });
+    }, { expectedStatuses: CANCELLABLE_HEARTBEAT_RUN_STATUSES });
+    if (!cancelled) return getRun(run.id);
+    if (await shouldDeferDurableTerminal(run.id)) return cancelled;
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
@@ -14382,7 +14671,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
+      const running = runningProcesses.get(run.id);
+      if (running) {
+        await terminateHeartbeatRunProcess({
+          pid: running.child.pid ?? run.processPid,
+          processGroupId: running.processGroupId ?? run.processGroupId,
+          graceMs: Math.max(1, running.graceSec) * 1000,
+        });
+        runningProcesses.delete(run.id);
+      } else if (run.processPid || run.processGroupId) {
+        await terminateHeartbeatRunProcess({ pid: run.processPid, processGroupId: run.processGroupId });
+      }
+      await heartbeatLogFlushers.get(run.id)?.();
+      const cancelled = await setRunStatus(run.id, "cancelled", {
         finishedAt: new Date(),
         error: reason,
         errorCode,
@@ -14393,28 +14694,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             errorMessage: reason,
           }),
         } : {}),
-      });
+      }, { expectedStatuses: CANCELLABLE_HEARTBEAT_RUN_STATUSES });
+      if (!cancelled) continue;
+      if (await shouldDeferDurableTerminal(run.id)) continue;
 
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: new Date(),
         error: reason,
       });
 
-      const running = runningProcesses.get(run.id);
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-        runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
-      await releaseIssueExecutionAndPromote(run);
+      await releaseIssueExecutionAndPromote(cancelled);
     }
 
     return runs.length;
@@ -14629,26 +14918,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!agent) throw notFound("Agent not found");
       await ensureRuntimeState(agent);
       const taskKey = readNonEmptyString(opts?.taskKey);
-      const clearedTaskSessions = await clearTaskSessions(
-        agent.companyId,
-        agent.id,
-        taskKey ? { taskKey, adapterType: agent.adapterType } : undefined,
-      );
-      const runtimePatch: Partial<typeof agentRuntimeState.$inferInsert> = {
-        sessionId: null,
-        lastError: null,
-        updatedAt: new Date(),
-      };
-      if (!taskKey) {
-        runtimePatch.stateJson = {};
-      }
-
-      const updated = await db
-        .update(agentRuntimeState)
-        .set(runtimePatch)
-        .where(eq(agentRuntimeState.agentId, agentId))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const { updated, clearedTaskSessions } = await db.transaction(async (tx) => {
+        await lockAgentTerminalState(tx as unknown as Db, agentId);
+        await tx.select({ id: agentRuntimeState.agentId }).from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, agentId)).for("no key update");
+        const sessionConditions = and(
+          eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId),
+          ...(taskKey ? [eq(agentTaskSessions.taskKey, taskKey), eq(agentTaskSessions.adapterType, agent.adapterType)] : []),
+        );
+        const priorSessions = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions).where(sessionConditions);
+        if (taskKey) {
+          const cleared = { sessionParamsJson: null, sessionDisplayId: null, lastRunId: null, lastError: null, updatedAt: new Date() };
+          await tx.insert(agentTaskSessions).values({
+            companyId: agent.companyId, agentId, adapterType: agent.adapterType, taskKey,
+            sessionGeneration: 1, ...cleared,
+          }).onConflictDoUpdate({
+            target: [agentTaskSessions.companyId, agentTaskSessions.agentId, agentTaskSessions.adapterType, agentTaskSessions.taskKey],
+            set: { ...cleared, sessionGeneration: sql`${agentTaskSessions.sessionGeneration} + 1` },
+          });
+        } else {
+          await tx.delete(agentTaskSessions).where(sessionConditions);
+        }
+        const updated = await tx.update(agentRuntimeState).set({
+          sessionId: null, lastError: null, updatedAt: new Date(),
+          ...(!taskKey ? { stateJson: {}, sessionGeneration: sql`${agentRuntimeState.sessionGeneration} + 1` } : {}),
+        }).where(eq(agentRuntimeState.agentId, agentId)).returning().then((rows) => rows[0] ?? null);
+        return { updated, clearedTaskSessions: priorSessions.length };
+      });
 
       if (!updated) return null;
       return {
@@ -14740,6 +15036,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
+    reconcileTerminalRuns,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

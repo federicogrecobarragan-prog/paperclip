@@ -189,13 +189,14 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
 async function computeObservedAmount(
   db: Db,
   policy: Pick<PolicyRow, "companyId" | "scopeType" | "scopeId" | "windowKind" | "metric">,
+  windowAt = new Date(),
 ) {
   if (policy.metric !== "billed_cents") return 0;
 
   const conditions = [eq(costEvents.companyId, policy.companyId)];
   if (policy.scopeType === "agent") conditions.push(eq(costEvents.agentId, policy.scopeId));
   if (policy.scopeType === "project") conditions.push(eq(costEvents.projectId, policy.scopeId));
-  const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
+  const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind, windowAt);
   if (policy.windowKind === "calendar_month_utc") {
     conditions.push(gte(costEvents.occurredAt, start));
     conditions.push(lt(costEvents.occurredAt, end));
@@ -397,8 +398,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     policy: PolicyRow,
     thresholdType: BudgetThresholdType,
     amountObserved: number,
+    windowAt = new Date(),
   ) {
-    const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
+    const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind, windowAt);
     let publishThresholdActivity: (() => void) | undefined;
     const result = await db.transaction(async (transaction) => {
       const tx = transaction as unknown as Db;
@@ -492,7 +494,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     return result;
   }
 
-  async function resolveOpenSoftIncidents(policyId: string) {
+  async function resolveOpenSoftIncidents(policyId: string, windowStart?: Date) {
     await db
       .update(budgetIncidents)
       .set({
@@ -505,6 +507,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           eq(budgetIncidents.policyId, policyId),
           eq(budgetIncidents.thresholdType, "soft"),
           eq(budgetIncidents.status, "open"),
+          ...(windowStart ? [eq(budgetIncidents.windowStart, windowStart)] : []),
         ),
       );
   }
@@ -745,16 +748,19 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
       for (const policy of relevantPolicies) {
         if (policy.metric !== "billed_cents" || policy.amount <= 0) continue;
-        const observedAmount = await computeObservedAmount(db, policy);
+        // Recovery can occur in a later month. Evaluate the event's original
+        // window instead of silently treating a historical violation as zero.
+        const windowAt = event.occurredAt;
+        const observedAmount = await computeObservedAmount(db, policy, windowAt);
         const softThreshold = Math.ceil((policy.amount * policy.warnPercent) / 100);
 
         if (policy.notifyEnabled && observedAmount >= softThreshold) {
-          await createIncidentIfNeeded(policy, "soft", observedAmount);
+          await createIncidentIfNeeded(policy, "soft", observedAmount, windowAt);
         }
 
         if (policy.hardStopEnabled && observedAmount >= policy.amount) {
-          await resolveOpenSoftIncidents(policy.id);
-          await createIncidentIfNeeded(policy, "hard", observedAmount);
+          await resolveOpenSoftIncidents(policy.id, resolveWindow(policy.windowKind as BudgetWindowKind, windowAt).start);
+          await createIncidentIfNeeded(policy, "hard", observedAmount, windowAt);
           await pauseAndCancelScopeForBudget(policy);
         }
       }
