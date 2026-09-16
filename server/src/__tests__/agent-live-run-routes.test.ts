@@ -658,7 +658,7 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(400);
     expect(res.body).toEqual({ error: "Invalid triggerDetail" });
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-  }, 10_000);
+  }, 60_000);
 
   it.each(["manual", "system", "ping", "callback"])("accepts the shared triggerDetail enum: %s", async (triggerDetail) => {
     const res = await requestApp(

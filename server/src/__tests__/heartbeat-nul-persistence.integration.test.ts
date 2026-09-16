@@ -3,11 +3,13 @@ import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  approvals,
   agents,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
   budgetPolicies,
+  budgetIncidents,
   companies,
   costEvents,
   createDb,
@@ -37,6 +39,7 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 import * as activityLogService from "../services/activity-log.ts";
+import * as liveEventsService from "../services/live-events.ts";
 import {
   heartbeatService,
   type HeartbeatPostTerminalStep,
@@ -288,6 +291,14 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     });
     expect(queued).toBeTruthy();
     const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    expect(await waitForCondition(async () => {
+      const row = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.runId, queued!.id))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "failed";
+    })).toBe(true);
     const [wakeup] = await db
       .select()
       .from(agentWakeupRequests)
@@ -478,6 +489,42 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
       expect(persisted).not.toContain(opaqueCanary);
     }
     expect(persisted).toContain("***REDACTED***");
+  });
+
+  it("redacts an opaque assignment split across adapter chunks before every sink", async () => {
+    const { agentId } = await seedAgent();
+    const opaqueCanary = "OpaqueChunkBoundaryQ7N4V8M2R6";
+    const liveEventSpy = vi.spyOn(liveEventsService, "publishLiveEvent");
+    mockAdapterExecute.mockImplementationOnce(async (context: {
+      onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    }) => {
+      await context.onLog("stderr", "api");
+      await context.onLog("stderr", `Key=\n${opaqueCanary}\n`);
+      return { exitCode: 0, signal: null, timedOut: false };
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      reason: "split_stream_redaction",
+    });
+    expect(queued).toBeTruthy();
+    const terminal = await waitForTerminalRun(heartbeat, queued!.id);
+    const log = await heartbeat.readLog(queued!.id);
+    const liveLogPayloads = liveEventSpy.mock.calls
+      .map(([event]) => event)
+      .filter((event) => event.type === "heartbeat.run.log" && event.payload.runId === queued!.id);
+    const persisted = JSON.stringify({
+      stdoutExcerpt: terminal?.stdoutExcerpt,
+      stderrExcerpt: terminal?.stderrExcerpt,
+      log,
+      liveLogPayloads,
+    });
+
+    expect(terminal?.status).toBe("succeeded");
+    expect(persisted).not.toContain(opaqueCanary);
+    expect(persisted).toContain("redacted ambiguous adapter log");
   });
 
   it("redacts synthetic secrets from thrown adapter errors and workspace-finalize evidence", async () => {
@@ -1081,7 +1128,9 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
         .then((rows) => rows[0] ?? null);
       return originalWakeup?.status === "completed" &&
         Boolean(promotedWakeup?.runId) &&
-        Boolean(dependentWakeup);
+        Boolean(dependentWakeup) &&
+        postTerminalAttempts.get("runtime_state") === 2 &&
+        postTerminalAttempts.get("task_session") === 2;
     });
     expect(finalizedSideEffects).toBe(true);
 
@@ -1140,4 +1189,606 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
       .where(eq(issues.id, blockerIssueId));
     expect(sourceIssueAfterPromotion?.executionRunId).toBeNull();
   });
+
+  for (const crashPhase of ["after_terminal_commit", "after_accounting_commit"] as const) {
+    it(`recovers ${crashPhase} with a new service instance and concurrent replayers`, async () => {
+      const { companyId, agentId } = await seedAgent();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Durable terminal recovery ${crashPhase}`,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+      });
+      await db.insert(budgetPolicies).values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 100,
+        warnPercent: 80,
+        hardStopEnabled: true,
+        notifyEnabled: false,
+        isActive: true,
+      });
+
+      let adapterStarted!: () => void;
+      const adapterStartedPromise = new Promise<void>((resolve) => { adapterStarted = resolve; });
+      let finishAdapter!: () => void;
+      const adapterCanFinish = new Promise<void>((resolve) => { finishAdapter = resolve; });
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        adapterStarted();
+        await adapterCanFinish;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          provider: "test",
+          biller: "test-biller",
+          model: "durable-recovery-model",
+          billingType: "metered_api",
+          costUsd: 1.23,
+          usage: { inputTokens: 101, cachedInputTokens: 7, outputTokens: 29 },
+          sessionId: `durable-session-${crashPhase}`,
+        };
+      });
+
+      let crashRunId: string | null = null;
+      const crashedService = heartbeatService(db, {
+        deferTerminalFinalization: ({ runId, phase }) => runId === crashRunId && phase === crashPhase,
+      });
+      const queued = await crashedService.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        contextSnapshot: { issueId, taskKey: `issue:${issueId}`, wakeReason: "issue_assigned" },
+      });
+      expect(queued).toBeTruthy();
+      crashRunId = queued!.id;
+      await adapterStartedPromise;
+      await db.update(issues).set({
+        status: "done",
+        completedAt: new Date(),
+        checkoutRunId: queued!.id,
+        executionRunId: queued!.id,
+        updatedAt: new Date(),
+      }).where(eq(issues.id, issueId));
+      finishAdapter();
+
+      let crashedRun = await waitForTerminalRun(crashedService, queued!.id, 10_000);
+      if (crashPhase === "after_accounting_commit") {
+        expect(await waitForCondition(async () => {
+          crashedRun = await crashedService.getRun(queued!.id);
+          return Boolean(crashedRun?.runtimeAccountedAt) && !crashedRun?.budgetEnforcedAt;
+        }, 10_000)).toBe(true);
+      }
+      expect(crashedRun?.status).toBe("succeeded");
+      expect(crashedRun?.terminalFinalizationJson).toBeTruthy();
+      expect(crashedRun?.terminalFinalizedAt).toBeNull();
+      if (crashPhase === "after_terminal_commit") {
+        expect(crashedRun?.runtimeAccountedAt).toBeNull();
+        await db.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId));
+        await db.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
+      } else {
+        expect(crashedRun?.runtimeAccountedAt).toBeInstanceOf(Date);
+        expect(crashedRun?.budgetEnforcedAt).toBeNull();
+      }
+
+      const firstRestart = heartbeatService(db);
+      const secondRestart = heartbeatService(db);
+      await Promise.all([
+        firstRestart.reconcileTerminalRuns(),
+        secondRestart.reconcileTerminalRuns(),
+      ]);
+      const replay = await heartbeatService(db).reconcileTerminalRuns();
+      expect(replay).toEqual({ completed: 0, pending: 0 });
+
+      const [run, runtimeState, currentAgent, sourceIssue, wakeups, events, incidents, approvalsRows, hardLogs, sessions] =
+        await Promise.all([
+          db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id)).then((rows) => rows[0]),
+          db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId)).then((rows) => rows[0]),
+          db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0]),
+          db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]),
+          db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, queued!.id)),
+          db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, queued!.id)),
+          db.select().from(budgetIncidents).where(and(
+            eq(budgetIncidents.companyId, companyId),
+            eq(budgetIncidents.thresholdType, "hard"),
+          )),
+          db.select().from(approvals).where(and(
+            eq(approvals.companyId, companyId),
+            eq(approvals.type, "budget_override_required"),
+          )),
+          db.select().from(activityLog).where(and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, "budget.hard_threshold_crossed"),
+          )),
+          db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+        ]);
+
+      expect(run.runtimeAccountedAt).toBeInstanceOf(Date);
+      expect(run.budgetEnforcedAt).toBeInstanceOf(Date);
+      expect(run.terminalFinalizedAt).toBeInstanceOf(Date);
+      expect(run.terminalFinalizationJson).toMatchObject({
+        version: 1,
+        completed: {
+          wakeup: true,
+          runtime: true,
+          taskSession: true,
+          agent: true,
+          issueExecution: true,
+        },
+      });
+      expect(runtimeState).toMatchObject({
+        totalInputTokens: 101,
+        totalCachedInputTokens: 7,
+        totalOutputTokens: 29,
+        totalCostCents: 123,
+        lastRunId: queued!.id,
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ costCents: 123, inputTokens: 101, outputTokens: 29 });
+      expect(incidents).toHaveLength(1);
+      expect(approvalsRows).toHaveLength(1);
+      expect(hardLogs).toHaveLength(1);
+      expect(currentAgent.status).toBe("paused");
+      expect(wakeups).toHaveLength(1);
+      expect(wakeups[0]?.status).toBe("completed");
+      expect(sourceIssue.checkoutRunId).toBeNull();
+      expect(sourceIssue.executionRunId).toBeNull();
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]?.lastRunId).toBe(queued!.id);
+    }, 30_000);
+  }
+
+  it("accounts an old pending run without rewinding a newer run or reset sessions", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const oldRunId = randomUUID();
+    const newerRunId = randomUUID();
+    const oldStartedAt = new Date("2026-08-31T23:58:00.000Z");
+    const newerStartedAt = new Date("2026-09-01T00:02:00.000Z");
+    const now = new Date("2026-09-01T00:03:00.000Z");
+
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 25,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: false,
+      isActive: true,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: oldRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        createdAt: oldStartedAt,
+        startedAt: oldStartedAt,
+        finishedAt: new Date("2026-08-31T23:59:00.000Z"),
+        terminalFinalizationJson: {
+          version: 1,
+          adapterType: "claude_local",
+          ledger: {
+            usage: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 3 },
+            costUsd: 0.25,
+            provider: "test",
+            biller: "test-biller",
+            billingType: "metered_api",
+            model: "old-model",
+          },
+          session: {
+            generation: 0,
+            taskGeneration: 0,
+            legacySessionId: "old-global-session",
+            taskKey: "issue:reset-task",
+            mode: "upsert",
+            params: { sessionId: "old-task-session" },
+            displayId: "old-task-session",
+          },
+          completed: {},
+        },
+      },
+      {
+        id: newerRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        createdAt: newerStartedAt,
+        startedAt: newerStartedAt,
+        finishedAt: now,
+        runtimeAccountedAt: now,
+        budgetEnforcedAt: now,
+        terminalFinalizedAt: now,
+      },
+    ]);
+    await db.insert(agentRuntimeState).values({
+      companyId,
+      agentId,
+      adapterType: "claude_local",
+      sessionId: "new-global-session",
+      sessionGeneration: 1,
+      lastRunId: newerRunId,
+      lastRunStatus: "succeeded",
+      totalInputTokens: 20,
+      totalCachedInputTokens: 4,
+      totalOutputTokens: 6,
+      totalCostCents: 50,
+    });
+    await db.insert(agentTaskSessions).values([
+      {
+        companyId,
+        agentId,
+        adapterType: "claude_local",
+        taskKey: "issue:reset-task",
+        sessionGeneration: 1,
+        sessionParamsJson: null,
+        sessionDisplayId: null,
+        lastRunId: newerRunId,
+      },
+      {
+        companyId,
+        agentId,
+        adapterType: "claude_local",
+        taskKey: "issue:unrelated-task",
+        sessionGeneration: 4,
+        sessionParamsJson: { sessionId: "unrelated-session" },
+        sessionDisplayId: "unrelated-session",
+        lastRunId: newerRunId,
+      },
+    ]);
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      heartbeatRunId: newerRunId,
+      provider: "test",
+      biller: "test-biller",
+      billingType: "metered_api",
+      model: "new-model",
+      inputTokens: 20,
+      cachedInputTokens: 4,
+      outputTokens: 6,
+      costCents: 50,
+      occurredAt: now,
+    });
+
+    const firstRestart = heartbeatService(db);
+    expect(await firstRestart.reconcileTerminalRuns()).toEqual({ completed: 1, pending: 0 });
+    expect(await heartbeatService(db).reconcileTerminalRuns()).toEqual({ completed: 0, pending: 0 });
+
+    const [oldRun, runtime, taskSessions, events, incidents] = await Promise.all([
+      firstRestart.getRun(oldRunId),
+      db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId)).then((rows) => rows[0]),
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+      db.select().from(costEvents).where(eq(costEvents.agentId, agentId)),
+      db.select().from(budgetIncidents).where(and(
+        eq(budgetIncidents.companyId, companyId),
+        eq(budgetIncidents.thresholdType, "hard"),
+      )),
+    ]);
+    const resetTask = taskSessions.find((session) => session.taskKey === "issue:reset-task");
+    const unrelatedTask = taskSessions.find((session) => session.taskKey === "issue:unrelated-task");
+
+    expect(oldRun?.terminalFinalizedAt).toBeInstanceOf(Date);
+    expect(runtime).toMatchObject({
+      sessionId: "new-global-session",
+      sessionGeneration: 1,
+      lastRunId: newerRunId,
+      lastRunStatus: "succeeded",
+      totalInputTokens: 30,
+      totalCachedInputTokens: 6,
+      totalOutputTokens: 9,
+      totalCostCents: 75,
+    });
+    expect(resetTask).toMatchObject({
+      sessionGeneration: 1,
+      sessionParamsJson: null,
+      sessionDisplayId: null,
+      lastRunId: newerRunId,
+    });
+    expect(unrelatedTask).toMatchObject({
+      sessionGeneration: 4,
+      sessionParamsJson: { sessionId: "unrelated-session" },
+      sessionDisplayId: "unrelated-session",
+      lastRunId: newerRunId,
+    });
+    expect(events).toHaveLength(2);
+    expect(events.filter((event) => event.heartbeatRunId === oldRunId)).toHaveLength(1);
+    expect(events.reduce((sum, event) => sum + event.costCents, 0)).toBe(75);
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]).toMatchObject({
+      amountObserved: 25,
+      windowStart: new Date("2026-08-01T00:00:00.000Z"),
+      windowEnd: new Date("2026-09-01T00:00:00.000Z"),
+    });
+  }, 30_000);
+
+  it("clears only an old checkout and leaves post-boundary deferred work behind a newer execution", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const oldRunId = randomUUID();
+    const newerRunId = randomUUID();
+    const issueId = randomUUID();
+    const lateWakeId = randomUUID();
+    const oldStartedAt = new Date("2026-09-10T10:00:00.000Z");
+    const oldFinishedAt = new Date("2026-09-10T10:01:00.000Z");
+    const newerStartedAt = new Date("2026-09-10T10:02:00.000Z");
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: oldRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        createdAt: oldStartedAt,
+        startedAt: oldStartedAt,
+        finishedAt: oldFinishedAt,
+        contextSnapshot: { issueId, taskKey: `issue:${issueId}` },
+        terminalFinalizationJson: {
+          version: 1,
+          adapterType: null,
+          ledger: null,
+          session: null,
+          completed: {},
+        },
+      },
+      {
+        id: newerRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        createdAt: newerStartedAt,
+        startedAt: newerStartedAt,
+        finishedAt: new Date("2026-09-10T10:03:00.000Z"),
+        terminalFinalizedAt: new Date("2026-09-10T10:03:01.000Z"),
+        contextSnapshot: { issueId, taskKey: `issue:${issueId}` },
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Preserve the newer execution lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: oldRunId,
+      executionRunId: newerRunId,
+      executionAgentNameKey: "persistencetestadaptor",
+      executionLockedAt: newerStartedAt,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: lateWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: { issueId },
+      status: "deferred_issue_execution",
+      requestedAt: new Date("2026-09-10T10:01:01.000Z"),
+    });
+
+    expect(await heartbeatService(db).reconcileTerminalRuns()).toEqual({ completed: 1, pending: 0 });
+    const [oldRun, issue, lateWake] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, oldRunId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, lateWakeId)).then((rows) => rows[0]),
+    ]);
+
+    expect(oldRun.terminalFinalizedAt).toBeInstanceOf(Date);
+    expect(issue.checkoutRunId).toBeNull();
+    expect(issue.executionRunId).toBe(newerRunId);
+    expect(issue.executionAgentNameKey).toBe("persistencetestadaptor");
+    expect(issue.executionLockedAt).toEqual(newerStartedAt);
+    expect(lateWake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+  }, 30_000);
+
+  it("distinguishes zero, subscription, unknown, and legacy accounting", async () => {
+    const cases = [
+      {
+        name: "known zero",
+        result: {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          billingType: "metered_api",
+          costUsd: 0,
+          usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        },
+        expected: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, costCents: 0, events: 0 },
+      },
+      {
+        name: "subscription usage",
+        result: {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          billingType: "subscription",
+          costUsd: 999,
+          usage: { inputTokens: 12, cachedInputTokens: 3, outputTokens: 4 },
+        },
+        expected: { inputTokens: 12, cachedInputTokens: 3, outputTokens: 4, costCents: 0, events: 1 },
+      },
+      {
+        name: "unknown usage",
+        result: { exitCode: 0, signal: null, timedOut: false },
+        expected: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, costCents: 0, events: 0 },
+      },
+    ] as const;
+
+    for (const accountingCase of cases) {
+      const { agentId } = await seedAgent();
+      mockAdapterExecute.mockResolvedValueOnce(accountingCase.result);
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "system",
+        reason: `accounting_${accountingCase.name.replaceAll(" ", "_")}`,
+      });
+      expect(queued).toBeTruthy();
+      expect((await waitForTerminalRun(heartbeat, queued!.id, 10_000))?.status).toBe("succeeded");
+      await heartbeatService(db).reconcileTerminalRuns();
+      const finalized = await waitForCondition(async () =>
+        Boolean((await heartbeat.getRun(queued!.id))?.terminalFinalizedAt), 10_000
+      );
+      const finalRun = await heartbeat.getRun(queued!.id);
+      expect(finalized, `${accountingCase.name}: ${JSON.stringify({
+        runtimeAccountedAt: finalRun?.runtimeAccountedAt,
+        budgetEnforcedAt: finalRun?.budgetEnforcedAt,
+        terminalFinalizationJson: finalRun?.terminalFinalizationJson,
+      })}`).toBe(true);
+
+      const [runtime, events] = await Promise.all([
+        db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId)).then((rows) => rows[0]),
+        db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, queued!.id)),
+      ]);
+      expect(runtime).toMatchObject({
+        totalInputTokens: accountingCase.expected.inputTokens,
+        totalCachedInputTokens: accountingCase.expected.cachedInputTokens,
+        totalOutputTokens: accountingCase.expected.outputTokens,
+        totalCostCents: accountingCase.expected.costCents,
+      });
+      expect(events).toHaveLength(accountingCase.expected.events);
+      if (accountingCase.name === "subscription usage") {
+        expect(events[0]).toMatchObject({
+          billingType: "subscription_included",
+          inputTokens: 12,
+          cachedInputTokens: 3,
+          outputTokens: 4,
+          costCents: 0,
+        });
+      }
+    }
+
+    const { companyId, agentId } = await seedAgent();
+    const legacyRunId = randomUUID();
+    const occurredAt = new Date("2026-08-15T12:00:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: legacyRunId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      startedAt: occurredAt,
+      finishedAt: occurredAt,
+      terminalFinalizationJson: null,
+    });
+    await db.insert(agentRuntimeState).values({
+      companyId,
+      agentId,
+      adapterType: "http",
+      lastRunId: legacyRunId,
+      lastRunStatus: "succeeded",
+      totalCostCents: 40,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      heartbeatRunId: legacyRunId,
+      provider: "legacy",
+      biller: "legacy",
+      billingType: "metered_api",
+      model: "legacy-model",
+      costCents: 40,
+      occurredAt,
+    });
+
+    expect(await heartbeatService(db).reconcileTerminalRuns()).toEqual({ completed: 0, pending: 0 });
+    const [legacyRun, legacyRuntime, legacyEvents] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, legacyRunId)).then((rows) => rows[0]),
+      db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId)).then((rows) => rows[0]),
+      db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, legacyRunId)),
+    ]);
+    expect(legacyRun.runtimeAccountedAt).toBeNull();
+    expect(legacyRuntime.totalCostCents).toBe(40);
+    expect(legacyEvents).toHaveLength(1);
+  }, 30_000);
+
+  it("rejects unpersistable adapter usage and cost before terminal success", async () => {
+    for (const invalidResult of [
+      {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        usage: { inputTokens: 2_147_483_648, cachedInputTokens: 0, outputTokens: 0 },
+      },
+      {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        costUsd: Number.MAX_VALUE,
+      },
+    ]) {
+      const { agentId } = await seedAgent();
+      mockAdapterExecute.mockResolvedValueOnce(invalidResult);
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "system",
+        reason: "invalid_ledger_contract",
+      });
+      expect(queued).toBeTruthy();
+      const terminal = await waitForTerminalRun(heartbeat, queued!.id, 10_000);
+      expect(terminal?.status).toBe("failed");
+      expect(terminal?.error).toContain("PostgreSQL int4");
+      expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, queued!.id))).toHaveLength(0);
+      expect(await waitForCondition(async () => {
+        const [run, agent] = await Promise.all([
+          heartbeat.getRun(queued!.id),
+          db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0]),
+        ]);
+        return Boolean(run?.terminalFinalizedAt) && agent?.status !== "running";
+      }, 10_000)).toBe(true);
+    }
+  }, 30_000);
+
+  it("rotates 101 poison terminal rows so a valid pending row is reconciled", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const poisonIds = Array.from({ length: 101 }, (_, index) =>
+      `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`
+    );
+    const validId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    await db.insert(heartbeatRuns).values([
+      ...poisonIds.map((id) => ({
+        id,
+        companyId,
+        agentId,
+        status: "failed",
+        finishedAt: new Date(),
+        terminalFinalizationJson: { version: 1, completed: { wakeup: "not-a-boolean" } },
+      })),
+      {
+        id: validId,
+        companyId,
+        agentId,
+        status: "failed",
+        finishedAt: new Date(),
+        terminalFinalizationJson: {
+          version: 1,
+          adapterType: null,
+          ledger: null,
+          session: null,
+          completed: {},
+        },
+      },
+    ]);
+    const warningSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileTerminalRuns({ limit: 100 });
+    expect(first).toEqual({ completed: 0, pending: 100 });
+    expect((await heartbeat.getRun(validId))?.terminalFinalizedAt).toBeNull();
+    const second = await heartbeat.reconcileTerminalRuns({ limit: 100 });
+    expect(second.completed).toBe(1);
+    expect((await heartbeat.getRun(validId))?.terminalFinalizedAt).toBeInstanceOf(Date);
+    expect(warningSpy.mock.calls.some(([, message]) =>
+      message === "invalid or unsupported durable terminal finalization payload; recovery remains pending"
+    )).toBe(true);
+  }, 30_000);
 });

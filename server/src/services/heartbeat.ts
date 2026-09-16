@@ -7,6 +7,7 @@ import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNul
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  BILLING_TYPES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   MODEL_PROFILE_KEYS,
   envBindingSchema,
@@ -4824,6 +4825,75 @@ type TerminalFinalizationPayload = {
   completed: Record<string, boolean>;
 };
 
+const TERMINAL_FINALIZATION_PHASES = new Set([
+  "wakeup",
+  "runtime",
+  "taskSession",
+  "agent",
+  "issueExecution",
+]);
+const TERMINAL_LEDGER_INT_MAX = 2_147_483_647;
+
+function parseTerminalFinalizationPayload(value: unknown): TerminalFinalizationPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const payload = value as Record<string, unknown>;
+  if (payload.version !== 1) return null;
+  if (payload.adapterType !== null && typeof payload.adapterType !== "string") return null;
+
+  const completed = payload.completed;
+  if (!completed || typeof completed !== "object" || Array.isArray(completed)) return null;
+  for (const [phase, done] of Object.entries(completed)) {
+    if (!TERMINAL_FINALIZATION_PHASES.has(phase) || typeof done !== "boolean") return null;
+  }
+
+  const ledger = payload.ledger;
+  if (ledger !== null) {
+    if (!ledger || typeof ledger !== "object" || Array.isArray(ledger)) return null;
+    const record = ledger as Record<string, unknown>;
+    if (
+      (record.costUsd !== null && (
+        typeof record.costUsd !== "number" ||
+        !Number.isFinite(record.costUsd) ||
+        record.costUsd < 0 ||
+        !Number.isSafeInteger(Math.round(record.costUsd * 100)) ||
+        Math.round(record.costUsd * 100) > TERMINAL_LEDGER_INT_MAX
+      )) ||
+      typeof record.provider !== "string" ||
+      typeof record.biller !== "string" ||
+      !BILLING_TYPES.includes(record.billingType as BillingType) ||
+      typeof record.model !== "string"
+    ) return null;
+    if (record.usage !== null) {
+      if (!record.usage || typeof record.usage !== "object" || Array.isArray(record.usage)) return null;
+      const usage = record.usage as Record<string, unknown>;
+      if (![usage.inputTokens, usage.cachedInputTokens, usage.outputTokens].every((count) =>
+        typeof count === "number" && Number.isInteger(count) && count >= 0 && count <= TERMINAL_LEDGER_INT_MAX
+      )) return null;
+    }
+  }
+
+  const session = payload.session;
+  if (session !== null) {
+    if (!session || typeof session !== "object" || Array.isArray(session)) return null;
+    const record = session as Record<string, unknown>;
+    if (
+      typeof record.generation !== "number" ||
+      !Number.isSafeInteger(record.generation) ||
+      record.generation < 0 ||
+      typeof record.taskGeneration !== "number" ||
+      !Number.isSafeInteger(record.taskGeneration) ||
+      record.taskGeneration < 0 ||
+      (record.legacySessionId !== null && typeof record.legacySessionId !== "string") ||
+      (record.taskKey !== null && typeof record.taskKey !== "string") ||
+      !["upsert", "clear", "none"].includes(String(record.mode)) ||
+      (record.params !== null && (!record.params || typeof record.params !== "object" || Array.isArray(record.params))) ||
+      (record.displayId !== null && typeof record.displayId !== "string")
+    ) return null;
+  }
+
+  return value as TerminalFinalizationPayload;
+}
+
 const heartbeatLogFlushers = new Map<string, () => Promise<void>>();
 
 function emptyTerminalFinalizationPayload(): TerminalFinalizationPayload {
@@ -6484,7 +6554,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (sanitized as Record<string, unknown>)[key] = sanitizeHeartbeatPersistenceText(value);
       }
     }
-    for (const key of ["usageJson", "resultJson", "contextSnapshot"] as const) {
+    for (const key of ["usageJson", "resultJson", "contextSnapshot", "terminalFinalizationJson"] as const) {
       const value = sanitized[key];
       if (value !== null && value !== undefined) {
         sanitized[key] = sanitizeHeartbeatPersistenceRecord(value);
@@ -8837,7 +8907,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutSource: "heartbeat_daily_cap_gate",
         timeoutFired: false,
       },
-    });
+    }, { expectedStatuses: ["queued"] });
     if (!cancelled) return null;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
@@ -9112,7 +9182,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutSource: "dependency_gate",
         timeoutFired: false,
       },
-    });
+    }, { expectedStatuses: ["queued"] });
     if (!cancelled) return null;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
@@ -9318,7 +9388,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutSource: "stale_queued_run_gate",
         timeoutFired: false,
       },
-    });
+    }, { expectedStatuses: ["queued"] });
     if (!cancelled) return null;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
@@ -9894,12 +9964,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function noNewerStartedRun(run: typeof heartbeatRuns.$inferSelect) {
+    const runStartedAt = (run.startedAt ?? run.createdAt).toISOString();
+    const runCreatedAt = run.createdAt.toISOString();
     return sql`not exists (
       select 1 from heartbeat_runs newer
       where newer.company_id = ${run.companyId} and newer.agent_id = ${run.agentId}
         and newer.started_at is not null and newer.id <> ${run.id}
         and (newer.started_at, newer.created_at, newer.id) >
-          (${run.startedAt ?? run.createdAt}::timestamptz, ${run.createdAt}::timestamptz, ${run.id}::uuid)
+          (${runStartedAt}::timestamptz, ${runCreatedAt}::timestamptz, ${run.id}::uuid)
     )`;
   }
 
@@ -9947,6 +10019,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function finalizeDurableTaskSession(run: typeof heartbeatRuns.$inferSelect, payload: TerminalFinalizationPayload) {
+    const runStartedAt = (run.startedAt ?? run.createdAt).toISOString();
+    const runCreatedAt = run.createdAt.toISOString();
     await db.transaction(async (transaction) => {
       const tx = transaction as unknown as Db;
       if (!await claimTerminalPhase(tx, run.id, "taskSession")) return;
@@ -9978,13 +10052,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`not exists (select 1 from heartbeat_runs prior
             where prior.id = ${agentTaskSessions.lastRunId}
               and (coalesce(prior.started_at, prior.created_at), prior.created_at, prior.id) >
-                (${run.startedAt ?? run.createdAt}::timestamptz, ${run.createdAt}::timestamptz, ${run.id}::uuid))`,
+                (${runStartedAt}::timestamptz, ${runCreatedAt}::timestamptz, ${run.id}::uuid))`,
         ),
       });
     });
   }
 
   async function finalizeDurableRuntime(run: typeof heartbeatRuns.$inferSelect, payload: TerminalFinalizationPayload) {
+    const runStartedAt = (run.startedAt ?? run.createdAt).toISOString();
+    const runCreatedAt = run.createdAt.toISOString();
     await db.transaction(async (transaction) => {
       const tx = transaction as unknown as Db;
       if (!await claimTerminalPhase(tx, run.id, "runtime")) return;
@@ -10004,7 +10080,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and reset_session.session_generation <> ${session.taskGeneration})` : sql`true`,
         sql`not exists (select 1 from heartbeat_runs prior where prior.id = ${agentRuntimeState.lastRunId}
           and (coalesce(prior.started_at, prior.created_at), prior.created_at, prior.id) >
-            (${run.startedAt ?? run.createdAt}::timestamptz, ${run.createdAt}::timestamptz, ${run.id}::uuid))`,
+            (${runStartedAt}::timestamptz, ${runCreatedAt}::timestamptz, ${run.id}::uuid))`,
       ));
     });
   }
@@ -10032,8 +10108,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reconcileTerminalFinalization(runId: string, opts?: { deferIssueRelease?: boolean }): Promise<boolean> {
     let run = await getRun(runId);
     if (!run || !isHeartbeatRunTerminalStatus(run.status) || run.terminalFinalizedAt) return true;
-    const payload = run.terminalFinalizationJson as TerminalFinalizationPayload | null;
-    if (!payload || payload.version !== 1) return false;
+    const payload = parseTerminalFinalizationPayload(run.terminalFinalizationJson);
+    if (!payload) {
+      logger.warn(
+        { runId: run.id, terminalFinalizationVersion: parseObject(run.terminalFinalizationJson).version ?? null },
+        "invalid or unsupported durable terminal finalization payload; recovery remains pending",
+      );
+      return false;
+    }
     const agent = await getAgent(run.agentId);
     if (agent) await ensureRuntimeState(agent);
     if (agent && payload.ledger) {
@@ -10341,7 +10423,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         error: "Agent not found",
         errorCode: "agent_not_found",
         finishedAt: new Date(),
-      });
+      }, { expectedStatuses: ["running"] });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
         error: "Agent not found",
@@ -11545,7 +11627,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               errorMessage: abortReason,
             }),
           } : {}),
-        });
+        }, { expectedStatuses: ["running"] });
         await setWakeupStatus(run.wakeupRequestId, "cancelled", {
           finishedAt: new Date(),
           error: abortReason,
