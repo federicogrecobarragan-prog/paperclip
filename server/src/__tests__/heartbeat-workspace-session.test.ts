@@ -29,6 +29,8 @@ import {
   requiresPushCapabilityPreflight,
   resolveWorkspaceAfterLowTrustPreflight,
   resolveRuntimeSessionParamsForWorkspace,
+  readTrustedHeartbeatFailurePersistenceDetails,
+  sanitizeHeartbeatFailureMessage,
   shouldDeferFollowupWakeForSameIssue,
   stripHostWorkspaceProvisionForLowTrustSandbox,
   stripWorkspaceRuntimeFromExecutionRunConfig,
@@ -238,6 +240,45 @@ function buildIssueAncestryDb(rows: Array<{ id: string; companyId: string; paren
 }
 
 describe("assertGitSensitiveAdapterWorkspaceValid", () => {
+  it("uses immutable canonical message and metadata snapshots after a trusted error is mutated", async () => {
+    const secret = "mutated-trusted-workspace-secret";
+    const input = buildWorkspaceValidationInput({
+      issue: {
+        id: "issue-immutable-snapshot",
+        identifier: "PAP-SNAPSHOT",
+        projectId: null,
+        projectWorkspaceId: "workspace-1",
+      },
+    });
+    let caught: unknown;
+    try {
+      await assertGitSensitiveAdapterWorkspaceValid(input);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+
+    const mutableError = caught as Error & { resultJson: Record<string, unknown> };
+    mutableError.message = secret;
+    mutableError.resultJson = {
+      workspaceValidation: { reason: secret, credential: secret },
+    };
+
+    const message = sanitizeHeartbeatFailureMessage(
+      mutableError,
+      { enabled: false },
+      "workspace validation failed",
+    );
+    const details = readTrustedHeartbeatFailurePersistenceDetails(mutableError);
+    expect(message).toContain("linked to a project workspace but has no project id");
+    expect(message).not.toContain(secret);
+    expect(details?.errorCode).toBe("workspace_validation_failed");
+    expect(details?.resultJson).toMatchObject({
+      workspaceValidation: { reason: "missing_project_id" },
+    });
+    expect(JSON.stringify(details)).not.toContain(secret);
+  });
+
   it("rejects a project-workspace-linked issue that is missing its project id before adapter launch", async () => {
     await expectWorkspaceValidationFailure(
       buildWorkspaceValidationInput({

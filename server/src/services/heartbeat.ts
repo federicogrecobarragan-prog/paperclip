@@ -3,10 +3,11 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  BILLING_TYPES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   MODEL_PROFILE_KEYS,
   envBindingSchema,
@@ -104,6 +105,7 @@ import {
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  readAuthenticWorkspaceRuntimeValidationFailure,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
@@ -189,6 +191,16 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  readAuthenticInvalidAdapterExecutionResultErrorMessage,
+  normalizeAdapterExecutionResultForPersistence,
+  normalizeHeartbeatExitCodeForPersistence,
+  sanitizeHeartbeatPersistenceRecord,
+  sanitizeHeartbeatPersistenceText,
+  sanitizeHeartbeatPersistenceValue,
+  sanitizeHeartbeatWakeupSkipReasonForPersistence,
+} from "./heartbeat-persistence-safety.js";
+import { createHeartbeatStreamRedactor } from "./heartbeat-stream-redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -330,11 +342,31 @@ export class WorkspaceValidationFailure extends Error {
   code = WORKSPACE_VALIDATION_FAILURE_CODE;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(message: string, resultJson: Record<string, unknown>, authenticityToken?: unknown) {
     super(message);
     this.name = "WorkspaceValidationFailure";
     this.resultJson = resultJson;
+    if (authenticityToken === WORKSPACE_VALIDATION_FAILURE_TOKEN) {
+      authenticWorkspaceValidationFailures.set(this, {
+        message: this.message,
+        resultJson: snapshotTrustedHeartbeatFailureResultJson(resultJson),
+      });
+    }
   }
+}
+
+const WORKSPACE_VALIDATION_FAILURE_TOKEN = Symbol("paperclip.workspace-validation-failure");
+const authenticWorkspaceValidationFailures = new WeakMap<WorkspaceValidationFailure, {
+  message: string;
+  resultJson: Record<string, unknown>;
+}>();
+
+function workspaceValidationFailure(message: string, resultJson: Record<string, unknown>) {
+  return new WorkspaceValidationFailure(
+    message,
+    resultJson,
+    WORKSPACE_VALIDATION_FAILURE_TOKEN,
+  );
 }
 
 // Pre-dispatch gate outcome: required secret/env bindings are missing, so the
@@ -344,11 +376,116 @@ export class ConfigurationIncompleteFailure extends Error {
   code = CONFIGURATION_INCOMPLETE_FAILURE_CODE;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(message: string, resultJson: Record<string, unknown>, authenticityToken?: unknown) {
     super(message);
     this.name = "ConfigurationIncompleteFailure";
     this.resultJson = resultJson;
+    if (authenticityToken === CONFIGURATION_INCOMPLETE_FAILURE_TOKEN) {
+      authenticConfigurationIncompleteFailures.set(this, {
+        message: this.message,
+        resultJson: snapshotTrustedHeartbeatFailureResultJson(resultJson),
+      });
+    }
   }
+}
+
+const CONFIGURATION_INCOMPLETE_FAILURE_TOKEN = Symbol(
+  "paperclip.configuration-incomplete-failure",
+);
+const authenticConfigurationIncompleteFailures = new WeakMap<ConfigurationIncompleteFailure, {
+  message: string;
+  resultJson: Record<string, unknown>;
+}>();
+
+function configurationIncompleteFailure(
+  message: string,
+  resultJson: Record<string, unknown>,
+) {
+  return new ConfigurationIncompleteFailure(
+    message,
+    resultJson,
+    CONFIGURATION_INCOMPLETE_FAILURE_TOKEN,
+  );
+}
+
+function snapshotTrustedHeartbeatFailureResultJson(
+  resultJson: Record<string, unknown>,
+): Record<string, unknown> {
+  try {
+    return structuredClone(resultJson) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+type TrustedHeartbeatFailureSnapshot = {
+  message: string;
+  resultJson: Record<string, unknown>;
+};
+
+function readAuthenticWorkspaceValidationFailure(
+  error: unknown,
+): TrustedHeartbeatFailureSnapshot | null {
+  const snapshot = authenticWorkspaceValidationFailures.get(
+    error as WorkspaceValidationFailure,
+  );
+  if (snapshot) {
+    return {
+      message: snapshot.message,
+      resultJson: snapshotTrustedHeartbeatFailureResultJson(snapshot.resultJson),
+    };
+  }
+  return readAuthenticWorkspaceRuntimeValidationFailure(error);
+}
+
+function readAuthenticConfigurationIncompleteFailure(
+  error: unknown,
+): TrustedHeartbeatFailureSnapshot | null {
+  const snapshot = authenticConfigurationIncompleteFailures.get(
+    error as ConfigurationIncompleteFailure,
+  );
+  if (!snapshot) return null;
+  return {
+    message: snapshot.message,
+    resultJson: snapshotTrustedHeartbeatFailureResultJson(snapshot.resultJson),
+  };
+}
+
+export function readTrustedHeartbeatFailurePersistenceDetails(
+  error: unknown,
+): { errorCode: string; resultJson: Record<string, unknown> } | null {
+  const workspaceFailure = readAuthenticWorkspaceValidationFailure(error);
+  if (workspaceFailure) {
+    return {
+      errorCode: WORKSPACE_VALIDATION_FAILURE_CODE,
+      resultJson: workspaceFailure.resultJson,
+    };
+  }
+  const configurationFailure = readAuthenticConfigurationIncompleteFailure(error);
+  if (configurationFailure) {
+    return {
+      errorCode: CONFIGURATION_INCOMPLETE_FAILURE_CODE,
+      resultJson: configurationFailure.resultJson,
+    };
+  }
+  return null;
+}
+
+export function sanitizeHeartbeatFailureMessage(
+  error: unknown,
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+  fallback = "Heartbeat execution failed",
+) {
+  const trustedMessage =
+    readAuthenticWorkspaceValidationFailure(error)?.message ??
+    readAuthenticConfigurationIncompleteFailure(error)?.message ??
+    readAuthenticInvalidAdapterExecutionResultErrorMessage(error);
+  if (trustedMessage === null) {
+    return sanitizeHeartbeatPersistenceText(fallback);
+  }
+  return sanitizeHeartbeatPersistenceText(
+    redactCurrentUserText(trustedMessage, currentUserRedactionOptions),
+  );
 }
 
 function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallbackMode {
@@ -438,6 +575,60 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+const deadLocalProcessFirstObservedAt = new Map<
+  string,
+  { pid: number; firstObservedAt: number }
+>();
+export const ACTIVE_EXECUTION_DEAD_PROCESS_GRACE_MS = 15_000;
+
+export function isHeartbeatRunTrackedInMemory(runId: string) {
+  return runningProcesses.has(runId) || activeRunExecutions.has(runId);
+}
+
+export function shouldPersistHeartbeatProcessMetadata(executionTarget: unknown) {
+  const target = parseObject(executionTarget);
+  // SSH execution is represented by a host-local ssh child, so its pid is a
+  // valid host liveness signal. Sandbox runners report the remote process pid,
+  // which must never be probed with process.kill() on the Paperclip host.
+  return !(target.kind === "remote" && target.transport === "sandbox");
+}
+
+export function sanitizeHeartbeatErrorForLog(_error: unknown) {
+  // Deliberately omit the raw Error object, name, message, and stack. Provider
+  // failures can embed opaque credentials in any of them, and heuristic text
+  // redaction cannot prove an arbitrary value is safe.
+  return { name: "HeartbeatExecutionError" };
+}
+
+export function isTrackedDeadLocalProcess(input: {
+  trackedInMemory: boolean;
+  adapterExecutionInMemory: boolean;
+  tracksLocalChild: boolean;
+  processPid: number | null | undefined;
+  processPidAlive: boolean;
+  deadProcessObservedForMs?: number;
+  activeExecutionDeadProcessGraceMs?: number;
+}) {
+  const isDeadTrackedChild = input.trackedInMemory &&
+    input.tracksLocalChild &&
+    typeof input.processPid === "number" &&
+    Number.isInteger(input.processPid) &&
+    input.processPid > 0 &&
+    !input.processPidAlive;
+  if (!isDeadTrackedChild) return false;
+  if (!input.adapterExecutionInMemory) return true;
+
+  const configuredGraceMs = input.activeExecutionDeadProcessGraceMs ??
+    ACTIVE_EXECUTION_DEAD_PROCESS_GRACE_MS;
+  const graceMs = Number.isFinite(configuredGraceMs)
+    ? Math.max(0, configuredGraceMs)
+    : ACTIVE_EXECUTION_DEAD_PROCESS_GRACE_MS;
+  const observedForMs = Math.max(0, input.deadProcessObservedForMs ?? 0);
+  // A live executeRun may briefly own a child between Node's `exit` and
+  // `close` events. Protect that race only for a bounded window; a dead PID
+  // plus a Promise that never settles must become reapable again.
+  return observedForMs >= graceMs;
+}
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -571,7 +762,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     ))
     : false;
   if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured) {
-    throw new ConfigurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
+    throw configurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
       configurationIncomplete: {
         reason: requiredScopedEnvBinding.reason,
         companyId: input.companyId,
@@ -646,7 +837,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       );
       if (requiredMissingBindings.length > 0) {
         const detail = requiredMissingBindings.map(formatMissingBindingForOperator).join("; ");
-        throw new ConfigurationIncompleteFailure(
+        throw configurationIncompleteFailure(
           `configuration incomplete: ${requiredScopedEnvBinding.remediation}; ${detail}`,
           {
             configurationIncomplete: {
@@ -666,7 +857,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     }
     if (missingBindings.length > 0) {
       const detail = missingBindings.map(formatMissingBindingForOperator).join("; ");
-      throw new ConfigurationIncompleteFailure(`configuration incomplete: ${detail}`, {
+      throw configurationIncompleteFailure(`configuration incomplete: ${detail}`, {
         configurationIncomplete: {
           reason: "secret_binding_missing",
           companyId: input.companyId,
@@ -794,7 +985,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       return typeof value === "string" && value.trim().length > 0;
     });
     if (blockedPaygKeys.length > 0) {
-      throw new ConfigurationIncompleteFailure(
+      throw configurationIncompleteFailure(
         `subscription-only mode: PAYG provider key(s) blocked in run env: ${blockedPaygKeys.join(", ")}. ` +
           "Remove them from the agent adapterConfig.env / environment / project / routine bindings to run on subscription auth.",
         {
@@ -1209,23 +1400,6 @@ async function ensureManagedProjectWorkspace(input: {
   }
 }
 
-type WorkspaceValidationFailureLike = WorkspaceValidationFailure | {
-  code: typeof WORKSPACE_VALIDATION_FAILURE_CODE;
-  resultJson: Record<string, unknown>;
-};
-
-function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailureLike {
-  if (error instanceof WorkspaceValidationFailure) return true;
-  const maybe = error as { code?: unknown; resultJson?: unknown } | null;
-  return Boolean(
-    maybe &&
-      maybe.code === WORKSPACE_VALIDATION_FAILURE_CODE &&
-      maybe.resultJson &&
-      typeof maybe.resultJson === "object" &&
-      !Array.isArray(maybe.resultJson),
-  );
-}
-
 function isWorkspaceValidationFailedRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
 ) {
@@ -1262,10 +1436,6 @@ function fingerprintFinalizeWorkspaceBranchValidation(input: {
     }))
     .digest("hex");
   return `workspace_finalize_branch_mismatch:v1:sha256:${digest}`;
-}
-
-function isConfigurationIncompleteFailure(error: unknown): error is ConfigurationIncompleteFailure {
-  return error instanceof ConfigurationIncompleteFailure;
 }
 
 function isConfigurationIncompleteFailedRun(
@@ -1323,7 +1493,7 @@ export async function assertPushCapabilityCheckoutValid(input: {
   const cwd = readNonEmptyString(input.cwd);
   if (!cwd) return;
   if (await hasGitPushRemote(cwd)) return;
-  throw new WorkspaceValidationFailure(
+  throw workspaceValidationFailure(
     `Issue ${input.issue.identifier ?? input.issue.id} requested the GitHub PR workflow, but checkout "${cwd}" has no configured push remote. Bind the run to a writable repo checkout before dispatching the agent.`,
     {
       workspaceValidation: {
@@ -1377,7 +1547,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     input.executionWorkspace.strategy === "git_worktree";
 
   const fail = (reason: string, message: string, extra: Record<string, unknown> = {}) => {
-    throw new WorkspaceValidationFailure(message, {
+    throw workspaceValidationFailure(message, {
       workspaceValidation: {
         reason,
         adapterType: input.adapterType,
@@ -1692,9 +1862,10 @@ function appendExcerpt(prev: string, chunk: string) {
 }
 
 function truncateRunEventString(value: string) {
-  if (value.length <= MAX_RUN_EVENT_PAYLOAD_STRING_CHARS) return value;
-  const omittedChars = value.length - MAX_RUN_EVENT_PAYLOAD_STRING_CHARS;
-  return `${value.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
+  const sanitized = sanitizeHeartbeatPersistenceText(value);
+  if (sanitized.length <= MAX_RUN_EVENT_PAYLOAD_STRING_CHARS) return sanitized;
+  const omittedChars = sanitized.length - MAX_RUN_EVENT_PAYLOAD_STRING_CHARS;
+  return `${sanitized.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
 }
 
 function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>): unknown {
@@ -1761,7 +1932,8 @@ function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>
 }
 
 export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, unknown>): Record<string, unknown> {
-  const bounded = boundRunEventValue(payload, 0, new WeakSet());
+  const persistenceSafePayload = sanitizeHeartbeatPersistenceRecord(payload);
+  const bounded = boundRunEventValue(persistenceSafePayload, 0, new WeakSet());
   return parseObject(bounded) ?? { _truncated: true };
 }
 
@@ -1772,7 +1944,9 @@ function redactInlineBase64ImageData(chunk: string) {
 }
 
 export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
+  const normalized = sanitizeHeartbeatPersistenceText(
+    redactSensitiveText(redactInlineBase64ImageData(chunk)),
+  );
   if (normalized.length <= maxChars) return normalized;
 
   const headChars = Math.max(0, Math.floor(maxChars * 0.6));
@@ -2901,7 +3075,7 @@ async function recordWorkspaceConfigFreshnessOperation(input: WorkspaceConfigFre
   } catch (error) {
     logger.warn(
       {
-        err: error instanceof Error ? error.message : String(error),
+        err: sanitizeHeartbeatErrorForLog(error),
         runId: input.runId,
         previousWorkspaceId: input.previousWorkspaceId,
         activeWorkspaceId: input.activeWorkspaceId,
@@ -3994,6 +4168,24 @@ function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
 }
 
+export function heartbeatRunTracksHostLocalChildProcess(input: {
+  adapterType: string;
+  contextSnapshot: unknown;
+}) {
+  if (!isTrackedLocalChildProcessAdapter(input.adapterType)) return false;
+
+  const context = parseObject(input.contextSnapshot);
+  const environment = parseObject(context.paperclipEnvironment);
+  const driver = readNonEmptyString(environment.driver);
+
+  // Local adapters spawn either the adapter process itself or, for SSH
+  // environments, a host-local `ssh` child. Both PIDs live in Paperclip's
+  // process namespace and are safe liveness signals. Sandbox/plugin runners
+  // report provider-owned PIDs, so those must never be probed on this host.
+  // Missing/legacy context remains fail-closed.
+  return driver === "local" || driver === "ssh";
+}
+
 function isHeartbeatRunTerminalStatus(
   status: string | null | undefined,
 ): status is (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number] {
@@ -4586,9 +4778,175 @@ export function resolveNextSessionState(input: {
 
 export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeService>;
 
+export type HeartbeatPostTerminalStep =
+  | "liveness_classification"
+  | "wakeup_finalize"
+  | "run_reload"
+  | "lifecycle_event"
+  | "continuation_summary"
+  | "run_summary_comment"
+  | "retry_scheduling"
+  | "issue_comment_policy"
+  | "issue_execution_release"
+  | "liveness_continuation"
+  | "successful_handoff"
+  | "dependency_wake"
+  | "runtime_state"
+  | "task_session"
+  | "agent_status";
+
+export type HeartbeatRuntimeAccountingFaultPhase =
+  | "before_transaction"
+  | "after_runtime_state"
+  | "after_cost_event"
+  | "after_commit"
+  | "after_budget_evaluation";
+
+type TerminalFinalizationPayload = {
+  version: 1;
+  adapterType: string | null;
+  ledger: {
+    usage: UsageTotals | null;
+    costUsd: number | null;
+    provider: string;
+    biller: string;
+    billingType: BillingType;
+    model: string;
+  } | null;
+  session: {
+    generation: number;
+    taskGeneration: number;
+    legacySessionId: string | null;
+    taskKey: string | null;
+    mode: "upsert" | "clear" | "none";
+    params: Record<string, unknown> | null;
+    displayId: string | null;
+  } | null;
+  completed: Record<string, boolean>;
+};
+
+const TERMINAL_FINALIZATION_PHASES = new Set([
+  "wakeup",
+  "runtime",
+  "taskSession",
+  "agent",
+  "issueExecution",
+]);
+const TERMINAL_LEDGER_INT_MAX = 2_147_483_647;
+
+function parseTerminalFinalizationPayload(value: unknown): TerminalFinalizationPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const payload = value as Record<string, unknown>;
+  if (payload.version !== 1) return null;
+  if (payload.adapterType !== null && typeof payload.adapterType !== "string") return null;
+
+  const completed = payload.completed;
+  if (!completed || typeof completed !== "object" || Array.isArray(completed)) return null;
+  for (const [phase, done] of Object.entries(completed)) {
+    if (!TERMINAL_FINALIZATION_PHASES.has(phase) || typeof done !== "boolean") return null;
+  }
+
+  const ledger = payload.ledger;
+  if (ledger !== null) {
+    if (!ledger || typeof ledger !== "object" || Array.isArray(ledger)) return null;
+    const record = ledger as Record<string, unknown>;
+    if (
+      (record.costUsd !== null && (
+        typeof record.costUsd !== "number" ||
+        !Number.isFinite(record.costUsd) ||
+        record.costUsd < 0 ||
+        !Number.isSafeInteger(Math.round(record.costUsd * 100)) ||
+        Math.round(record.costUsd * 100) > TERMINAL_LEDGER_INT_MAX
+      )) ||
+      typeof record.provider !== "string" ||
+      typeof record.biller !== "string" ||
+      !BILLING_TYPES.includes(record.billingType as BillingType) ||
+      typeof record.model !== "string"
+    ) return null;
+    if (record.usage !== null) {
+      if (!record.usage || typeof record.usage !== "object" || Array.isArray(record.usage)) return null;
+      const usage = record.usage as Record<string, unknown>;
+      if (![usage.inputTokens, usage.cachedInputTokens, usage.outputTokens].every((count) =>
+        typeof count === "number" && Number.isInteger(count) && count >= 0 && count <= TERMINAL_LEDGER_INT_MAX
+      )) return null;
+    }
+  }
+
+  const session = payload.session;
+  if (session !== null) {
+    if (!session || typeof session !== "object" || Array.isArray(session)) return null;
+    const record = session as Record<string, unknown>;
+    if (
+      typeof record.generation !== "number" ||
+      !Number.isSafeInteger(record.generation) ||
+      record.generation < 0 ||
+      typeof record.taskGeneration !== "number" ||
+      !Number.isSafeInteger(record.taskGeneration) ||
+      record.taskGeneration < 0 ||
+      (record.legacySessionId !== null && typeof record.legacySessionId !== "string") ||
+      (record.taskKey !== null && typeof record.taskKey !== "string") ||
+      !["upsert", "clear", "none"].includes(String(record.mode)) ||
+      (record.params !== null && (!record.params || typeof record.params !== "object" || Array.isArray(record.params))) ||
+      (record.displayId !== null && typeof record.displayId !== "string")
+    ) return null;
+  }
+
+  return value as TerminalFinalizationPayload;
+}
+
+const heartbeatLogFlushers = new Map<string, () => Promise<void>>();
+
+function emptyTerminalFinalizationPayload(): TerminalFinalizationPayload {
+  // Absence of measured usage is not evidence of zero usage. Cancellation and
+  // setup failures still require durable ownership cleanup, but must not invent
+  // accounting entries for an adapter result that never reached this process.
+  return { version: 1, adapterType: null, ledger: null, session: null, completed: {} };
+}
+
+function buildTerminalFinalizationPayload(input: {
+  adapterType: string;
+  result: AdapterExecutionResult;
+  usage?: UsageTotals | null;
+  session: NonNullable<TerminalFinalizationPayload["session"]>;
+}): TerminalFinalizationPayload {
+  // Explicit projection: never retain adapter result/context/diagnostic objects
+  // or executable codec behavior in the recovery journal. Sanitize the final
+  // serialized session too, including values produced by adapter codecs.
+  return sanitizeHeartbeatPersistenceRecord({
+    version: 1,
+    adapterType: input.adapterType,
+    ledger: {
+      usage: input.usage ?? normalizeUsageTotals(input.result.usage),
+      costUsd: input.result.costUsd ?? null,
+      provider: input.result.provider ?? "unknown",
+      biller: resolveLedgerBiller(input.result),
+      billingType: normalizeLedgerBillingType(input.result.billingType),
+      model: input.result.model ?? "unknown",
+    },
+    session: input.session,
+    completed: {},
+  }) as TerminalFinalizationPayload;
+}
+
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  /** @internal Deterministic fault injection for post-terminal recovery tests. */
+  postTerminalStepFaultInjector?: (input: {
+    runId: string;
+    step: HeartbeatPostTerminalStep;
+    attempt: number;
+  }) => void | Promise<void>;
+  /** @internal Deterministic fault injection around the runtime accounting transaction. */
+  runtimeAccountingFaultInjector?: (input: {
+    runId: string;
+    phase: HeartbeatRuntimeAccountingFaultPhase;
+  }) => void | Promise<void>;
+  /** @internal Simulates loss of the service instance, not a retriable step error. */
+  deferTerminalFinalization?: (input: {
+    runId: string;
+    phase: "after_terminal_commit" | "after_accounting_commit";
+  }) => boolean | Promise<boolean>;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -4614,7 +4972,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const workspaceOperationsSvc = workspaceOperationService(db);
   const liveRunExecutions = {
     has(id: string) {
-      return runningProcesses.has(id) || activeRunExecutions.has(id);
+      return isHeartbeatRunTrackedInMemory(id);
     },
   };
   const budgetHooks = {
@@ -4625,6 +4983,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   const taskWatchdogs = taskWatchdogService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
+
+  async function settlePostTerminalStep<T>(input: {
+    runId: string;
+    step: HeartbeatPostTerminalStep;
+    operation: () => Promise<T>;
+    fallback: T;
+    attempts?: number;
+  }): Promise<T> {
+    const attempts = Math.max(1, Math.trunc(input.attempts ?? 1));
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await options.postTerminalStepFaultInjector?.({
+          runId: input.runId,
+          step: input.step,
+          attempt,
+        });
+        return await input.operation();
+      } catch (err) {
+        logger.warn(
+          {
+            err: sanitizeHeartbeatErrorForLog(err),
+            runId: input.runId,
+            step: input.step,
+            attempt,
+            attempts,
+          },
+          "post-terminal heartbeat step failed; continuing finalization",
+        );
+      }
+    }
+    return input.fallback;
+  }
 
   async function releaseEnvironmentLeasesForRun(input: {
     runId: string;
@@ -4640,12 +5030,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       status: leaseReleaseStatusForRunStatus(input.status),
       failureReason: input.failureReason ?? undefined,
     }).catch((err) => {
-      logger.warn({ err, runId: input.runId }, "failed to release environment leases for heartbeat run");
+      logger.warn(
+        { err: sanitizeHeartbeatErrorForLog(err), runId: input.runId },
+        "failed to release environment leases for heartbeat run",
+      );
       return null;
     });
     for (const releaseError of releaseResult?.errors ?? []) {
       logger.warn(
-        { err: releaseError.error, leaseId: releaseError.leaseId, runId: input.runId },
+        {
+          err: sanitizeHeartbeatErrorForLog(releaseError.error),
+          leaseId: releaseError.leaseId,
+          runId: input.runId,
+        },
         "failed to release environment lease for heartbeat run",
       );
     }
@@ -4663,7 +5060,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return typeof serverEncoding === "string" && serverEncoding.toUpperCase() === "SQL_ASCII";
         })
         .catch((err) => {
-          logger.warn({ err }, "failed to inspect database server encoding; using conservative heartbeat result projection");
+          logger.warn(
+            { err: sanitizeHeartbeatErrorForLog(err) },
+            "failed to inspect database server encoding; using conservative heartbeat result projection",
+          );
           return true;
         });
     }
@@ -5581,7 +5981,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
       } catch (err) {
-        logger.error({ err, issueId: claimed.id }, "issue monitor tick failed");
+        logger.error(
+          { err: sanitizeHeartbeatErrorForLog(err), issueId: claimed.id },
+          "issue monitor tick failed",
+        );
       }
     }
 
@@ -6141,39 +6544,64 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return ensured;
   }
 
+  function sanitizeHeartbeatRunPatch(
+    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+  ): Partial<typeof heartbeatRuns.$inferInsert> | undefined {
+    if (!patch) return patch;
+    const sanitized = { ...patch };
+    for (const [key, value] of Object.entries(sanitized)) {
+      if (typeof value === "string") {
+        (sanitized as Record<string, unknown>)[key] = sanitizeHeartbeatPersistenceText(value);
+      }
+    }
+    for (const key of ["usageJson", "resultJson", "contextSnapshot", "terminalFinalizationJson"] as const) {
+      const value = sanitized[key];
+      if (value !== null && value !== undefined) {
+        sanitized[key] = sanitizeHeartbeatPersistenceRecord(value);
+      }
+    }
+    return sanitized;
+  }
+
+  function sanitizeWakeupPatch(
+    patch: Partial<typeof agentWakeupRequests.$inferInsert> | undefined,
+  ): Partial<typeof agentWakeupRequests.$inferInsert> | undefined {
+    if (!patch) return patch;
+    const sanitized = { ...patch };
+    for (const [key, value] of Object.entries(sanitized)) {
+      if (typeof value === "string") {
+        (sanitized as Record<string, unknown>)[key] = sanitizeHeartbeatPersistenceText(value);
+      }
+    }
+    if (sanitized.payload !== null && sanitized.payload !== undefined) {
+      sanitized.payload = sanitizeHeartbeatPersistenceRecord(sanitized.payload);
+    }
+    return sanitized;
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    opts?: { expectedStatuses?: readonly string[] },
   ) {
+    const sanitizedPatch = sanitizeHeartbeatRunPatch(isHeartbeatRunTerminalStatus(status)
+      ? { ...patch, terminalFinalizationJson: patch?.terminalFinalizationJson ?? emptyTerminalFinalizationPayload() }
+      : patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, runId))
+      .set({ status, ...sanitizedPatch,
+        ...(isHeartbeatRunTerminalStatus(status) ? {
+          terminalFinalizationJson: sql`case when ${heartbeatRuns.status} in ('succeeded','failed','cancelled','timed_out')
+            then ${heartbeatRuns.terminalFinalizationJson}
+            else coalesce(${heartbeatRuns.terminalFinalizationJson}, ${JSON.stringify(sanitizedPatch?.terminalFinalizationJson)}::jsonb) end`,
+        } : {}), updatedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, runId),
+        ...(opts?.expectedStatuses ? [inArray(heartbeatRuns.status, [...opts.expectedStatuses])] : [])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
-    if (updated) {
-      if (isHeartbeatRunTerminalStatus(updated.status)) {
-        clearHeartbeatRunRuntimeStatus(updated.id);
-      }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: {
-          runId: updated.id,
-          agentId: updated.agentId,
-          status: updated.status,
-          invocationSource: updated.invocationSource,
-          triggerDetail: updated.triggerDetail,
-          error: updated.error ?? null,
-          errorCode: updated.errorCode ?? null,
-          startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
-          finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
-        },
-      });
-      publishRunLifecyclePluginEvent(updated);
-    }
+    if (updated) publishRunStatusUpdate(updated);
 
     return updated;
   }
@@ -6182,10 +6610,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    options: { publish?: boolean } = {},
   ) {
+    const sanitizedPatch = sanitizeHeartbeatRunPatch(isHeartbeatRunTerminalStatus(status)
+      ? { ...patch, terminalFinalizationJson: patch?.terminalFinalizationJson ?? emptyTerminalFinalizationPayload() }
+      : patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch,
+        ...(isHeartbeatRunTerminalStatus(status) ? {
+          terminalFinalizationJson: sql`coalesce(${heartbeatRuns.terminalFinalizationJson}, ${JSON.stringify(sanitizedPatch?.terminalFinalizationJson)}::jsonb)`,
+        } : {}), updatedAt: new Date() })
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -6194,22 +6629,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (isHeartbeatRunTerminalStatus(updated.status)) {
         clearHeartbeatRunRuntimeStatus(updated.id);
       }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: {
-          runId: updated.id,
-          agentId: updated.agentId,
-          status: updated.status,
-          invocationSource: updated.invocationSource,
-          triggerDetail: updated.triggerDetail,
-          error: updated.error ?? null,
-          errorCode: updated.errorCode ?? null,
-          startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
-          finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
-        },
-      });
-      publishRunLifecyclePluginEvent(updated);
+      if (options.publish !== false) publishRunStatusUpdate(updated);
       return { run: updated, updated: true as const };
     }
 
@@ -6220,6 +6640,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
 
     return { run: current, updated: false as const };
+  }
+
+  async function setTerminalRunStatusIfRunning(
+    runId: string,
+    status: "succeeded" | "failed" | "cancelled" | "timed_out",
+    patch: Partial<typeof heartbeatRuns.$inferInsert>,
+  ) {
+    let persisted: Awaited<ReturnType<typeof setRunStatusIfRunning>>;
+    try {
+      persisted = await setRunStatusIfRunning(runId, status, patch, { publish: false });
+    } catch {
+      logger.warn(
+        { runId, status },
+        "primary terminal heartbeat persistence failed; retrying with bounded sanitized fallback",
+      );
+      const safeError = typeof patch.error === "string"
+        ? sanitizeHeartbeatPersistenceText(patch.error)
+        : null;
+      persisted = await setRunStatusIfRunning(runId, status, {
+        terminalFinalizationJson: patch.terminalFinalizationJson ?? emptyTerminalFinalizationPayload(),
+        finishedAt: patch.finishedAt instanceof Date ? patch.finishedAt : new Date(),
+        error: status === "succeeded" ? null : safeError,
+        errorCode: typeof patch.errorCode === "string"
+          ? sanitizeHeartbeatPersistenceText(patch.errorCode)
+          : status === "succeeded" ? null : "terminal_persistence_fallback",
+        exitCode: normalizeHeartbeatExitCodeForPersistence(patch.exitCode),
+        signal: typeof patch.signal === "string"
+          ? sanitizeHeartbeatPersistenceText(patch.signal)
+          : null,
+        resultJson: {
+          persistenceFallback: true,
+          originalTerminalStatus: status,
+        },
+        stdoutExcerpt: null,
+        stderrExcerpt: null,
+      }, { publish: false });
+    }
+
+    if (persisted.updated && persisted.run) {
+      try {
+        publishRunStatusUpdate(persisted.run);
+      } catch (err) {
+        logger.warn(
+          { err: sanitizeHeartbeatErrorForLog(err), runId, status },
+          "best-effort terminal heartbeat publication failed after persisted CAS",
+        );
+      }
+    }
+    return persisted;
+  }
+
+  function publishRunStatusUpdate(run: typeof heartbeatRuns.$inferSelect) {
+    if (isHeartbeatRunTerminalStatus(run.status)) {
+      clearHeartbeatRunRuntimeStatus(run.id);
+    }
+    publishLiveEvent({
+      companyId: run.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: run.id,
+        agentId: run.agentId,
+        status: run.status,
+        invocationSource: run.invocationSource,
+        triggerDetail: run.triggerDetail,
+        error: run.error ?? null,
+        errorCode: run.errorCode ?? null,
+        startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+        finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
+      },
+    });
+    publishRunLifecyclePluginEvent(run);
   }
 
   function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
@@ -6266,9 +6757,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch?: Partial<typeof agentWakeupRequests.$inferInsert>,
   ) {
     if (!wakeupRequestId) return;
+    const sanitizedPatch = sanitizeWakeupPatch(patch);
     await db
       .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
@@ -6737,7 +7229,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+      ? sanitizeHeartbeatPersistenceText(
+          redactCurrentUserText(event.message, currentUserRedactionOptions),
+        )
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)
@@ -6911,7 +7405,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } catch (err) {
       logger.warn(
         {
-          err,
+          err: sanitizeHeartbeatErrorForLog(err),
           runId: run.id,
           issueId,
           agentId: agent.id,
@@ -8413,7 +8907,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutSource: "heartbeat_daily_cap_gate",
         timeoutFired: false,
       },
-    });
+    }, { expectedStatuses: ["queued"] });
     if (!cancelled) return null;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
@@ -8608,16 +9102,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const claimedAt = new Date();
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimed = await db.transaction(async (tx) => {
+      await lockAgentTerminalState(tx as unknown as Db, run.agentId);
+      return tx.update(heartbeatRuns).set({
+        status: "running", startedAt: run.startedAt ?? claimedAt, updatedAt: claimedAt,
+      }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
+        sql`exists (select 1 from agents start_agent where start_agent.id = ${run.agentId}
+          and start_agent.status not in ('paused','terminated','pending_approval'))`,
+      )).returning().then((rows) => rows[0] ?? null);
+    });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -8689,7 +9182,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutSource: "dependency_gate",
         timeoutFired: false,
       },
-    });
+    }, { expectedStatuses: ["queued"] });
     if (!cancelled) return null;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
@@ -8895,7 +9388,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutSource: "stale_queued_run_gate",
         timeoutFired: false,
       },
-    });
+    }, { expectedStatuses: ["queued"] });
     if (!cancelled) return null;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
@@ -9212,7 +9705,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: {
+    staleThresholdMs?: number;
+    activeExecutionDeadProcessGraceMs?: number;
+  }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -9230,16 +9726,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const tracksLocalChild = heartbeatRunTracksHostLocalChildProcess({
+        adapterType,
+        contextSnapshot: run.contextSnapshot,
+      });
+      const hasRecordedProcessPid =
+        tracksLocalChild &&
+        typeof run.processPid === "number" &&
+        Number.isInteger(run.processPid) &&
+        run.processPid > 0;
+      const processPidAlive = hasRecordedProcessPid && isProcessAlive(run.processPid);
+      const trackedInMemory = isHeartbeatRunTrackedInMemory(run.id);
+      const adapterExecutionInMemory = activeRunExecutions.has(run.id);
+      const deadTrackedChildCandidate = trackedInMemory &&
+        tracksLocalChild &&
+        typeof run.processPid === "number" &&
+        Number.isInteger(run.processPid) &&
+        run.processPid > 0 &&
+        !processPidAlive;
+      let deadProcessObservedForMs = 0;
+      if (deadTrackedChildCandidate) {
+        const recordedPid = run.processPid as number;
+        const previousObservation = deadLocalProcessFirstObservedAt.get(run.id);
+        const firstObservedAt = previousObservation?.pid === recordedPid
+          ? previousObservation.firstObservedAt
+          : now.getTime();
+        deadLocalProcessFirstObservedAt.set(run.id, {
+          pid: recordedPid,
+          firstObservedAt,
+        });
+        deadProcessObservedForMs = Math.max(0, now.getTime() - firstObservedAt);
+      } else {
+        deadLocalProcessFirstObservedAt.delete(run.id);
+      }
+      // A stale ChildProcess handle alone is not proof of life. Once no live
+      // executeRun owns the run and the persisted local child pid is gone,
+      // bypass the remaining in-memory/age gates so coalesced wakes cannot
+      // keep refreshing updatedAt and make the dead run immortal.
+      const trackedDeadLocalProcess = isTrackedDeadLocalProcess({
+        trackedInMemory,
+        adapterExecutionInMemory,
+        tracksLocalChild,
+        processPid: run.processPid,
+        processPidAlive,
+        deadProcessObservedForMs,
+        activeExecutionDeadProcessGraceMs: opts?.activeExecutionDeadProcessGraceMs,
+      });
+      if (trackedInMemory && !trackedDeadLocalProcess) continue;
 
       // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      if (staleThresholdMs > 0 && !trackedDeadLocalProcess) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
@@ -9275,7 +9815,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -9289,6 +9829,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
         ),
       });
+      if (!finalizedRunWrite.updated) {
+        // The live execution won the terminalization race. Its persisted
+        // outcome is authoritative, but stale handles are still safe to drop.
+        runningProcesses.delete(run.id);
+        activeRunExecutions.delete(run.id);
+        deadLocalProcessFirstObservedAt.delete(run.id);
+        continue;
+      }
+      let finalizedRun = finalizedRunWrite.run;
+      runningProcesses.delete(run.id);
+      activeRunExecutions.delete(run.id);
+      deadLocalProcessFirstObservedAt.delete(run.id);
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -9331,7 +9883,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(run.agentId, "failed", baseMessage);
       await startNextQueuedRunForAgent(run.agentId);
-      runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
 
@@ -9412,6 +9963,224 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileIssueGraphLiveness(opts);
   }
 
+  function noNewerStartedRun(run: typeof heartbeatRuns.$inferSelect) {
+    const runStartedAt = (run.startedAt ?? run.createdAt).toISOString();
+    const runCreatedAt = run.createdAt.toISOString();
+    return sql`not exists (
+      select 1 from heartbeat_runs newer
+      where newer.company_id = ${run.companyId} and newer.agent_id = ${run.agentId}
+        and newer.started_at is not null and newer.id <> ${run.id}
+        and (newer.started_at, newer.created_at, newer.id) >
+          (${runStartedAt}::timestamptz, ${runCreatedAt}::timestamptz, ${run.id}::uuid)
+    )`;
+  }
+
+  async function claimTerminalPhase(tx: Db, runId: string, phase: string) {
+    const owner = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    if (!owner) return false;
+    await lockAgentTerminalState(tx, owner.agentId);
+    const claimed = await tx.update(heartbeatRuns).set({
+      terminalFinalizationJson: sql`jsonb_set(${heartbeatRuns.terminalFinalizationJson}, '{completed}',
+        coalesce(${heartbeatRuns.terminalFinalizationJson}->'completed', '{}'::jsonb) || jsonb_build_object(${phase}::text, true))`,
+    }).where(and(
+      eq(heartbeatRuns.id, runId),
+      isNull(heartbeatRuns.terminalFinalizedAt),
+      sql`${heartbeatRuns.terminalFinalizationJson}->>'version' = '1'`,
+      sql`${heartbeatRuns.terminalFinalizationJson}->'completed'->>${phase} is distinct from 'true'`,
+    )).returning({ id: heartbeatRuns.id });
+    return claimed.length > 0;
+  }
+
+  async function lockAgentTerminalState(tx: Db, agentId: string) {
+    // Serialize run-start visibility, session resets and terminal projections
+    // across server instances. Unlike a long-lived lease, this lock disappears
+    // automatically on rollback/disconnection and is never held across hooks.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-terminal:${agentId}`}, 0))`);
+  }
+
+  async function finalizeDurableWakeup(run: typeof heartbeatRuns.$inferSelect) {
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "wakeup")) return;
+      if (!run.wakeupRequestId) return;
+      await tx.update(agentWakeupRequests).set({
+        status: run.status === "succeeded" ? "completed" : run.status,
+        finishedAt: run.finishedAt,
+        error: run.error,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, run.companyId),
+        or(eq(agentWakeupRequests.runId, run.id), isNull(agentWakeupRequests.runId)),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "running"]),
+      ));
+    });
+  }
+
+  async function finalizeDurableTaskSession(run: typeof heartbeatRuns.$inferSelect, payload: TerminalFinalizationPayload) {
+    const runStartedAt = (run.startedAt ?? run.createdAt).toISOString();
+    const runCreatedAt = run.createdAt.toISOString();
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "taskSession")) return;
+      const session = payload.session;
+      if (!session?.taskKey || session.mode === "none" || !payload.adapterType) return;
+      // The same runtime-row lock is used by global and task-specific resets.
+      // A reset during execute invalidates the generation captured before it.
+      const runtime = await tx.select().from(agentRuntimeState)
+        .where(and(eq(agentRuntimeState.agentId, run.agentId), eq(agentRuntimeState.companyId, run.companyId)))
+        .for("no key update").then((rows) => rows[0] ?? null);
+      if (!runtime || runtime.sessionGeneration !== session.generation) return;
+      const patch = {
+        sessionParamsJson: session.mode === "clear" ? null : session.params,
+        sessionDisplayId: session.mode === "clear" ? null : session.displayId,
+        lastRunId: run.id,
+        lastError: run.status === "succeeded" ? null : run.error,
+        updatedAt: new Date(),
+      };
+      // A clear is a tombstone, not a DELETE: lastRunId/generation must survive
+      // so an older pending finalizer cannot resurrect the cleared session.
+      await tx.insert(agentTaskSessions).values({
+        companyId: run.companyId, agentId: run.agentId, adapterType: payload.adapterType,
+        taskKey: session.taskKey, sessionGeneration: session.taskGeneration, ...patch,
+      }).onConflictDoUpdate({
+        target: [agentTaskSessions.companyId, agentTaskSessions.agentId, agentTaskSessions.adapterType, agentTaskSessions.taskKey],
+        set: patch,
+        setWhere: and(
+          eq(agentTaskSessions.sessionGeneration, session.taskGeneration),
+          sql`not exists (select 1 from heartbeat_runs prior
+            where prior.id = ${agentTaskSessions.lastRunId}
+              and (coalesce(prior.started_at, prior.created_at), prior.created_at, prior.id) >
+                (${runStartedAt}::timestamptz, ${runCreatedAt}::timestamptz, ${run.id}::uuid))`,
+        ),
+      });
+    });
+  }
+
+  async function finalizeDurableRuntime(run: typeof heartbeatRuns.$inferSelect, payload: TerminalFinalizationPayload) {
+    const runStartedAt = (run.startedAt ?? run.createdAt).toISOString();
+    const runCreatedAt = run.createdAt.toISOString();
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "runtime")) return;
+      const session = payload.session;
+      await tx.update(agentRuntimeState).set({
+        ...(payload.adapterType ? { adapterType: payload.adapterType } : {}),
+        ...(session ? { sessionId: session.legacySessionId } : {}),
+        lastRunId: run.id, lastRunStatus: run.status, lastError: run.error, updatedAt: new Date(),
+      }).where(and(
+        eq(agentRuntimeState.agentId, run.agentId), eq(agentRuntimeState.companyId, run.companyId),
+        noNewerStartedRun(run),
+        session ? eq(agentRuntimeState.sessionGeneration, session.generation) : sql`true`,
+        session?.taskKey ? sql`not exists (select 1 from agent_task_sessions reset_session
+          where reset_session.company_id = ${run.companyId} and reset_session.agent_id = ${run.agentId}
+            and reset_session.adapter_type = ${payload.adapterType}
+            and reset_session.task_key = ${session.taskKey}
+            and reset_session.session_generation <> ${session.taskGeneration})` : sql`true`,
+        sql`not exists (select 1 from heartbeat_runs prior where prior.id = ${agentRuntimeState.lastRunId}
+          and (coalesce(prior.started_at, prior.created_at), prior.created_at, prior.id) >
+            (${runStartedAt}::timestamptz, ${runCreatedAt}::timestamptz, ${run.id}::uuid))`,
+      ));
+    });
+  }
+
+  async function finalizeDurableAgent(run: typeof heartbeatRuns.$inferSelect) {
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      if (!await claimTerminalPhase(tx, run.id, "agent")) return;
+      const anyRunning = sql`exists (select 1 from heartbeat_runs active
+        where active.company_id = ${run.companyId} and active.agent_id = ${run.agentId} and active.status = 'running')`;
+      const failure = run.status === "failed" || run.status === "timed_out";
+      await tx.update(agents).set({
+        status: sql`case when ${anyRunning} then 'running' else ${failure ? "error" : "idle"} end`,
+        errorReason: sql`case when ${anyRunning} then null else ${failure ? truncateAgentErrorReason(run.error) : null} end`,
+        lastHeartbeatAt: run.finishedAt ?? new Date(),
+        updatedAt: new Date(),
+      }).where(and(
+        eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
+        notInArray(agents.status, ["paused", "terminated", "pending_approval"]),
+        noNewerStartedRun(run),
+      ));
+    });
+  }
+
+  async function reconcileTerminalFinalization(runId: string, opts?: { deferIssueRelease?: boolean }): Promise<boolean> {
+    let run = await getRun(runId);
+    if (!run || !isHeartbeatRunTerminalStatus(run.status) || run.terminalFinalizedAt) return true;
+    const payload = parseTerminalFinalizationPayload(run.terminalFinalizationJson);
+    if (!payload) {
+      logger.warn(
+        { runId: run.id, terminalFinalizationVersion: parseObject(run.terminalFinalizationJson).version ?? null },
+        "invalid or unsupported durable terminal finalization payload; recovery remains pending",
+      );
+      return false;
+    }
+    const agent = await getAgent(run.agentId);
+    if (agent) await ensureRuntimeState(agent);
+    if (agent && payload.ledger) {
+      const ledger = payload.ledger;
+      const completed = await updateRuntimeState(agent, run, {
+        exitCode: run.exitCode, signal: run.signal, timedOut: run.status === "timed_out",
+        provider: ledger.provider, biller: ledger.biller, model: ledger.model,
+        billingType: ledger.billingType, costUsd: ledger.costUsd ?? undefined,
+        errorMessage: run.error ?? undefined,
+      }, { legacySessionId: payload.session?.legacySessionId ?? null }, ledger.usage);
+      if (!completed) return false;
+    } else if (!run.budgetEnforcedAt) {
+      // No measured ledger payload: do not fabricate usage or re-account legacy
+      // rows. A known event, if any, still has to finish its enforcement phase.
+      const events = await db.select().from(costEvents).where(and(
+        eq(costEvents.companyId, run.companyId), eq(costEvents.heartbeatRunId, run.id),
+      ));
+      for (const event of events) await budgets.evaluateCostEvent(event);
+      await db.update(heartbeatRuns).set({ budgetEnforcedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    }
+    await finalizeDurableWakeup(run);
+    await finalizeDurableRuntime(run, payload);
+    await finalizeDurableTaskSession(run, payload);
+    await finalizeDurableAgent(run);
+    if (opts?.deferIssueRelease) return true;
+    // Never promote more work until accounting/enforcement and session state
+    // are durable. The release transaction marks its own phase atomically.
+    await releaseIssueExecutionAndPromote(run, { durableFinalization: true });
+    await db.update(heartbeatRuns).set({ terminalFinalizedAt: new Date() }).where(and(
+      eq(heartbeatRuns.id, run.id), isNotNull(heartbeatRuns.budgetEnforcedAt),
+      sql`${heartbeatRuns.terminalFinalizationJson}->'completed' @> '{"wakeup":true,"runtime":true,"taskSession":true,"agent":true,"issueExecution":true}'::jsonb`,
+    ));
+    run = await getRun(run.id);
+    return Boolean(run?.terminalFinalizedAt);
+  }
+
+  async function shouldDeferDurableTerminal(runId: string) {
+    return await options.deferTerminalFinalization?.({ runId, phase: "after_terminal_commit" }) === true;
+  }
+
+  let terminalRecoveryInFlight: Promise<{ completed: number; pending: number }> | null = null;
+  async function reconcileTerminalRuns(opts?: { limit?: number }) {
+    if (terminalRecoveryInFlight) return terminalRecoveryInFlight;
+    const operation = (async () => {
+      const pending = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        isNotNull(heartbeatRuns.terminalFinalizationJson), isNull(heartbeatRuns.terminalFinalizedAt),
+        inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out"]),
+      )).orderBy(sql`${heartbeatRuns.terminalFinalizationAttemptedAt} asc nulls first`, asc(heartbeatRuns.id))
+        .limit(Math.max(1, Math.min(opts?.limit ?? 100, 1000)));
+      let completed = 0;
+      for (const run of pending) {
+        try {
+          await db.update(heartbeatRuns).set({ terminalFinalizationAttemptedAt: new Date() })
+            .where(eq(heartbeatRuns.id, run.id));
+          if (await reconcileTerminalFinalization(run.id)) completed += 1;
+        } catch (err) {
+          logger.warn({ runId: run.id, err: sanitizeHeartbeatErrorForLog(err) }, "durable terminal heartbeat recovery remains pending");
+        }
+      }
+      return { completed, pending: pending.length - completed };
+    })();
+    terminalRecoveryInFlight = operation;
+    try { return await operation; } finally { if (terminalRecoveryInFlight === operation) terminalRecoveryInFlight = null; }
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -9431,40 +10200,123 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const biller = resolveLedgerBiller(result);
     const ledgerScope = await resolveLedgerScopeForRun(db, agent.companyId, run);
 
-    await db
-      .update(agentRuntimeState)
-      .set({
-        adapterType: agent.adapterType,
-        sessionId: session.legacySessionId,
-        lastRunId: run.id,
-        lastRunStatus: run.status,
-        lastError: result.errorMessage ?? null,
-        totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
-        totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
-        totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
-        totalCostCents: sql`${agentRuntimeState.totalCostCents} + ${additionalCostCents}`,
-        updatedAt: new Date(),
-      })
-      .where(eq(agentRuntimeState.agentId, agent.id));
+    await options.runtimeAccountingFaultInjector?.({
+      runId: run.id,
+      phase: "before_transaction",
+    });
+    const accounting = await db.transaction(async (tx) => {
+      const accountedAt = new Date();
+      const claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          runtimeAccountedAt: accountedAt,
+          updatedAt: accountedAt,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          isNull(heartbeatRuns.runtimeAccountedAt),
+        ))
+        .returning({ id: heartbeatRuns.id })
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) {
+        return {
+          applied: false as const,
+          costEvent: null as typeof costEvents.$inferSelect | null,
+        };
+      }
 
-    if (additionalCostCents > 0 || hasTokenUsage) {
-      const costs = costService(db, budgetHooks);
-      await costs.createEvent(agent.companyId, {
-        heartbeatRunId: run.id,
-        agentId: agent.id,
-        issueId: ledgerScope.issueId,
-        projectId: ledgerScope.projectId,
-        provider,
-        biller,
-        billingType,
-        model: result.model ?? "unknown",
-        inputTokens,
-        cachedInputTokens,
-        outputTokens,
-        costCents: additionalCostCents,
-        occurredAt: new Date(),
+      const runtimeUpdated = await tx
+        .update(agentRuntimeState)
+        .set({
+          totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
+          totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
+          totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
+          totalCostCents: sql`${agentRuntimeState.totalCostCents} + ${additionalCostCents}`,
+          updatedAt: accountedAt,
+        })
+        .where(eq(agentRuntimeState.agentId, agent.id))
+        .returning({ agentId: agentRuntimeState.agentId })
+        .then((rows) => rows[0] ?? null);
+      if (!runtimeUpdated) {
+        throw new Error(`Runtime state disappeared while accounting run ${run.id}`);
+      }
+
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_runtime_state",
+      });
+
+      let costEvent: typeof costEvents.$inferSelect | null = null;
+      if (additionalCostCents > 0 || hasTokenUsage) {
+        // Keep database accounting atomic, but defer budget evaluation and its
+        // process-cancellation hooks until after commit so an aborted
+        // transaction cannot leak an irreversible side effect.
+        const costs = costService(tx as unknown as Db);
+        costEvent = await costs.createEvent(agent.companyId, {
+          heartbeatRunId: run.id,
+          agentId: agent.id,
+          issueId: ledgerScope.issueId,
+          projectId: ledgerScope.projectId,
+          provider,
+          biller,
+          billingType,
+          model: result.model ?? "unknown",
+          inputTokens,
+          cachedInputTokens,
+          outputTokens,
+          costCents: additionalCostCents,
+          occurredAt: run.finishedAt ?? run.startedAt ?? run.createdAt,
+        }, { evaluateBudgets: false });
+      }
+
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_cost_event",
+      });
+      return { applied: true as const, costEvent };
+    });
+
+    if (accounting.applied) {
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_commit",
       });
     }
+
+    if (await options.deferTerminalFinalization?.({ runId: run.id, phase: "after_accounting_commit" })) {
+      return false;
+    }
+    const budgetAlreadyEnforced = await db.select({ at: heartbeatRuns.budgetEnforcedAt }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id)).then((rows) => Boolean(rows[0]?.at));
+    if (budgetAlreadyEnforced) return true;
+
+    // A retry after an ambiguous post-commit failure no longer owns the claim,
+    // so reload its event and finish the recoverable budget-enforcement phase.
+    // evaluateCostEvent is idempotent for persisted incidents/logs, while its
+    // cancellation hook safely converges already-cancelled work.
+    const persistedCostEvent = accounting.costEvent ?? (
+      additionalCostCents > 0 || hasTokenUsage
+        ? await db
+          .select()
+          .from(costEvents)
+          .where(and(
+            eq(costEvents.companyId, agent.companyId),
+            eq(costEvents.heartbeatRunId, run.id),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+        : null
+    );
+    if (persistedCostEvent) {
+      await budgets.evaluateCostEvent(persistedCostEvent);
+      await options.runtimeAccountingFaultInjector?.({
+        runId: run.id,
+        phase: "after_budget_evaluation",
+      });
+    }
+    await db.update(heartbeatRuns).set({ budgetEnforcedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, run.id), isNull(heartbeatRuns.budgetEnforcedAt)));
+    return true;
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
@@ -9538,7 +10390,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       for (const claimedRun of claimedRuns) {
         void executeRun(claimedRun.id).catch((err) => {
-          logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+          logger.error(
+            { err: sanitizeHeartbeatErrorForLog(err), runId: claimedRun.id },
+            "queued heartbeat execution failed",
+          );
         });
       }
       return claimedRuns;
@@ -9568,7 +10423,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         error: "Agent not found",
         errorCode: "agent_not_found",
         finishedAt: new Date(),
-      });
+      }, { expectedStatuses: ["running"] });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
         error: "Agent not found",
@@ -9896,9 +10751,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               'PAPERCLIP_EXECUTION_MODE bootstrap env is not kubernetes-forced (absent or "any")';
           }
         } catch (err) {
-          bootstrapSkipReason = `PAPERCLIP_EXECUTION_MODE bootstrap env failed to parse: ${
-            err instanceof Error ? err.message : String(err)
-          }`;
+          bootstrapSkipReason =
+            "PAPERCLIP_EXECUTION_MODE bootstrap env failed to parse; raw diagnostic omitted";
         }
         if (bootstrap) {
           await environmentsSvc.ensureKubernetesEnvironment(
@@ -9955,7 +10809,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       profileResolutionFallbackReason = "adapter_profile_resolution_failed";
       logger.warn(
         {
-          err: error,
+          err: sanitizeHeartbeatErrorForLog(error),
           companyId: agent.companyId,
           agentId: agent.id,
           adapterType: agent.adapterType,
@@ -10386,7 +11240,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               runId: run.id,
               issueId,
               executionWorkspaceCwd: executionWorkspace.cwd,
-              cleanupError: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+              err: sanitizeHeartbeatErrorForLog(cleanupError),
             },
             "Failed to cleanup realized execution workspace after persistence failure",
           );
@@ -10446,7 +11300,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: context,
+          contextSnapshot: sanitizeHeartbeatPersistenceRecord(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -10537,7 +11391,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: sanitizeHeartbeatPersistenceRecord(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
@@ -10694,8 +11548,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let seq = 1;
     let handle: RunLogHandle | null = null;
+    let terminalOutcomePersisted: RunSessionOutcome | null = null;
+    let reconcilePersistedTerminalSideEffects: (() => Promise<void>) | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
+    let flushAdapterLogs: () => Promise<void> = async () => {};
     let outputSeq = Number(run.lastOutputSeq ?? 0);
     let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
     let lastLogRuntimeStatusTouchMs = 0;
@@ -10736,7 +11593,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-          contextSnapshot: context,
+          contextSnapshot: sanitizeHeartbeatPersistenceRecord(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))
@@ -10770,7 +11627,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               errorMessage: abortReason,
             }),
           } : {}),
-        });
+        }, { expectedStatuses: ["running"] });
         await setWakeupStatus(run.wakeupRequestId, "cancelled", {
           finishedAt: new Date(),
           error: abortReason,
@@ -10813,18 +11670,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-      const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
-        );
-        if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
-        if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
+      const streamRedactor = createHeartbeatStreamRedactor({
+        redactAdditionalText: (safeText) => compactRunLogChunk(redactCurrentUserText(safeText, currentUserRedactionOptions)),
+      });
+      let logWriteChain: Promise<void> = Promise.resolve();
+      const emitSafeLog = async (safeStream: "stdout" | "stderr", sanitizedChunk: string) => {
+        if (safeStream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
+        if (safeStream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         const ts = new Date().toISOString();
 
         let appendedBytes = 0;
         if (handle) {
           appendedBytes = await runLogStore.append(handle, {
-            stream,
+            stream: safeStream,
             chunk: sanitizedChunk,
             ts,
           });
@@ -10834,7 +11692,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outputProgressState.pending = {
           at: new Date(ts),
           seq: outputSeq,
-          stream,
+          stream: safeStream,
           bytes: persistedLogBytes,
         };
         await flushOutputProgress();
@@ -10874,12 +11732,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             agentId: run.agentId,
             issueId,
             ts,
-            stream,
+            stream: safeStream,
             chunk: payloadChunk,
             truncated: payloadChunk.length !== sanitizedChunk.length,
           },
         });
       };
+      const writeSafeLogs = (chunks: ReturnType<typeof streamRedactor.write>) => {
+        logWriteChain = logWriteChain.catch(() => undefined).then(async () => {
+          for (const entry of chunks) await emitSafeLog(entry.stream, entry.chunk);
+        });
+        return logWriteChain;
+      };
+      const onLog = (stream: "stdout" | "stderr", chunk: string) =>
+        writeSafeLogs(streamRedactor.write(stream === "stdout" ? "stdout" : "stderr", chunk));
+      flushAdapterLogs = () => writeSafeLogs(streamRedactor.flush());
+      heartbeatLogFlushers.set(run.id, flushAdapterLogs);
       if (runScopedMentionedSkillKeys.length > 0) {
         await onLog(
           "stdout",
@@ -10945,7 +11813,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: sanitizeHeartbeatPersistenceRecord(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -10963,15 +11831,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } catch (err) {
           await onLog(
             "stderr",
-            `[paperclip] Failed to post workspace-ready comment: ${err instanceof Error ? err.message : String(err)}\n`,
+            "[paperclip] Failed to post workspace-ready comment; raw diagnostic omitted\n",
           );
         }
       }
       const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
-        if (meta.env && secretKeys.size > 0) {
+        const safeMeta = sanitizeHeartbeatPersistenceRecord(meta);
+        const safeEnv = parseObject(safeMeta.env);
+        if (Object.keys(safeEnv).length > 0 && secretKeys.size > 0) {
           for (const key of secretKeys) {
-            if (key in meta.env) meta.env[key] = "***REDACTED***";
+            if (key in safeEnv) safeEnv[key] = "***REDACTED***";
           }
+          safeMeta.env = safeEnv;
         }
         const modelProfileMetadata = modelProfileRunMetadata(modelProfileApplication);
         await appendRunEvent(currentRun, seq++, {
@@ -10980,7 +11851,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           level: "info",
           message: "adapter invocation",
           payload: {
-            ...(meta as unknown as Record<string, unknown>),
+            ...safeMeta,
             ...(modelProfileMetadata ? { modelProfile: modelProfileMetadata } : {}),
           },
         });
@@ -11055,7 +11926,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   recorder: workspaceOperationRecorder,
                 });
               } catch (repairErr) {
-                const workspaceValidationFailure = isWorkspaceValidationFailure(repairErr) ? repairErr : null;
+                const workspaceValidationFailure =
+                  readAuthenticWorkspaceValidationFailure(repairErr);
+                const repairFailureMessage = workspaceValidationFailure?.message ??
+                  "Managed git worktree branch repair failed; raw diagnostic omitted";
                 finalizeBranchMetadata = {
                   executionWorkspaceId: branchInspection.workspaceRecord.id,
                   ...initialManagedGitWorktreeBranch,
@@ -11064,7 +11938,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   attempted: true,
                   succeeded: false,
                   initial: initialManagedGitWorktreeBranch,
-                  reason: repairErr instanceof Error ? repairErr.message : String(repairErr),
+                  reason: repairFailureMessage,
                 };
                 await workspaceOperationRecorder.recordOperation({
                   phase: "workspace_finalize",
@@ -11081,7 +11955,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   },
                   run: async () => ({
                     status: "failed",
-                    stderr: `Managed git worktree branch check failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)}\n`,
+                    stderr: `Managed git worktree branch check failed: ${repairFailureMessage}\n`,
                   }),
                 });
                 adapterFinalizeOutcome = "failed";
@@ -11129,7 +12003,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 }),
               });
               adapterFinalizeOutcome = "failed";
-              throw new WorkspaceValidationFailure(
+              throw workspaceValidationFailure(
                 `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${inspection.expectedBranchName}" at "${inspection.worktreePath}", but ${inspection.reason ?? "the checked-out branch could not be verified"}. Record a sanctioned execution-workspace branch transition or restore the workspace branch before completing the run.`,
                 {
                   workspaceValidation: {
@@ -11165,9 +12039,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
-      let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
+      let adapterResult: AdapterExecutionResult;
       try {
-        adapterResult = await adapter.execute({
+        const rawAdapterResult = await adapter.execute({
           runId: run.id,
           agent,
           runtime: runtimeForAdapter,
@@ -11184,6 +12058,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
           },
           onSpawn: async (meta) => {
+            // A retry/fallback can spawn a new process within the same run.
+            // Reset the dead-PID grace clock even if the OS recycles the same
+            // numeric pid; each child receives its own bounded exit→close window.
+            deadLocalProcessFirstObservedAt.delete(run.id);
+            if (!shouldPersistHeartbeatProcessMetadata(executionTarget)) return;
             await persistRunProcessMetadata(run.id, {
               pid: meta.pid,
               processGroupId:
@@ -11195,6 +12074,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           authToken: authToken ?? undefined,
         });
+        adapterResult = normalizeAdapterExecutionResultForPersistence(rawAdapterResult);
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
         // barrier so dependents that share this executionWorkspace can wake.
@@ -11207,14 +12087,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // write itself threw. Either way the workspace may be in a partial
         // state. Best-effort record finalize=failed so the dependent readiness
         // check keeps the gate closed instead of waking on stale local state,
-        // and surface the original error to the caller.
+          // and surface the original error to the caller.
         try {
           await recordWorkspaceFinalize("failed", {
-            errorMessage: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
+            errorMessage: sanitizeHeartbeatFailureMessage(
+              adapterErr,
+              currentUserRedactionOptions,
+              "Adapter execution failed; raw provider diagnostic omitted",
+            ),
           });
         } catch (recordErr) {
           logger.warn(
-            { err: recordErr, runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
+            {
+              err: sanitizeHeartbeatErrorForLog(recordErr),
+              runId: run.id,
+              executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+            },
             "failed to record workspace_finalize=failed operation; dependents may remain gated",
           );
         }
@@ -11246,7 +12134,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: sanitizeHeartbeatPersistenceRecord(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -11263,7 +12151,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           } catch (err) {
             await onLog(
               "stderr",
-              `[paperclip] Failed to post adapter-managed runtime comment: ${err instanceof Error ? err.message : String(err)}\n`,
+              "[paperclip] Failed to post adapter-managed runtime comment; raw diagnostic omitted\n",
             );
           }
         }
@@ -11317,6 +12205,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
+        await flushAdapterLogs();
         logSummary = await runLogStore.finalize(handle);
       }
       const finalLogBytes = logSummary?.bytes;
@@ -11380,7 +12269,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
-      const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
+      const persistedRunWrite = await setTerminalRunStatusIfRunning(run.id, status, {
+        terminalFinalizationJson: buildTerminalFinalizationPayload({
+          adapterType: agent.adapterType,
+          result: adapterResult,
+          usage: normalizedUsage,
+          session: {
+            generation: runtime.sessionGeneration,
+            taskGeneration: taskSession?.sessionGeneration ?? 0,
+            legacySessionId: nextSessionState.legacySessionId,
+            taskKey,
+            mode: !taskKey ? "none" : adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId) ? "clear" : "upsert",
+            params: attachPaperclipSessionMetadataToSessionParams(nextSessionState.params, configuredModel, sessionConfigMetadata),
+            displayId: nextSessionState.displayId,
+          },
+        }),
         finishedAt: new Date(),
         error: runErrorMessage,
         errorCode: runErrorCode,
@@ -11406,84 +12309,246 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return;
       }
+      terminalOutcomePersisted = outcome;
+      if (await options.deferTerminalFinalization?.({ runId: run.id, phase: "after_terminal_commit" })) return;
+      reconcilePersistedTerminalSideEffects = async () => { await reconcileTerminalFinalization(run.id); };
+      if (!await reconcileTerminalFinalization(run.id, { deferIssueRelease: true })) return;
 
-      let persistedRun = persistedRunWrite.run;
+      const terminalSideEffectProgress = {
+        wakeup: false,
+        issueExecution: false,
+        runtimeState: false,
+        taskSession: taskKey == null,
+        agentStatus: false,
+      };
+      let terminalRunForSideEffects = persistedRunWrite.run;
+      const loadTerminalRunForSideEffects = async () => {
+        if (!terminalRunForSideEffects) {
+          terminalRunForSideEffects = await getRun(run.id);
+        }
+        return terminalRunForSideEffects;
+      };
+      const finalizeTerminalWakeup = async () => {
+        if (terminalSideEffectProgress.wakeup) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await finalizeDurableWakeup(terminalRun);
+        terminalSideEffectProgress.wakeup = true;
+      };
+      const finalizeTerminalIssueExecution = async () => {
+        if (terminalSideEffectProgress.issueExecution) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await releaseIssueExecutionAndPromote(terminalRun, { durableFinalization: true });
+        terminalSideEffectProgress.issueExecution = true;
+      };
+      const finalizeTerminalRuntimeState = async () => {
+        if (terminalSideEffectProgress.runtimeState) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await finalizeDurableRuntime(terminalRun, terminalRun.terminalFinalizationJson as TerminalFinalizationPayload);
+        terminalSideEffectProgress.runtimeState = true;
+      };
+      const finalizeTerminalTaskSession = async () => {
+        if (terminalSideEffectProgress.taskSession || !taskKey) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await finalizeDurableTaskSession(terminalRun, terminalRun.terminalFinalizationJson as TerminalFinalizationPayload);
+        terminalSideEffectProgress.taskSession = true;
+      };
+      const finalizeTerminalAgent = async () => {
+        if (terminalSideEffectProgress.agentStatus) return;
+        const terminalRun = await loadTerminalRunForSideEffects();
+        if (!terminalRun) return;
+        await finalizeDurableAgent(terminalRun);
+        terminalSideEffectProgress.agentStatus = true;
+      };
+      reconcilePersistedTerminalSideEffects = async () => {
+        if (!terminalSideEffectProgress.wakeup) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "wakeup_finalize",
+            operation: finalizeTerminalWakeup,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.issueExecution) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "issue_execution_release",
+            operation: finalizeTerminalIssueExecution,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.runtimeState) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "runtime_state",
+            operation: finalizeTerminalRuntimeState,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.taskSession) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "task_session",
+            operation: finalizeTerminalTaskSession,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+        if (!terminalSideEffectProgress.agentStatus) {
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "agent_status",
+            operation: finalizeTerminalAgent,
+            fallback: undefined,
+            attempts: 2,
+          });
+        }
+      };
+
+      let persistedRun = terminalRunForSideEffects;
       if (persistedRun) {
-        persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
+        persistedRun = await settlePostTerminalStep({
+          runId: run.id,
+          step: "liveness_classification",
+          operation: async () => await classifyAndPersistRunLiveness(persistedRun!, persistedResultJson) ?? persistedRun!,
+          fallback: persistedRun,
+        });
+        terminalRunForSideEffects = persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
-        finishedAt: new Date(),
-        error: runErrorMessage,
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "wakeup_finalize",
+        operation: finalizeTerminalWakeup,
+        fallback: undefined,
+        attempts: 2,
       });
 
-      const finalizedRun = persistedRun ?? (await getRun(run.id));
+      const finalizedRun = persistedRun ?? await settlePostTerminalStep({
+        runId: run.id,
+        step: "run_reload",
+        operation: async () => await getRun(run.id),
+        fallback: null,
+        attempts: 2,
+      });
+      terminalRunForSideEffects = finalizedRun ?? terminalRunForSideEffects;
       if (finalizedRun) {
-        await appendRunEvent(finalizedRun, seq++, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
-          message: `run ${outcome}`,
-          payload: {
-            status,
-            exitCode: adapterResult.exitCode,
-          },
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "lifecycle_event",
+          operation: async () => await appendRunEvent(finalizedRun, seq++, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: outcome === "succeeded" ? "info" : "error",
+            message: `run ${outcome}`,
+            payload: {
+              status,
+              exitCode: adapterResult.exitCode,
+            },
+          }),
+          fallback: null,
         });
         const livenessRun = finalizedRun;
-        await refreshContinuationSummaryForRun(livenessRun, agent);
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "continuation_summary",
+          operation: async () => await refreshContinuationSummaryForRun(livenessRun, agent),
+          fallback: undefined,
+        });
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
         if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
-          try {
-            const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
-            if (!existingRunComment) {
-              const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
-              if (issueComment) {
-                await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
+          await settlePostTerminalStep({
+            runId: run.id,
+            step: "run_summary_comment",
+            operation: async () => {
+              try {
+                const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
+                if (!existingRunComment) {
+                  const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
+                  if (issueComment) {
+                    await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
+                  }
+                }
+              } catch (err) {
+                await onLog(
+                  "stderr",
+                  "[paperclip] Failed to post run summary comment; raw diagnostic omitted\n",
+                );
               }
-            }
-          } catch (err) {
-            await onLog(
-              "stderr",
-              `[paperclip] Failed to post run summary comment: ${err instanceof Error ? err.message : String(err)}\n`,
-            );
-          }
+            },
+            fallback: undefined,
+          });
         }
-        if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
-          const policy = parseMaxTurnContinuationPolicy(agent);
-          if (policy.enabled && policy.maxAttempts > 0) {
-            await scheduleBoundedRetryForRun(livenessRun, agent, {
-              retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-              wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
-              maxAttempts: policy.maxAttempts,
-              delayMs: policy.delayMs,
-            });
-          } else {
-            await appendRunEvent(livenessRun, await nextRunEventSeq(livenessRun.id), {
-              eventType: "lifecycle",
-              stream: "system",
-              level: "warn",
-              message: "Max-turn continuation suppressed because the policy is disabled",
-              payload: {
-                retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-                policy,
-              },
-            });
-          }
-        } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent);
-        }
-        const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(livenessRun);
-        await handleRunLivenessContinuation(livenessRun);
-        await handleSuccessfulRunHandoff(
-          issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
-            ? {
-              ...livenessRun,
-              issueCommentStatus: issueCommentPolicyResult.outcome,
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "retry_scheduling",
+          operation: async () => {
+            if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+              const policy = parseMaxTurnContinuationPolicy(agent);
+              if (policy.enabled && policy.maxAttempts > 0) {
+                await scheduleBoundedRetryForRun(livenessRun, agent, {
+                  retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+                  wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+                  maxAttempts: policy.maxAttempts,
+                  delayMs: policy.delayMs,
+                });
+              } else {
+                await appendRunEvent(livenessRun, await nextRunEventSeq(livenessRun.id), {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "warn",
+                  message: "Max-turn continuation suppressed because the policy is disabled",
+                  payload: {
+                    retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+                    policy,
+                  },
+                });
+              }
+            } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
+              await scheduleBoundedRetryForRun(livenessRun, agent);
             }
-            : livenessRun,
-          agent,
-        );
+          },
+          fallback: undefined,
+        });
+        const issueCommentPolicyResult = await settlePostTerminalStep({
+          runId: run.id,
+          step: "issue_comment_policy",
+          operation: async () => await finalizeIssueCommentPolicy(livenessRun, agent),
+          fallback: null,
+        });
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "issue_execution_release",
+          operation: finalizeTerminalIssueExecution,
+          fallback: undefined,
+          attempts: 2,
+        });
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "liveness_continuation",
+          operation: async () => await handleRunLivenessContinuation(livenessRun),
+          fallback: undefined,
+        });
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "successful_handoff",
+          operation: async () => await handleSuccessfulRunHandoff(
+            issueCommentPolicyResult?.outcome === "retry_queued" || issueCommentPolicyResult?.outcome === "retry_exhausted"
+              ? {
+                ...livenessRun,
+                issueCommentStatus: issueCommentPolicyResult.outcome,
+              }
+              : livenessRun,
+            agent,
+          ),
+          fallback: undefined,
+        });
 
         // Dependency wake re-check: if this run's issue was marked done mid-run,
         // the route-time `issue_blockers_resolved` wake may have been gated by
@@ -11492,8 +12557,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // `listWakeableBlockedDependents` delegates to dependency readiness, which
         // only returns dependents whose done blockers have crossed the successful
         // `workspace_finalize` barrier.
-        if (issueId && finalizedRun) {
-          try {
+        await settlePostTerminalStep({
+          runId: run.id,
+          step: "dependency_wake",
+          operation: async () => {
+            if (!issueId || !finalizedRun) return;
+            try {
             const blockerIssueStatus = await db
               .select({ status: issues.status })
               .from(issues)
@@ -11552,71 +12621,89 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   })
                 ).catch((wakeErr) => {
                   logger.warn(
-                    { err: wakeErr, issueId, dependentIssueId: dependent.id, agentId: dependent.assigneeAgentId },
+                    {
+                      err: sanitizeHeartbeatErrorForLog(wakeErr),
+                      issueId,
+                      dependentIssueId: dependent.id,
+                      agentId: dependent.assigneeAgentId,
+                    },
                     "failed to fire deferred dependent wake after workspace_finalize",
                   );
                 });
               }
             }
-          } catch (finalizeWakeErr) {
-            logger.warn(
-              { err: finalizeWakeErr, runId: run.id, issueId },
-              "failed to evaluate dependent wakes after workspace_finalize",
-            );
-          }
-        }
+            } catch (finalizeWakeErr) {
+              logger.warn(
+                { err: sanitizeHeartbeatErrorForLog(finalizeWakeErr), runId: run.id, issueId },
+                "failed to evaluate dependent wakes after workspace_finalize",
+              );
+            }
+          },
+          fallback: undefined,
+        });
       }
 
-      if (finalizedRun) {
-        await updateRuntimeState(agent, finalizedRun, adapterResult, {
-          legacySessionId: nextSessionState.legacySessionId,
-        }, normalizedUsage);
-        if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
-              taskKey,
-              adapterType: agent.adapterType,
-            });
-          } else {
-            await upsertTaskSession({
-              companyId: agent.companyId,
-              agentId: agent.id,
-              adapterType: agent.adapterType,
-              taskKey,
-              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-                nextSessionState.params,
-                configuredModel,
-                sessionConfigMetadata,
-              ),
-              sessionDisplayId: nextSessionState.displayId,
-              lastRunId: finalizedRun.id,
-              lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
-            });
-          }
-        }
-      }
-      await finalizeAgentStatus(
-        agent.id,
-        outcome,
-        outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
-      );
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "runtime_state",
+        operation: finalizeTerminalRuntimeState,
+        fallback: undefined,
+        attempts: 2,
+      });
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "task_session",
+        operation: finalizeTerminalTaskSession,
+        fallback: undefined,
+        attempts: 2,
+      });
+      await settlePostTerminalStep({
+        runId: run.id,
+        step: "agent_status",
+        operation: finalizeTerminalAgent,
+        fallback: undefined,
+        attempts: 2,
+      });
+      // A bounded second reconciliation pass retries only incomplete,
+      // idempotent critical steps. Runtime accounting is guarded as
+      // attempt-once to avoid double-counting a partial write.
+      await reconcilePersistedTerminalSideEffects();
     } catch (err) {
-      const message = redactCurrentUserText(
-        err instanceof Error ? err.message : "Unknown adapter failure",
-        await getCurrentUserRedactionOptions(),
+      if (terminalOutcomePersisted) {
+        logger.warn(
+          { err: sanitizeHeartbeatErrorForLog(err), runId, outcome: terminalOutcomePersisted },
+          "unexpected post-terminal heartbeat failure; reconciling persisted terminal side effects",
+        );
+        await reconcilePersistedTerminalSideEffects?.().catch((reconcileErr) => {
+          logger.warn(
+            { err: sanitizeHeartbeatErrorForLog(reconcileErr), runId, outcome: terminalOutcomePersisted },
+            "persisted terminal side-effect reconciliation failed",
+          );
+        });
+        return;
+      }
+      const failureRedactionOptions = await getCurrentUserRedactionOptions();
+      const message = sanitizeHeartbeatFailureMessage(
+        err,
+        failureRedactionOptions,
+        "Adapter execution failed; raw provider diagnostic omitted",
       );
-      const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
-      const configurationIncompleteFailure = isConfigurationIncompleteFailure(err) ? err : null;
-      const failureErrorCode =
-        workspaceValidationFailure?.code ?? configurationIncompleteFailure?.code ?? "adapter_failed";
-      logger.error({ err, runId }, "heartbeat execution failed");
+      const trustedFailureDetails = readTrustedHeartbeatFailurePersistenceDetails(err);
+      const failureErrorCode = trustedFailureDetails?.errorCode ?? "adapter_failed";
+      logger.error({ err: sanitizeHeartbeatErrorForLog(err), runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
+      await flushAdapterLogs().catch((flushErr) => {
+        logger.warn({ err: sanitizeHeartbeatErrorForLog(flushErr), runId }, "failed to flush safe adapter logs after error");
+      });
       if (handle) {
         try {
           logSummary = await runLogStore.finalize(handle);
         } catch (finalizeErr) {
-          logger.warn({ err: finalizeErr, runId }, "failed to finalize run log after error");
+          logger.warn(
+            { err: sanitizeHeartbeatErrorForLog(finalizeErr), runId },
+            "failed to finalize run log after error",
+          );
         }
       }
       const finalLogBytes = logSummary?.bytes;
@@ -11624,17 +12711,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outputProgressState.pending.bytes = finalLogBytes;
       }
       await flushOutputProgress({ force: true }).catch((flushErr) => {
-        logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
+        logger.warn(
+          { err: sanitizeHeartbeatErrorForLog(flushErr), runId },
+          "failed to flush run output progress after error",
+        );
       });
 
-      const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
+      const failedRunWrite = await setTerminalRunStatusIfRunning(run.id, "failed", {
+        terminalFinalizationJson: sanitizeHeartbeatPersistenceRecord({
+          ...emptyTerminalFinalizationPayload(),
+          adapterType: agent.adapterType,
+          session: {
+            generation: runtime.sessionGeneration,
+            taskGeneration: taskSession?.sessionGeneration ?? 0,
+            legacySessionId: runtimeForAdapter.sessionId,
+            taskKey,
+            mode: taskKey && (previousSessionParams || previousSessionDisplayId || taskSession) ? "upsert" : "none",
+            params: attachPaperclipSessionMetadataToSessionParams(previousSessionParams, configuredModel, sessionConfigMetadata),
+            displayId: previousSessionDisplayId,
+          },
+        }),
         error: message,
         errorCode: failureErrorCode,
         finishedAt: new Date(),
         resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
           errorCode: failureErrorCode,
           errorMessage: message,
-          resultJson: workspaceValidationFailure?.resultJson ?? configurationIncompleteFailure?.resultJson ?? null,
+          resultJson: trustedFailureDetails?.resultJson ?? null,
         }),
         stdoutExcerpt,
         stderrExcerpt,
@@ -11655,6 +12758,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const failedRun = failedRunWrite.run;
+      terminalOutcomePersisted = "failed";
+      if (await options.deferTerminalFinalization?.({ runId: run.id, phase: "after_terminal_commit" })) return;
+      reconcilePersistedTerminalSideEffects = async () => { await reconcileTerminalFinalization(run.id); };
+      if (!await reconcileTerminalFinalization(run.id, { deferIssueRelease: true })) return;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
         error: message,
@@ -11674,52 +12781,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         await releaseIssueExecutionAndPromote(livenessRun);
 
-        await updateRuntimeState(agent, livenessRun, {
-          exitCode: null,
-          signal: null,
-          timedOut: false,
-          errorMessage: message,
-        }, {
-          legacySessionId: runtimeForAdapter.sessionId,
-        });
-
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-              previousSessionParams,
-              configuredModel,
-              sessionConfigMetadata,
-            ),
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
-          });
-        }
+        await reconcileTerminalFinalization(run.id);
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      if (failedRun) await finalizeDurableAgent(failedRun);
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
-          const message = redactCurrentUserText(
-            outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
-            await getCurrentUserRedactionOptions(),
+          const setupFailureRedactionOptions = await getCurrentUserRedactionOptions();
+          const message = sanitizeHeartbeatFailureMessage(
+            outerErr,
+            setupFailureRedactionOptions,
+            "Heartbeat setup failed; raw diagnostic omitted",
           );
           // A missing secret/env binding is a known pre-dispatch configuration gap,
           // not an opaque setup crash. Surface it with its own errorCode so the
           // recovery path routes it to a human owner instead of looping retries.
-          const workspaceValidationSetupFailure = isWorkspaceValidationFailure(outerErr) ? outerErr : null;
-          const configurationIncompleteSetupFailure = isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
-          const setupFailureErrorCode =
-            workspaceValidationSetupFailure?.code ?? configurationIncompleteSetupFailure?.code ?? "setup_failed";
-          logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          const trustedSetupFailureDetails =
+            readTrustedHeartbeatFailurePersistenceDetails(outerErr);
+          const setupFailureErrorCode = trustedSetupFailureDetails?.errorCode ?? "setup_failed";
+          logger.error(
+            { err: sanitizeHeartbeatErrorForLog(outerErr), runId },
+            "heartbeat execution setup failed",
+          );
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
-          const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
+          const setupFailureWrite = await setTerminalRunStatusIfRunning(runId, "failed", {
             error: message,
             errorCode: setupFailureErrorCode,
             finishedAt: new Date(),
@@ -11727,8 +12814,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
                 errorCode: setupFailureErrorCode,
                 errorMessage: message,
-                resultJson:
-                  workspaceValidationSetupFailure?.resultJson ?? configurationIncompleteSetupFailure?.resultJson ?? null,
+                resultJson: trustedSetupFailureDetails?.resultJson ?? null,
               }),
             } : {}),
           }).catch(() => ({ run: null, updated: false as const }));
@@ -11783,7 +12869,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          runningProcesses.delete(run.id);
           activeRunExecutions.delete(run.id);
+          heartbeatLogFlushers.delete(run.id);
+          deadLocalProcessFirstObservedAt.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
   }
@@ -11844,7 +12933,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; durableFinalization?: boolean } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -11861,6 +12950,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
+      const durableRun = await tx.select({ payload: heartbeatRuns.terminalFinalizationJson, finishedAt: heartbeatRuns.finishedAt })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).then((rows) => rows[0] ?? null);
+      const durableFinalization = options.durableFinalization || durableRun?.payload?.version === 1;
+      if (durableFinalization && !await claimTerminalPhase(tx as unknown as Db, run.id, "issueExecution")) return null;
       // Lock the context issue (if any) AND every issue that still references this run.
       //
       // A single run can hold execution locks on multiple issues: the caller's context
@@ -11993,6 +13086,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ...(durableFinalization && durableRun?.finishedAt ? [lte(agentWakeupRequests.requestedAt, durableRun.finishedAt)] : []),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             ),
           )
@@ -12552,11 +13646,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
-    const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
-    const reason = opts.reason ?? null;
-    const payload = opts.payload ?? null;
+    const contextSnapshot = sanitizeHeartbeatPersistenceRecord(opts.contextSnapshot ?? {});
+    const reason = typeof opts.reason === "string"
+      ? sanitizeHeartbeatPersistenceText(opts.reason)
+      : null;
+    const payload = opts.payload ? sanitizeHeartbeatPersistenceRecord(opts.payload) : null;
+    const requestedByActorId = typeof opts.requestedByActorId === "string"
+      ? sanitizeHeartbeatPersistenceText(opts.requestedByActorId)
+      : null;
+    const idempotencyKey = typeof opts.idempotencyKey === "string"
+      ? sanitizeHeartbeatPersistenceText(opts.idempotencyKey)
+      : null;
     const {
-      contextSnapshot: enrichedContextSnapshot,
+      contextSnapshot: rawEnrichedContextSnapshot,
       issueIdFromPayload,
       taskKey,
       wakeCommentId,
@@ -12567,6 +13669,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggerDetail,
       payload,
     });
+    const enrichedContextSnapshot = sanitizeHeartbeatPersistenceRecord(rawEnrichedContextSnapshot);
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
     const agent = await getAgent(agentId);
@@ -12576,19 +13679,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
+      const sanitizedPatch = sanitizeWakeupPatch(patch);
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
         source,
         triggerDetail,
-        reason: skipReason,
+        reason: sanitizeHeartbeatWakeupSkipReasonForPersistence(skipReason),
         payload,
         status: "skipped",
         requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
+        requestedByActorId,
+        idempotencyKey,
         finishedAt: new Date(),
-        ...patch,
+        ...sanitizedPatch,
       });
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
@@ -12735,7 +13839,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           contextSnapshot: enrichedContextSnapshot,
           requestedByActorType: opts.requestedByActorType,
-          requestedByActorId: opts.requestedByActorId,
+          requestedByActorId,
         });
 
         if (!treeHoldInteractionWake) {
@@ -12807,8 +13911,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload,
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
@@ -13063,8 +14167,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
@@ -13125,8 +14229,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               status: "coalesced",
               coalescedCount: 1,
               requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
+              requestedByActorId,
+              idempotencyKey,
               runId: mergedRun.id,
               finishedAt: new Date(),
             });
@@ -13191,8 +14295,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               payload: deferredPayload,
               status: "deferred_issue_execution",
               requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
+              requestedByActorId,
+              idempotencyKey,
             });
 
             return { kind: "deferred" as const };
@@ -13218,8 +14322,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
             finishedAt: now,
           });
           if (source === "timer") {
@@ -13245,8 +14349,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload,
             status: "queued",
             requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            requestedByActorId,
+            idempotencyKey,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -13360,8 +14464,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: "coalesced",
         coalescedCount: 1,
         requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
+        requestedByActorId,
+        idempotencyKey,
         runId: mergedRun.id,
         finishedAt: new Date(),
       });
@@ -13392,8 +14496,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           status: "skipped",
           requestedByActorType: opts.requestedByActorType ?? null,
-          requestedByActorId: opts.requestedByActorId ?? null,
-          idempotencyKey: opts.idempotencyKey ?? null,
+          requestedByActorId,
+          idempotencyKey,
           finishedAt: now,
         });
         if (source === "timer") {
@@ -13419,8 +14523,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload,
           status: "queued",
           requestedByActorType: opts.requestedByActorType ?? null,
-          requestedByActorId: opts.requestedByActorId ?? null,
-          idempotencyKey: opts.idempotencyKey ?? null,
+          requestedByActorId,
+          idempotencyKey,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -13596,30 +14700,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : options.resultJson;
 
     const running = runningProcesses.get(run.id);
-    try {
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
-    } finally {
-      runningProcesses.delete(run.id);
+    if (running) {
+      await terminateHeartbeatRunProcess({
+        pid: running.child.pid ?? run.processPid,
+        processGroupId: running.processGroupId ?? run.processGroupId,
+        graceMs: Math.max(1, running.graceSec) * 1000,
+      });
+    } else if (run.processPid || run.processGroupId) {
+      await terminateHeartbeatRunProcess({ pid: run.processPid, processGroupId: run.processGroupId });
     }
+    // Preserve ownership on failed termination. A retry must still be able to
+    // find/cancel the live child before the run becomes terminal.
+    runningProcesses.delete(run.id);
 
     const finishedAt = new Date();
+    await heartbeatLogFlushers.get(run.id)?.();
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt,
       error: reason,
       errorCode,
       ...(resultJson ? { resultJson } : {}),
-    });
+    }, { expectedStatuses: CANCELLABLE_HEARTBEAT_RUN_STATUSES });
+    if (!cancelled) return getRun(run.id);
+    if (await shouldDeferDurableTerminal(run.id)) return cancelled;
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
@@ -13650,7 +14753,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
+      const running = runningProcesses.get(run.id);
+      if (running) {
+        await terminateHeartbeatRunProcess({
+          pid: running.child.pid ?? run.processPid,
+          processGroupId: running.processGroupId ?? run.processGroupId,
+          graceMs: Math.max(1, running.graceSec) * 1000,
+        });
+        runningProcesses.delete(run.id);
+      } else if (run.processPid || run.processGroupId) {
+        await terminateHeartbeatRunProcess({ pid: run.processPid, processGroupId: run.processGroupId });
+      }
+      await heartbeatLogFlushers.get(run.id)?.();
+      const cancelled = await setRunStatus(run.id, "cancelled", {
         finishedAt: new Date(),
         error: reason,
         errorCode,
@@ -13661,28 +14776,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             errorMessage: reason,
           }),
         } : {}),
-      });
+      }, { expectedStatuses: CANCELLABLE_HEARTBEAT_RUN_STATUSES });
+      if (!cancelled) continue;
+      if (await shouldDeferDurableTerminal(run.id)) continue;
 
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: new Date(),
         error: reason,
       });
 
-      const running = runningProcesses.get(run.id);
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-        runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
-      await releaseIssueExecutionAndPromote(run);
+      await releaseIssueExecutionAndPromote(cancelled);
     }
 
     return runs.length;
@@ -13897,26 +15000,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!agent) throw notFound("Agent not found");
       await ensureRuntimeState(agent);
       const taskKey = readNonEmptyString(opts?.taskKey);
-      const clearedTaskSessions = await clearTaskSessions(
-        agent.companyId,
-        agent.id,
-        taskKey ? { taskKey, adapterType: agent.adapterType } : undefined,
-      );
-      const runtimePatch: Partial<typeof agentRuntimeState.$inferInsert> = {
-        sessionId: null,
-        lastError: null,
-        updatedAt: new Date(),
-      };
-      if (!taskKey) {
-        runtimePatch.stateJson = {};
-      }
-
-      const updated = await db
-        .update(agentRuntimeState)
-        .set(runtimePatch)
-        .where(eq(agentRuntimeState.agentId, agentId))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const { updated, clearedTaskSessions } = await db.transaction(async (tx) => {
+        await lockAgentTerminalState(tx as unknown as Db, agentId);
+        await tx.select({ id: agentRuntimeState.agentId }).from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, agentId)).for("no key update");
+        const sessionConditions = and(
+          eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId),
+          ...(taskKey ? [eq(agentTaskSessions.taskKey, taskKey), eq(agentTaskSessions.adapterType, agent.adapterType)] : []),
+        );
+        const priorSessions = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions).where(sessionConditions);
+        if (taskKey) {
+          const cleared = { sessionParamsJson: null, sessionDisplayId: null, lastRunId: null, lastError: null, updatedAt: new Date() };
+          await tx.insert(agentTaskSessions).values({
+            companyId: agent.companyId, agentId, adapterType: agent.adapterType, taskKey,
+            sessionGeneration: 1, ...cleared,
+          }).onConflictDoUpdate({
+            target: [agentTaskSessions.companyId, agentTaskSessions.agentId, agentTaskSessions.adapterType, agentTaskSessions.taskKey],
+            set: { ...cleared, sessionGeneration: sql`${agentTaskSessions.sessionGeneration} + 1` },
+          });
+        } else {
+          await tx.delete(agentTaskSessions).where(sessionConditions);
+        }
+        const updated = await tx.update(agentRuntimeState).set({
+          sessionId: null, lastError: null, updatedAt: new Date(),
+          ...(!taskKey ? { stateJson: {}, sessionGeneration: sql`${agentRuntimeState.sessionGeneration} + 1` } : {}),
+        }).where(eq(agentRuntimeState.agentId, agentId)).returning().then((rows) => rows[0] ?? null);
+        return { updated, clearedTaskSessions: priorSessions.length };
+      });
 
       if (!updated) return null;
       return {
@@ -14008,6 +15118,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
+    reconcileTerminalRuns,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

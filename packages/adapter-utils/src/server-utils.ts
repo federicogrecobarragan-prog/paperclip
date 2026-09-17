@@ -2856,6 +2856,14 @@ export async function runChildProcess(
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
+    /**
+     * Maximum time to wait for Node's `close` event after the child emitted
+     * `exit`. Descendants can inherit stdout/stderr and keep those pipes open
+     * after the recorded child pid is gone, so callers that need a bounded
+     * terminal transition can opt into destroying the lingering streams and
+     * settling the process result after this delay.
+     */
+    postExitCloseTimeoutMs?: number;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
   },
@@ -2916,6 +2924,8 @@ export async function runChildProcess(
         let terminalCleanupStarted = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
+        let postExitCloseTimer: NodeJS.Timeout | null = null;
+        let settled = false;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
 
@@ -2924,6 +2934,35 @@ export async function runChildProcess(
           if (terminalCleanupKillTimer) clearTimeout(terminalCleanupKillTimer);
           terminalCleanupTimer = null;
           terminalCleanupKillTimer = null;
+        };
+
+        const clearPostExitCloseTimer = () => {
+          if (postExitCloseTimer) clearTimeout(postExitCloseTimer);
+          postExitCloseTimer = null;
+        };
+
+        const settleProcessResult = (code: number | null, signal: NodeJS.Signals | null) => {
+          if (settled) return;
+          settled = true;
+          if (timeout) clearTimeout(timeout);
+          clearTerminalCleanupTimers();
+          clearPostExitCloseTimer();
+          runningProcesses.delete(runId);
+          void logChain.finally(() => {
+            void Promise.resolve()
+              .then(() => target.cleanup?.())
+              .finally(() => {
+                resolve({
+                  exitCode: code,
+                  signal,
+                  timedOut,
+                  stdout,
+                  stderr,
+                  pid: child.pid ?? null,
+                  startedAt,
+                });
+              });
+          });
         };
 
         const maybeArmTerminalResultCleanup = () => {
@@ -3015,8 +3054,11 @@ export async function runChildProcess(
         }
 
         child.on("error", (err: Error) => {
+          if (settled) return;
+          settled = true;
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          clearPostExitCloseTimer();
           runningProcesses.delete(runId);
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
@@ -3028,29 +3070,31 @@ export async function runChildProcess(
           reject(new Error(msg));
         });
 
-        child.on("exit", () => {
+        child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
           maybeArmTerminalResultCleanup();
+          const postExitCloseTimeoutMs = opts.postExitCloseTimeoutMs;
+          if (
+            settled ||
+            postExitCloseTimer ||
+            typeof postExitCloseTimeoutMs !== "number" ||
+            !Number.isFinite(postExitCloseTimeoutMs) ||
+            postExitCloseTimeoutMs < 0
+          ) {
+            return;
+          }
+          postExitCloseTimer = setTimeout(() => {
+            postExitCloseTimer = null;
+            if (settled) return;
+            child.stdin?.destroy();
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            settleProcessResult(code, signal);
+          }, postExitCloseTimeoutMs);
+          postExitCloseTimer.unref?.();
         });
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
-          if (timeout) clearTimeout(timeout);
-          clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
-          void logChain.finally(() => {
-            void Promise.resolve()
-              .then(() => target.cleanup?.())
-              .finally(() => {
-              resolve({
-                exitCode: code,
-                signal,
-                timedOut,
-                stdout,
-                stderr,
-                pid: child.pid ?? null,
-                startedAt,
-              });
-              });
-          });
+          settleProcessResult(code, signal);
         });
       })
       .catch(reject);

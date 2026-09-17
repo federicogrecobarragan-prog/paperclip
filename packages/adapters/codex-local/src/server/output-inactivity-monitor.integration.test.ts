@@ -5,6 +5,7 @@ import {
   createCodexOutputInactivityMonitor,
   formatOutputInactivityMonitorErrorMessage,
 } from "./output-inactivity-monitor.js";
+import { resolveCodexHostKillTarget } from "./execute.js";
 
 const FAKE_CODEX_SCRIPT = `
 process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "abc" }) + "\\n");
@@ -14,12 +15,33 @@ process.stdin.on("data", () => {});
 setInterval(() => {}, 60_000);
 `;
 
+describe("codex inactivity monitor process ownership", () => {
+  it("never maps a sandbox-reported remote pid to a host kill target", () => {
+    const remotePidCollidingWithThisHost = process.pid;
+
+    expect(resolveCodexHostKillTarget({
+      pid: remotePidCollidingWithThisHost,
+      processGroupId: null,
+    }, true)).toBeNull();
+    expect(resolveCodexHostKillTarget({
+      pid: remotePidCollidingWithThisHost,
+      processGroupId: null,
+    }, false)).toEqual({
+      pid: remotePidCollidingWithThisHost,
+      processGroupId: null,
+    });
+  });
+});
+
 describe("codex inactivity monitor (integration: real subprocess)", () => {
   it(
     "kills a codex child that goes silent after one event and surfaces a monitor failure",
     async () => {
       const runId = `monitor-integration-${Date.now()}`;
-      const timeoutMs = 250;
+      // Leave enough room for a cold Windows process spawn before asserting
+      // the post-event inactivity path. This stays far below the production
+      // default while avoiding a pre-first-event race on slower hosts.
+      const timeoutMs = 2_000;
       const logs: Array<{ stream: string; chunk: string }> = [];
       let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
       let monitorFired = false;
@@ -81,7 +103,13 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
         expect(monitorFired, "monitor should fire when codex goes silent").toBe(true);
         // Process was killed by our signal, not by hitting timeoutSec.
         expect(proc.timedOut).toBe(false);
-        expect(["SIGTERM", "SIGKILL"]).toContain(proc.signal);
+        if (process.platform === "win32") {
+          // Node reports a numeric exit code and a null signal for a process
+          // terminated through Windows' emulated signal path.
+          expect(proc.exitCode).not.toBe(0);
+        } else {
+          expect(["SIGTERM", "SIGKILL"]).toContain(proc.signal);
+        }
         expect(["SIGTERM", "SIGKILL"]).toContain(terminationSignal);
         // The errorMessage shape mirrors the AdapterExecutionResult that
         // execute.ts will produce for this case.
