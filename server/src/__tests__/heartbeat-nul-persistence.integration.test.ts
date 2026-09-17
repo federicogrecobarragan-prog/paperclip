@@ -234,6 +234,14 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
       sessionGeneration: 3,
       lastRunId: null,
     });
+
+    await db.delete(agents).where(eq(agents.id, agentId));
+    expect(
+      await db
+        .select()
+        .from(agentTaskSessions)
+        .where(eq(agentTaskSessions.taskKey, taskKey)),
+    ).toHaveLength(0);
   });
 
   it("persists sanitized result, logs, events, wake payload, context, runtime state, and session", async () => {

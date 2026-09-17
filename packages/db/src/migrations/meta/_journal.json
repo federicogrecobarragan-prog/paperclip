@@ -918,6 +918,13 @@
       "when": 1789657064750,
       "tag": "0130_agent_task_session_run_set_null",
       "breakpoints": true
+    },
+    {
+      "idx": 131,
+      "version": "7",
+      "when": 1789657570288,
+      "tag": "0131_agent_task_session_agent_cascade",
+      "breakpoints": true
     }
   ]
 }
