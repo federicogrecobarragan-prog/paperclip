@@ -911,6 +911,13 @@
       "when": 1782526700000,
       "tag": "0129_heartbeat_terminal_finalization",
       "breakpoints": true
+    },
+    {
+      "idx": 130,
+      "version": "7",
+      "when": 1789657064750,
+      "tag": "0130_agent_task_session_run_set_null",
+      "breakpoints": true
     }
   ]
 }

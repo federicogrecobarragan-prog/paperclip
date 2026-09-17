@@ -201,6 +201,41 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     return { companyId, agentId };
   }
 
+  it("preserves task session continuity when heartbeat history is deleted", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const runId = randomUUID();
+    const taskKey = `issue:${randomUUID()}`;
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "succeeded",
+    });
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "http",
+      taskKey,
+      sessionParamsJson: { sessionId: "retained-session" },
+      sessionGeneration: 3,
+      lastRunId: runId,
+    });
+
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+
+    const [session] = await db
+      .select()
+      .from(agentTaskSessions)
+      .where(eq(agentTaskSessions.taskKey, taskKey));
+    expect(session).toMatchObject({
+      taskKey,
+      sessionParamsJson: { sessionId: "retained-session" },
+      sessionGeneration: 3,
+      lastRunId: null,
+    });
+  });
+
   it("persists sanitized result, logs, events, wake payload, context, runtime state, and session", async () => {
     const { agentId } = await seedAgent();
     mockAdapterExecute.mockImplementationOnce(async (context: {

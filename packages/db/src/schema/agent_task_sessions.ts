@@ -14,7 +14,7 @@ export const agentTaskSessions = pgTable(
     sessionParamsJson: jsonb("session_params_json").$type<Record<string, unknown>>(),
     sessionDisplayId: text("session_display_id"),
     sessionGeneration: integer("session_generation").notNull().default(0),
-    lastRunId: uuid("last_run_id").references(() => heartbeatRuns.id),
+    lastRunId: uuid("last_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     lastError: text("last_error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
