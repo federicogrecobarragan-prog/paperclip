@@ -95,6 +95,20 @@ function isRouteOrAuthzTest(file) {
   return additionalSerializedServerTests.has(file);
 }
 
+// Binary (UTF-16 code unit) order, NOT `localeCompare`. The shard split is
+// positional -- `list.filter((_, i) => i % shardCount === shardIndex)` -- so the
+// sort order IS the partition. `localeCompare` resolves against the runtime's
+// default collation, which comes from the environment (ICU/LC_ALL), so two
+// runners of the same workflow that resolved different collations would compute
+// different partitions: one suite could run twice and another never, with every
+// job still green. A silent false green, not a red. Code-unit order is a pure
+// function of the strings, so the partition is an invariant of the code instead
+// of a coincidence of the environment. Same reasoning as LAC-1380/LAC-1387 for
+// the teams-catalog manifest hash.
+function compareRepoPaths(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function fail(message) {
   console.error(`[test:run] ${message}`);
   process.exit(1);
@@ -364,7 +378,7 @@ const routeTests = walk(serverTestsDir)
     repoPath: toRepoPath(file),
     serverPath: toServerPath(file),
   }))
-  .sort((a, b) => a.repoPath.localeCompare(b.repoPath));
+  .sort((a, b) => compareRepoPaths(a.repoPath, b.repoPath));
 
 // Every server test file that the general-server group is responsible for,
 // i.e. the whole server project minus the route/authz suites that run in the
@@ -375,7 +389,7 @@ const generalServerTestFiles = walk(serverSrcDir)
   .map((file) => toRepoPath(file))
   .filter((repoPath) => repoPath.endsWith(".test.ts"))
   .filter((repoPath) => !isRouteOrAuthzTest(repoPath))
-  .sort((a, b) => a.localeCompare(b));
+  .sort(compareRepoPaths);
 
 const options = parseCliOptions(process.argv.slice(2));
 if (options.dryRun) {
