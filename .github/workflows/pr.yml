@@ -58,6 +58,11 @@ jobs:
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
+      # Fails when a project declared in vitest.projects.mjs runs in no CI lane,
+      # and prints every deliberate exception it granted (LAC-1384).
+      - name: Test vitest lane coverage
+        run: node --test ./scripts/__tests__/vitest-lane-coverage.test.mjs
+
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
 
@@ -233,18 +238,23 @@ jobs:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, teams_catalog_freshness, general_tests, build]
+    # `policy` is named explicitly, not left to the skip cascade: the guards it
+    # runs (lane coverage, no-git-push, shard partition) have to gate the merge
+    # directly, not because a downstream job happened to be skipped (LAC-1384).
+    needs: [policy, typecheck_release_registry, teams_catalog_freshness, general_tests, build]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
       - name: Fail if any split verify lane failed
         env:
+          POLICY_RESULT: ${{ needs.policy.result }}
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           TEAMS_CATALOG_FRESHNESS_RESULT: ${{ needs.teams_catalog_freshness.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
+          test "$POLICY_RESULT" = "success"
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$TEAMS_CATALOG_FRESHNESS_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
