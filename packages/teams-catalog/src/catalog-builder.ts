@@ -109,7 +109,7 @@ export async function buildCatalogManifest(
     if (team) teams.push(team);
   }
 
-  teams.sort((a, b) => a.id.localeCompare(b.id));
+  teams.sort((a, b) => comparePaths(a.id, b.id));
   collectUniquenessErrors(teams, errors);
 
   return {
@@ -424,7 +424,7 @@ async function collectTeamFiles(
   files.sort((a, b) => {
     if (a.path === TEAM_ENTRYPOINT) return -1;
     if (b.path === TEAM_ENTRYPOINT) return 1;
-    return a.path.localeCompare(b.path);
+    return comparePaths(a.path, b.path);
   });
 
   if (!files.some((file) => file.path === TEAM_ENTRYPOINT && file.kind === "team")) {
@@ -569,7 +569,7 @@ function collectRequiredSkills(
     upsert(resolveDeclaredSkillRequirement(teamDir, declared, catalogSkills, localSkillSlugs, agentSlugs, errors));
   }
 
-  return Array.from(requirements.values()).sort((a, b) => `${a.type}:${a.ref}`.localeCompare(`${b.type}:${b.ref}`));
+  return Array.from(requirements.values()).sort((a, b) => comparePaths(`${a.type}:${a.ref}`, `${b.type}:${b.ref}`));
 }
 
 function requirementIdentity(requirement: CatalogTeamSkillRequirement) {
@@ -712,7 +712,10 @@ function collectEnvInputs(graph: TeamPackageGraph): CatalogTeamEnvInputSummary[]
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
-  }).sort((a, b) => `${a.agentSlug ?? ""}:${a.projectSlug ?? ""}:${a.key}`.localeCompare(`${b.agentSlug ?? ""}:${b.projectSlug ?? ""}:${b.key}`));
+  }).sort((a, b) => comparePaths(
+    `${a.agentSlug ?? ""}:${a.projectSlug ?? ""}:${a.key}`,
+    `${b.agentSlug ?? ""}:${b.projectSlug ?? ""}:${b.key}`,
+  ));
 }
 
 function readEnvInputs(
@@ -757,7 +760,7 @@ function collectSourceRefs(
     });
   }
 
-  refs.sort((a, b) => `${a.type}:${a.ref}`.localeCompare(`${b.type}:${b.ref}`));
+  refs.sort((a, b) => comparePaths(`${a.type}:${a.ref}`, `${b.type}:${b.ref}`));
   return refs;
 }
 
@@ -920,7 +923,11 @@ function validateSlug(label: string, value: string, prefix: string, errors: stri
 }
 
 async function sortedDirEntries(dir: string) {
-  return (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+  return (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => comparePaths(a.name, b.name));
+}
+
+function comparePaths(a: string, b: string) {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function sameManifestExceptGeneratedAt(a: CatalogManifest, b: CatalogManifest) {

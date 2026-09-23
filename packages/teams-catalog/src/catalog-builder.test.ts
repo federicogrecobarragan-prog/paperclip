@@ -27,6 +27,12 @@ describe("teams catalog manifest", () => {
     await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
   });
 
+  it("does not use locale-sensitive comparisons in the catalog builder", async () => {
+    const source = await fs.readFile(new URL("./catalog-builder.ts", import.meta.url), "utf8");
+
+    expect(source).not.toContain("localeCompare");
+  });
+
   it("builds stable manifest entries from catalog team directories", async () => {
     const packageDir = await createCatalogPackage();
     await writeTeam(packageDir, "bundled", "software-development", "product-engineering", {
@@ -150,6 +156,37 @@ describe("teams catalog manifest", () => {
     expect(result.manifest.teams[0]!.contentHash).toBe(
       "sha256:841d6d346322229ef82f267572a71e525fd8d4edc321389fb8144cf6e41b1b7b",
     );
+  });
+
+  it("orders collation-sensitive paths by code unit before hashing", async () => {
+    const packageDir = await createCatalogPackage();
+    await writeTeam(packageDir, "bundled", "software-development", "portable-order", {
+      frontmatter: [
+        "name: Portable Order",
+        "description: Exercises deterministic file ordering across runtimes.",
+        "schema: agentcompanies/v1",
+        "manager: agents/lead/AGENTS.md",
+      ],
+      files: {
+        "a.md": "lowercase path\n",
+        "Z.md": "uppercase path\n",
+        "agents/lead/AGENTS.md": "---\nname: Lead\nslug: lead\n---\n\nLead.\n",
+      },
+    });
+
+    const result = await buildCatalogManifest({
+      packageDir,
+      generatedAt: "2026-06-03T00:00:00.000Z",
+      catalogSkills,
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(result.manifest.teams[0]!.files.map((file) => file.path)).toEqual([
+      "TEAM.md",
+      "Z.md",
+      "a.md",
+      "agents/lead/AGENTS.md",
+    ]);
   });
 
   it("reports frontmatter, directory, uniqueness, reference, and skill errors together", async () => {
