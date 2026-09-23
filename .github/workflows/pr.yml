@@ -132,11 +132,19 @@ jobs:
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 
-  teams_catalog_freshness:
-    name: Teams catalog freshness
+  catalog_freshness:
+    name: Catalog freshness (${{ matrix.catalog_label }})
     needs: [policy]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - catalog_package: teams-catalog
+            catalog_label: teams
+          - catalog_package: skills-catalog
+            catalog_label: skills
 
     steps:
       - name: Checkout repository
@@ -163,8 +171,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Validate teams catalog freshness
-        run: pnpm --filter @paperclipai/teams-catalog validate
+      - name: Validate ${{ matrix.catalog_label }} catalog freshness
+        run: pnpm --filter @paperclipai/${{ matrix.catalog_package }} validate
 
   general_tests:
     name: General tests (${{ matrix.group_label }})
@@ -233,7 +241,7 @@ jobs:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, teams_catalog_freshness, general_tests, build]
+    needs: [typecheck_release_registry, catalog_freshness, general_tests, build]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -241,12 +249,12 @@ jobs:
       - name: Fail if any split verify lane failed
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
-          TEAMS_CATALOG_FRESHNESS_RESULT: ${{ needs.teams_catalog_freshness.result }}
+          CATALOG_FRESHNESS_RESULT: ${{ needs.catalog_freshness.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
-          test "$TEAMS_CATALOG_FRESHNESS_RESULT" = "success"
+          test "$CATALOG_FRESHNESS_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
 
