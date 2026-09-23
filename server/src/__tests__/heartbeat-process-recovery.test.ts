@@ -1145,6 +1145,86 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  // LAC-1352: on Windows the adapter's kill reaches only the wrapper pid. Its
+  // descendants survive holding our stdio pipes, `close` never fires, the
+  // in-memory handle is never released, and the reaper skipped the row for
+  // good -- leaving the agent `running` over a dead process forever.
+  it("finalizes a tracked run whose in-memory handle points at a dead pid", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    const heartbeat = heartbeatService(db);
+    runningProcesses.set(runId, {
+      child: { pid: 999_999_999 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    // The stale handle must be dropped, or the next pass skips the row again.
+    expect(runningProcesses.has(runId)).toBe(false);
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(
+      events.some((event) => (event.payload as Record<string, unknown> | null)?.staleProcessHandleCleared === true),
+    ).toBe(true);
+  });
+
+  it("keeps a tracked run untouched while the handle's pid is still alive", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+    runningProcesses.set(runId, {
+      child: { pid: child.pid } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    // A live process still owns the run: the handle must survive untouched.
+    expect(runningProcesses.has(runId)).toBe(true);
+  });
+
+  it("keeps a tracked run untouched before it has recorded any pid", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: null,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+    // The window between claiming a run and spawning its child: no pid exists
+    // yet, so "no live pid" is not evidence that the run died.
+    runningProcesses.set(runId, {
+      child: {} as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    expect(runningProcesses.has(runId)).toBe(true);
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",

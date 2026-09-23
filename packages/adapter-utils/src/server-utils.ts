@@ -6,6 +6,7 @@ import path from "node:path";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import { terminateWindowsProcessTree } from "./windows-process-tree.js";
 import type {
   AdapterSkillEntry,
   AdapterSkillSnapshot,
@@ -63,11 +64,17 @@ function resolveProcessGroupId(child: ChildProcess) {
   return typeof child.pid === "number" && child.pid > 0 ? child.pid : null;
 }
 
-function signalRunningProcess(
+async function signalRunningProcess(
   running: Pick<RunningProcess, "child" | "processGroupId">,
   signal: NodeJS.Signals,
 ) {
-  if (process.platform !== "win32" && running.processGroupId && running.processGroupId > 0) {
+  if (process.platform === "win32") {
+    // Windows has no process groups: signalling the wrapper PID leaves every
+    // descendant (node -> codex.exe) orphaned and holding our stdio pipes.
+    if (running.child.pid) await terminateWindowsProcessTree(running.child.pid);
+    return;
+  }
+  if (running.processGroupId && running.processGroupId > 0) {
     try {
       process.kill(-running.processGroupId, signal);
       return;
@@ -2912,6 +2919,15 @@ export async function runChildProcess(
         let stdout = "";
         let stderr = "";
         let logChain: Promise<void> = Promise.resolve();
+        // Windows tree termination is async. Hold the run handle until it
+        // settles, otherwise we would release tracking while descendants of the
+        // wrapper are still alive.
+        let terminationChain: Promise<void> = Promise.resolve();
+        const signalChild = (signal: NodeJS.Signals) => {
+          const termination = signalRunningProcess({ child, processGroupId }, signal)
+            .catch((err) => onLogError(err, runId, "failed to terminate child process tree"));
+          terminationChain = Promise.all([terminationChain, termination]).then(() => undefined);
+        };
         let terminalResultSeen = false;
         let terminalCleanupStarted = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
@@ -2953,10 +2969,10 @@ export async function runChildProcess(
             terminalCleanupTimer = null;
             if (terminalCleanupStarted || timedOut) return;
             terminalCleanupStarted = true;
-            signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            signalChild("SIGTERM");
             terminalCleanupKillTimer = setTimeout(() => {
               terminalCleanupKillTimer = null;
-              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+              signalChild("SIGKILL");
             }, Math.max(1, opts.graceSec) * 1000);
           }, graceMs);
         };
@@ -2966,9 +2982,9 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
-                signalRunningProcess({ child, processGroupId }, "SIGTERM");
+                signalChild("SIGTERM");
                 setTimeout(() => {
-                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                  signalChild("SIGKILL");
                 }, Math.max(1, opts.graceSec) * 1000);
               }, opts.timeoutSec * 1000)
             : null;
@@ -3035,8 +3051,8 @@ export async function runChildProcess(
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
-          void logChain.finally(() => {
+          void Promise.all([logChain, terminationChain]).finally(() => {
+            runningProcesses.delete(runId);
             void Promise.resolve()
               .then(() => target.cleanup?.())
               .finally(() => {

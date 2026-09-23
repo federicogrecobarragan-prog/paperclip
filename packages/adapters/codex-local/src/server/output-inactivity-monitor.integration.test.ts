@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
+import { signalCodexChild } from "./execute.js";
 import {
   CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
   createCodexOutputInactivityMonitor,
@@ -27,26 +28,21 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
       let elapsedMs = 0;
 
+      // Drive the real production kill path instead of a local copy of it: on
+      // Windows that is the process-tree termination, and a copy here would
+      // have kept passing while production stranded descendants (LAC-1352).
+      let killChain: Promise<void> = Promise.resolve();
       const kill = (signal: NodeJS.Signals) => {
         const target = killTarget;
-        if (!target) return false;
-        if (target.processGroupId && target.processGroupId > 0) {
-          try {
-            process.kill(-target.processGroupId, signal);
-            return true;
-          } catch {
-            /* fall through */
-          }
-        }
-        if (target.pid && target.pid > 0) {
-          try {
-            process.kill(target.pid, signal);
-            return true;
-          } catch {
-            return false;
-          }
-        }
-        return false;
+        if (!target) return;
+        killChain = killChain.then(() =>
+          signalCodexChild(target, signal).then(
+            (sent) => {
+              if (sent) terminationSignal = signal;
+            },
+            () => undefined,
+          ),
+        );
       };
 
       const monitor = createCodexOutputInactivityMonitor({
@@ -54,9 +50,9 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
         onFire: (state) => {
           monitorFired = true;
           elapsedMs = (state.firedAt ?? Date.now()) - state.lastEventAt;
-          if (kill("SIGTERM")) terminationSignal = "SIGTERM";
+          kill("SIGTERM");
           sigkillTimer = setTimeout(() => {
-            if (kill("SIGKILL")) terminationSignal = "SIGKILL";
+            kill("SIGKILL");
           }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
         },
       });
@@ -78,10 +74,19 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
           },
         });
 
+        await killChain;
         expect(monitorFired, "monitor should fire when codex goes silent").toBe(true);
-        // Process was killed by our signal, not by hitting timeoutSec.
+        // Killed by us, not by hitting timeoutSec.
         expect(proc.timedOut).toBe(false);
-        expect(["SIGTERM", "SIGKILL"]).toContain(proc.signal);
+        if (process.platform === "win32") {
+          // Windows terminates by handle, so Node reports no signal even though
+          // our kill is exactly what ended the process. Asserting a POSIX signal
+          // here is what made this case fail on Windows for its whole life.
+          expect(proc.signal).toBeNull();
+          expect(proc.exitCode, "a terminated child must not look like a clean exit").not.toBe(0);
+        } else {
+          expect(["SIGTERM", "SIGKILL"]).toContain(proc.signal);
+        }
         expect(["SIGTERM", "SIGKILL"]).toContain(terminationSignal);
         // The errorMessage shape mirrors the AdapterExecutionResult that
         // execute.ts will produce for this case.
