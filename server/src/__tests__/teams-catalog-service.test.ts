@@ -39,7 +39,6 @@ const {
 } = await import("../services/teams-catalog.js");
 
 const CORE_EXEC_TEAM_ID = "paperclipai:bundled:company-defaults:core-exec-team";
-const CORE_EXEC_TEAM_HASH = "sha256:0f20e9d56124c1dc90a1e4b128fabd863538bcc935117220f719d9620f7c89f1";
 
 function agentWithCatalogTeam(originHash: string | null, extra: Record<string, unknown> = {}) {
   return {
@@ -389,12 +388,13 @@ describe("teamsCatalogService", () => {
 
   describe("listInstalledCatalogTeams", () => {
     it("marks a team out of date when an installed originHash differs from the catalog hash", async () => {
+      const svc = teamsCatalogService({} as any);
+      const currentTeam = await svc.getCatalogTeamOrThrow(CORE_EXEC_TEAM_ID);
       mockAgentService.list.mockResolvedValue([
         agentWithCatalogTeam("sha256:stale-hash"),
         agentWithCatalogTeam("sha256:stale-hash"),
         { id: "no-provenance", companyId: "company-1", metadata: null },
       ]);
-      const svc = teamsCatalogService({} as any);
 
       const installed = await svc.listInstalledCatalogTeams("company-1");
 
@@ -403,7 +403,7 @@ describe("teamsCatalogService", () => {
         expect.objectContaining({
           catalogId: CORE_EXEC_TEAM_ID,
           present: true,
-          currentContentHash: CORE_EXEC_TEAM_HASH,
+          currentContentHash: currentTeam.contentHash,
           installedOriginHashes: ["sha256:stale-hash"],
           agentCount: 2,
           outOfDate: true,
@@ -412,8 +412,9 @@ describe("teamsCatalogService", () => {
     });
 
     it("marks a team up to date when the installed originHash matches the catalog hash", async () => {
-      mockAgentService.list.mockResolvedValue([agentWithCatalogTeam(CORE_EXEC_TEAM_HASH)]);
       const svc = teamsCatalogService({} as any);
+      const currentTeam = await svc.getCatalogTeamOrThrow(CORE_EXEC_TEAM_ID);
+      mockAgentService.list.mockResolvedValue([agentWithCatalogTeam(currentTeam.contentHash)]);
 
       const installed = await svc.listInstalledCatalogTeams("company-1");
 

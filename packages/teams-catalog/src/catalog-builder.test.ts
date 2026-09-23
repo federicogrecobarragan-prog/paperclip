@@ -126,6 +126,32 @@ describe("teams catalog manifest", () => {
     expect(result.manifest.teams[0]!.contentHash).toMatch(/^sha256:[a-f0-9]{64}$/);
   });
 
+  it("pins the content hash algorithm and input bytes", async () => {
+    const packageDir = await createCatalogPackage();
+    await writeTeam(packageDir, "bundled", "software-development", "hash-fixture", {
+      frontmatter: [
+        "name: Hash Fixture",
+        "description: Minimal team fixture for the content hash contract.",
+        "schema: agentcompanies/v1",
+        "manager: agents/lead/AGENTS.md",
+      ],
+      files: {
+        "agents/lead/AGENTS.md": "---\nname: Lead\nslug: lead\n---\n\nLead.\n",
+      },
+    });
+
+    const result = await buildCatalogManifest({
+      packageDir,
+      generatedAt: "2026-06-03T00:00:00.000Z",
+      catalogSkills,
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(result.manifest.teams[0]!.contentHash).toBe(
+      "sha256:841d6d346322229ef82f267572a71e525fd8d4edc321389fb8144cf6e41b1b7b",
+    );
+  });
+
   it("reports frontmatter, directory, uniqueness, reference, and skill errors together", async () => {
     const packageDir = await createCatalogPackage();
     await writeTeam(packageDir, "bundled", "Bad_Category", "duplicate", {
