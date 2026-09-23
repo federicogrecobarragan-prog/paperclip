@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -60,4 +61,22 @@ test("a route/authz suite never leaks into the general-server shards", () => {
 test("shard flags are rejected for the parallel workspace groups", () => {
   const result = dryRun(["--mode", "general", "--group", "general-workspaces-a", "--shard-index", "0", "--shard-count", "3"]);
   assert.notEqual(result.status, 0, "workspace groups must not accept shard flags");
+});
+
+test("every non-server root Vitest project is assigned to exactly one CI workspace group", () => {
+  const config = readFileSync(path.join(repoRoot, "vitest.config.ts"), "utf8");
+  const declaredPaths = Array.from(config.matchAll(/^\s+"([^"]+)",$/gm), ([, projectPath]) => projectPath);
+  const expectedProjects = declaredPaths
+    .filter((projectPath) => projectPath !== "server")
+    .map((projectPath) => {
+      const manifest = JSON.parse(readFileSync(path.join(repoRoot, projectPath, "package.json"), "utf8"));
+      return manifest.name;
+    })
+    .sort();
+  const dryRunResult = dryRunJson(["--mode", "general"]);
+  const assignedProjects = Object.values(dryRunResult.generalWorkspaceProjects)
+    .flat()
+    .sort();
+
+  assert.deepEqual(assignedProjects, expectedProjects);
 });
