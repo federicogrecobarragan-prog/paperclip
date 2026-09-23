@@ -267,20 +267,30 @@ printf '%s\\n' '{"type":"result","subtype":"success","session_id":"cursor-sessio
 
     const runnerState = {
       commands: [] as string[],
+      scripts: [] as string[],
     };
+    const emptyWorkspaceTar = Buffer.alloc(1024);
     const runner = {
       execute: async (input: { command: string; args?: string[]; env?: Record<string, string> }) => {
         runnerState.commands.push(input.command);
         if (input.command === "sh") {
+          const script = (input.args ?? []).join(" ");
+          runnerState.scripts.push(script);
+          const stdout =
+            script.includes("wc -c <") && script.includes("workspace-download.tar")
+              ? `${emptyWorkspaceTar.byteLength}\n`
+              : script.includes("dd if=") && script.includes("workspace-download.tar")
+                ? `${emptyWorkspaceTar.toString("base64")}\n`
+                : "";
           return {
             exitCode: 0,
-          signal: null,
-          timedOut: false,
-          stdout: "",
-          stderr: "",
-          pid: 555,
-          startedAt: new Date().toISOString(),
-        };
+            signal: null,
+            timedOut: false,
+            stdout,
+            stderr: "",
+            pid: 555,
+            startedAt: new Date().toISOString(),
+          };
         }
 
         return runChildProcess(`cursor-fresh-lease-${runnerState.commands.length}`, input.command, input.args ?? [], {
@@ -343,6 +353,16 @@ printf '%s\\n' '{"type":"result","subtype":"success","session_id":"cursor-sessio
       const resolvedCommand = runMeta.find(Boolean)?.command as string | undefined;
       expect(resolvedCommand).toMatch(/\.local\/bin\/agent$/);
       expect(resolvedCommand).toContain(path.join(systemHomeDir, ".local", "bin", command));
+      expect(
+        runnerState.scripts.some(
+          (script) => script.includes("wc -c <") && script.includes("workspace-download.tar"),
+        ),
+      ).toBe(true);
+      expect(
+        runnerState.scripts.some(
+          (script) => script.includes("dd if=") && script.includes("workspace-download.tar"),
+        ),
+      ).toBe(true);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
