@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -198,6 +198,7 @@ import {
   sanitizeHeartbeatPersistenceRecord,
   sanitizeHeartbeatPersistenceText,
   sanitizeHeartbeatPersistenceValue,
+  sanitizeHeartbeatTerminalFinalizationRecord,
   sanitizeHeartbeatWakeupSkipReasonForPersistence,
 } from "./heartbeat-persistence-safety.js";
 import { createHeartbeatStreamRedactor } from "./heartbeat-stream-redaction.js";
@@ -4910,9 +4911,10 @@ function buildTerminalFinalizationPayload(input: {
   session: NonNullable<TerminalFinalizationPayload["session"]>;
 }): TerminalFinalizationPayload {
   // Explicit projection: never retain adapter result/context/diagnostic objects
-  // or executable codec behavior in the recovery journal. Sanitize the final
-  // serialized session too, including values produced by adapter codecs.
-  return sanitizeHeartbeatPersistenceRecord({
+  // or executable codec behavior in the recovery journal. Session params are
+  // opaque adapter-owned resume handles, so preserve their key-shaped values
+  // while retaining all structural, text, U+0000, and size sanitization.
+  return sanitizeHeartbeatTerminalFinalizationRecord({
     version: 1,
     adapterType: input.adapterType,
     ledger: {
@@ -4925,7 +4927,7 @@ function buildTerminalFinalizationPayload(input: {
     },
     session: input.session,
     completed: {},
-  }) as TerminalFinalizationPayload;
+  }).record as TerminalFinalizationPayload;
 }
 
 export interface HeartbeatServiceOptions {
@@ -6554,10 +6556,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (sanitized as Record<string, unknown>)[key] = sanitizeHeartbeatPersistenceText(value);
       }
     }
-    for (const key of ["usageJson", "resultJson", "contextSnapshot", "terminalFinalizationJson"] as const) {
+    for (const key of ["usageJson", "resultJson", "contextSnapshot"] as const) {
       const value = sanitized[key];
       if (value !== null && value !== undefined) {
         sanitized[key] = sanitizeHeartbeatPersistenceRecord(value);
+      }
+    }
+    if (sanitized.terminalFinalizationJson !== null && sanitized.terminalFinalizationJson !== undefined) {
+      const terminal = sanitizeHeartbeatTerminalFinalizationRecord(sanitized.terminalFinalizationJson);
+      sanitized.terminalFinalizationJson = terminal.record;
+      if (terminal.sensitiveKeyExceptions > 0) {
+        logger.warn(
+          {
+            adapterType: readNonEmptyString(terminal.record.adapterType),
+            sensitiveKeyExceptions: terminal.sensitiveKeyExceptions,
+          },
+          "preserved sensitive-looking adapter session parameter keys in durable terminal state",
+        );
       }
     }
     return sanitized;
@@ -6583,7 +6598,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
-    opts?: { expectedStatuses?: readonly string[] },
+    opts?: { expectedStatuses?: readonly string[]; additionalConditions?: readonly SQL[] },
   ) {
     const sanitizedPatch = sanitizeHeartbeatRunPatch(isHeartbeatRunTerminalStatus(status)
       ? { ...patch, terminalFinalizationJson: patch?.terminalFinalizationJson ?? emptyTerminalFinalizationPayload() }
@@ -6597,7 +6612,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             else coalesce(${heartbeatRuns.terminalFinalizationJson}, ${JSON.stringify(sanitizedPatch?.terminalFinalizationJson)}::jsonb) end`,
         } : {}), updatedAt: new Date() })
       .where(and(eq(heartbeatRuns.id, runId),
-        ...(opts?.expectedStatuses ? [inArray(heartbeatRuns.status, [...opts.expectedStatuses])] : [])))
+        ...(opts?.expectedStatuses ? [inArray(heartbeatRuns.status, [...opts.expectedStatuses])] : []),
+        ...(opts?.additionalConditions ?? [])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -7976,24 +7992,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     gate: Extract<ScheduledRetryGate, { allowed: false }>,
     now: Date,
   ) {
-    const cancelled = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "cancelled",
-        finishedAt: now,
-        error: gate.reason,
-        errorCode: gate.errorCode,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, run.id),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          lte(heartbeatRuns.scheduledRetryAt, now),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const cancelled = await setRunStatus(run.id, "cancelled", {
+      finishedAt: now,
+      error: gate.reason,
+      errorCode: gate.errorCode,
+    }, {
+      expectedStatuses: ["scheduled_retry"],
+      additionalConditions: [lte(heartbeatRuns.scheduledRetryAt, now)],
+    });
 
     if (!cancelled) return null;
 
@@ -12346,14 +12352,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (terminalSideEffectProgress.runtimeState) return;
         const terminalRun = await loadTerminalRunForSideEffects();
         if (!terminalRun) return;
-        await finalizeDurableRuntime(terminalRun, terminalRun.terminalFinalizationJson as TerminalFinalizationPayload);
+        const payload = parseTerminalFinalizationPayload(terminalRun.terminalFinalizationJson);
+        if (!payload) return;
+        await finalizeDurableRuntime(terminalRun, payload);
         terminalSideEffectProgress.runtimeState = true;
       };
       const finalizeTerminalTaskSession = async () => {
         if (terminalSideEffectProgress.taskSession || !taskKey) return;
         const terminalRun = await loadTerminalRunForSideEffects();
         if (!terminalRun) return;
-        await finalizeDurableTaskSession(terminalRun, terminalRun.terminalFinalizationJson as TerminalFinalizationPayload);
+        const payload = parseTerminalFinalizationPayload(terminalRun.terminalFinalizationJson);
+        if (!payload) return;
+        await finalizeDurableTaskSession(terminalRun, payload);
         terminalSideEffectProgress.taskSession = true;
       };
       const finalizeTerminalAgent = async () => {
@@ -12718,7 +12728,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       const failedRunWrite = await setTerminalRunStatusIfRunning(run.id, "failed", {
-        terminalFinalizationJson: sanitizeHeartbeatPersistenceRecord({
+        terminalFinalizationJson: sanitizeHeartbeatTerminalFinalizationRecord({
           ...emptyTerminalFinalizationPayload(),
           adapterType: agent.adapterType,
           session: {
@@ -12730,7 +12740,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             params: attachPaperclipSessionMetadataToSessionParams(previousSessionParams, configuredModel, sessionConfigMetadata),
             displayId: previousSessionDisplayId,
           },
-        }),
+        }).record,
         error: message,
         errorCode: failureErrorCode,
         finishedAt: new Date(),

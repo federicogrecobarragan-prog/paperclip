@@ -557,6 +557,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           status: heartbeatRuns.status,
           errorCode: heartbeatRuns.errorCode,
           wakeupRequestId: heartbeatRuns.wakeupRequestId,
+          terminalFinalizationJson: heartbeatRuns.terminalFinalizationJson,
         })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, scheduled.run.id))
@@ -564,6 +565,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(retryRun).toMatchObject({
         status: "cancelled",
         errorCode: "issue_not_in_progress",
+        terminalFinalizationJson: {
+          version: 1,
+          adapterType: null,
+          ledger: null,
+          session: null,
+          completed: {},
+        },
       });
 
       const wakeupRequest = await db
@@ -603,6 +611,38 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         requiredStatus: "in_progress",
         scheduledRetryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
       });
+
+      if (issueStatus === "blocked") {
+        // Recreate the state left by a process loss immediately after the run's
+        // terminal commit. The durable outbox must make both rows recoverable.
+        // Use a blocked issue so recovery proves cleanup without intentionally
+        // creating a new assignment-recovery execution path.
+        await db.update(agentWakeupRequests).set({
+          status: "queued",
+          finishedAt: null,
+          error: null,
+        }).where(eq(agentWakeupRequests.id, retryRun?.wakeupRequestId ?? ""));
+        await db.update(issues).set({
+          executionRunId: scheduled.run.id,
+          executionAgentNameKey: "claudecoder",
+          executionLockedAt: scheduled.dueAt,
+        }).where(eq(issues.id, issueId));
+
+        expect(await heartbeat.reconcileTerminalRuns()).toEqual({ completed: 1, pending: 0 });
+        const recoveredWakeup = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, retryRun?.wakeupRequestId ?? ""))
+          .then((rows) => rows[0] ?? null);
+        const recoveredIssue = await db
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0] ?? null);
+        expect(recoveredWakeup?.status).toBe("cancelled");
+        expect(recoveredIssue?.executionRunId).toBeNull();
+        expect((await heartbeat.getRun(scheduled.run.id))?.terminalFinalizedAt).toBeInstanceOf(Date);
+      }
     },
   );
 

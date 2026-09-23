@@ -3386,7 +3386,9 @@ export function agentRoutes(
     }
     // Keep legacy empty-body/default behavior, but share the modern endpoint's
     // enum contract. Do not echo an invalid value into the response or audit log.
-    const triggerDetail = wakeAgentSchema.shape.triggerDetail.safeParse(body.triggerDetail);
+    const triggerDetail = wakeAgentSchema.shape.triggerDetail.safeParse(
+      body.triggerDetail === null ? undefined : body.triggerDetail,
+    );
     if (!triggerDetail.success) {
       res.status(400).json({ error: "Invalid triggerDetail" });
       return;

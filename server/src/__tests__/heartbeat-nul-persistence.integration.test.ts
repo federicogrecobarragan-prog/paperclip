@@ -308,6 +308,80 @@ describeEmbeddedPostgres("heartbeat U+0000 PostgreSQL persistence", () => {
     expect(sessions).toHaveLength(1);
   });
 
+  it("preserves sensitive-looking keys in opaque adapter session params and reports the exception", async () => {
+    const { agentId } = await seedAgent();
+    const taskKey = `issue:${randomUUID()}`;
+    const warningSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      sessionParams: {
+        authToken: "resume-handle-alpha",
+        nested: { cookie: "resume-handle-beta" },
+      },
+      sessionDisplayId: "opaque-session",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      contextSnapshot: { taskKey },
+    });
+    expect(queued).toBeTruthy();
+    expect((await waitForTerminalRun(heartbeat, queued!.id))?.status).toBe("succeeded");
+    const { sessions } = await waitForPostTerminalState(db, agentId, queued!.id);
+    const terminal = await heartbeat.getRun(queued!.id);
+
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.sessionParamsJson).toMatchObject({
+      authToken: "resume-handle-alpha",
+      nested: { cookie: "resume-handle-beta" },
+    });
+    expect(terminal?.terminalFinalizationJson).toMatchObject({
+      session: {
+        params: {
+          authToken: "resume-handle-alpha",
+          nested: { cookie: "resume-handle-beta" },
+        },
+      },
+    });
+    expect(warningSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ adapterType: "http", sensitiveKeyExceptions: expect.any(Number) }),
+      "preserved sensitive-looking adapter session parameter keys in durable terminal state",
+    );
+    const warningContext = warningSpy.mock.calls.find(([, message]) =>
+      message === "preserved sensitive-looking adapter session parameter keys in durable terminal state"
+    )?.[0] as { sensitiveKeyExceptions?: number } | undefined;
+    expect(warningContext?.sensitiveKeyExceptions).toBeGreaterThanOrEqual(2);
+
+    mockAdapterExecute.mockRejectedValueOnce(new Error("synthetic adapter failure"));
+    const failed = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      contextSnapshot: { taskKey },
+    });
+    expect(failed).toBeTruthy();
+    expect((await waitForTerminalRun(heartbeat, failed!.id))?.status).toBe("failed");
+    const failedState = await waitForPostTerminalState(db, agentId, failed!.id);
+    const failedTerminal = await heartbeat.getRun(failed!.id);
+
+    expect(failedState.sessions).toHaveLength(1);
+    expect(failedState.sessions[0]?.sessionParamsJson).toMatchObject({
+      authToken: "resume-handle-alpha",
+      nested: { cookie: "resume-handle-beta" },
+    });
+    expect(failedTerminal?.terminalFinalizationJson).toMatchObject({
+      session: {
+        params: {
+          authToken: "resume-handle-alpha",
+          nested: { cookie: "resume-handle-beta" },
+        },
+      },
+    });
+  });
+
   it("fails the full run when a known optional field is accessor-backed without executing it", async () => {
     const { agentId } = await seedAgent();
     let getterCalls = 0;

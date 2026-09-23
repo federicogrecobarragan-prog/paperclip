@@ -9,6 +9,7 @@ import {
   sanitizeHeartbeatPersistenceRecord,
   sanitizeHeartbeatPersistenceText,
   sanitizeHeartbeatPersistenceValue,
+  sanitizeHeartbeatTerminalFinalizationRecord,
   sanitizeHeartbeatWakeupSkipReasonForPersistence,
 } from "./heartbeat-persistence-safety.js";
 
@@ -493,6 +494,54 @@ describe("heartbeat persistence safety", () => {
       apiKey: "***REDACTED***",
       commandArgs: ["--api-key", "***REDACTED***", "safe-next"],
     });
+  });
+
+  it("preserves opaque session resume keys only inside terminal session params", () => {
+    const sanitized = sanitizeHeartbeatTerminalFinalizationRecord({
+      version: 1,
+      authToken: "outer-canary",
+      session: {
+        cookie: "session-canary",
+        params: {
+          authToken: "resume-handle-alpha",
+          nested: { cookie: "resume-handle-beta" },
+        },
+      },
+    });
+
+    expect(sanitized.sensitiveKeyExceptions).toBe(2);
+    expect(sanitized.record).toEqual({
+      version: 1,
+      authToken: "***REDACTED***",
+      session: {
+        cookie: "***REDACTED***",
+        params: {
+          authToken: "resume-handle-alpha",
+          nested: { cookie: "resume-handle-beta" },
+        },
+      },
+    });
+  });
+
+  it("keeps opaque adapter session params while redacting the same keys from result data", () => {
+    const result = normalizeAdapterExecutionResultForPersistence({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      sessionParams: {
+        authToken: "resume-handle-alpha",
+        nested: { cookie: "resume-handle-beta" },
+      },
+      resultJson: {
+        authToken: "result-canary",
+      },
+    });
+
+    expect(result.sessionParams).toEqual({
+      authToken: "resume-handle-alpha",
+      nested: { cookie: "resume-handle-beta" },
+    });
+    expect(result.resultJson).toEqual({ authToken: "***REDACTED***" });
   });
 
   it("redacts an opaque token assignment split by U+0000", () => {

@@ -103,9 +103,12 @@ type SanitizerState = {
   outputSlots: number;
   outputBytes: number;
   stringChars: number;
+  sensitiveKeyExceptions: number;
   ancestors: WeakSet<object>;
   seen: WeakSet<object>;
 };
+
+type SanitizerMode = "default" | "terminal_root" | "terminal_session" | "terminal_session_params";
 
 export class InvalidAdapterExecutionResultError extends Error {
   readonly code = "invalid_adapter_execution_result";
@@ -378,7 +381,7 @@ function sanitizeValue(
   value: unknown,
   state: SanitizerState,
   depth: number,
-  options: { commandArgs?: boolean } = {},
+  options: { commandArgs?: boolean; mode?: SanitizerMode } = {},
 ): unknown | typeof OMIT {
   if (!consumeWork(state)) return OMIT;
   if (typeof value === "string") return truncateString(value, state);
@@ -407,7 +410,7 @@ function sanitizeValue(
   }
 
   const boxed = sanitizeBoxedPrimitive(value);
-  if (boxed !== OMIT) return sanitizeValue(boxed, state, depth + 1);
+  if (boxed !== OMIT) return sanitizeValue(boxed, state, depth + 1, options);
 
   state.ancestors.add(value);
   try {
@@ -430,18 +433,18 @@ function sanitizeValue(
         let sanitized: unknown | typeof OMIT;
         if (options.commandArgs && redactNextCommandArg) {
           redactNextCommandArg = false;
-          sanitized = sanitizeValue(REDACTED_EVENT_VALUE, state, depth + 1);
+          sanitized = sanitizeValue(REDACTED_EVENT_VALUE, state, depth + 1, options);
         } else if (!descriptor) {
-          sanitized = sanitizeValue(null, state, depth + 1);
+          sanitized = sanitizeValue(null, state, depth + 1, options);
         } else if (!("value" in descriptor)) {
           if (options.commandArgs) redactNextCommandArg = true;
-          sanitized = sanitizeValue(null, state, depth + 1);
+          sanitized = sanitizeValue(null, state, depth + 1, options);
         } else {
           const entry = descriptor.value;
           if (options.commandArgs && commandArgRedactsNext(entry)) {
             redactNextCommandArg = true;
           }
-          sanitized = sanitizeValue(entry, state, depth + 1);
+          sanitized = sanitizeValue(entry, state, depth + 1, options);
         }
         if (sanitized === OMIT) {
           state.outputBytes -= separatorBytes;
@@ -487,11 +490,24 @@ function sanitizeValue(
       if (safeKey === null) break;
       const propertyBytes = (storedKeys > 0 ? 1 : 0) + jsonStringByteLength(safeKey) + 1;
       if (!consumeOutputBytes(state, propertyBytes)) break;
-      const rawEntry = isSensitivePayloadKey(key)
+      const mode = options.mode ?? "default";
+      const childMode: SanitizerMode =
+        mode === "terminal_root" && key === "session"
+          ? "terminal_session"
+          : mode === "terminal_session" && key === "params"
+            ? "terminal_session_params"
+            : mode === "terminal_session_params"
+              ? "terminal_session_params"
+              : "default";
+      const sensitiveKey = isSensitivePayloadKey(key);
+      const preserveSensitiveKey = mode === "terminal_session_params" && sensitiveKey;
+      if (preserveSensitiveKey) state.sensitiveKeyExceptions += 1;
+      const rawEntry = sensitiveKey && !preserveSensitiveKey
         ? REDACTED_EVENT_VALUE
         : descriptor.value;
       const sanitized = sanitizeValue(rawEntry, state, depth + 1, {
-        commandArgs: isCommandArgsPayloadKey(key),
+        commandArgs: mode !== "terminal_session_params" && isCommandArgsPayloadKey(key),
+        mode: childMode,
       });
       if (sanitized === OMIT) {
         state.outputBytes -= propertyBytes;
@@ -520,6 +536,7 @@ function createState(): SanitizerState {
     outputSlots: 0,
     outputBytes: 0,
     stringChars: 0,
+    sensitiveKeyExceptions: 0,
     ancestors: new WeakSet<object>(),
     seen: new WeakSet<object>(),
   };
@@ -534,6 +551,20 @@ export function sanitizeHeartbeatPersistenceRecord(value: unknown): Record<strin
   const sanitized = sanitizeHeartbeatPersistenceValue(value);
   if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) return {};
   return sanitized as Record<string, unknown>;
+}
+
+export function sanitizeHeartbeatTerminalFinalizationRecord(value: unknown): {
+  record: Record<string, unknown>;
+  sensitiveKeyExceptions: number;
+} {
+  const state = createState();
+  const sanitized = sanitizeValue(value, state, 0, { mode: "terminal_root" });
+  return {
+    record: sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)
+      ? sanitized as Record<string, unknown>
+      : {},
+    sensitiveKeyExceptions: state.sensitiveKeyExceptions,
+  };
 }
 
 function ownDataField(
@@ -865,7 +896,12 @@ export function normalizeAdapterExecutionResultForPersistence(input: unknown): A
       if (required) invalidContract(`${field} exceeds persistence budget`);
       return;
     }
-    const sanitized = sanitizeValue(value, state, 0);
+    const sanitized = sanitizeValue(
+      value,
+      state,
+      0,
+      field === "sessionParams" ? { mode: "terminal_session_params" } : undefined,
+    );
     if (sanitized === OMIT) {
       state.outputBytes -= propertyBytes;
       if (required || field === "usage" || field === "runtimeServices" || field === "question") {
