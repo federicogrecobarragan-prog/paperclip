@@ -4,24 +4,18 @@ import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  computeLanes,
+  LANE_EXCLUSIONS,
+  SERVER_LANE,
+  WORKSPACES_A_LANE,
+  WORKSPACES_B_LANE,
+} from "./vitest-lanes.mjs";
+
 const repoRoot = process.cwd();
 const serverRoot = path.join(repoRoot, "server");
 const serverSrcDir = path.join(repoRoot, "server", "src");
 const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
-const nonServerProjects = [
-  "@paperclipai/shared",
-  "@paperclipai/skills-catalog",
-  "@paperclipai/teams-catalog",
-  "@paperclipai/db",
-  "@paperclipai/adapter-utils",
-  "@paperclipai/adapter-acpx-local",
-  "@paperclipai/adapter-codex-local",
-  "@paperclipai/adapter-opencode-local",
-  "@paperclipai/plugin-sdk",
-  "@paperclipai/create-paperclip-plugin",
-  "@paperclipai/ui",
-  "paperclipai",
-];
 const routeTestPattern = /[^/]*(?:route|routes|authz)[^/]*\.test\.ts$/;
 const additionalSerializedServerTests = new Set([
   "server/src/__tests__/approval-routes-idempotency.test.ts",
@@ -53,11 +47,19 @@ let invocationIndex = 0;
 const serializedModeName = "serialized";
 const generalModeName = "general";
 const allModeName = "all";
-const generalServerGroupName = "general-server";
-const generalWorkspacesAGroupName = "general-workspaces-a";
-const generalWorkspacesBGroupName = "general-workspaces-b";
-const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
-const generalWorkspacesBProjects = nonServerProjects.filter((project) => !generalWorkspacesAProjects.includes(project));
+const generalServerGroupName = SERVER_LANE;
+const generalWorkspacesAGroupName = WORKSPACES_A_LANE;
+const generalWorkspacesBGroupName = WORKSPACES_B_LANE;
+// Lanes are derived from vitest.projects.mjs — the same list vitest.config.ts
+// declares — so a project can never be declared to Vitest and run in no lane.
+// See scripts/vitest-lanes.mjs (LAC-1384).
+const {
+  declaredProjects,
+  lanes,
+  laneA: generalWorkspacesAProjects,
+  laneB: generalWorkspacesBProjects,
+  excluded: laneExcludedProjects,
+} = computeLanes();
 const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, generalWorkspacesBGroupName];
 const serializedServerVitestArgs = [
   "--no-file-parallelism",
@@ -281,7 +283,25 @@ function runGeneralSuites(routeTests) {
   }
 }
 
+// Print what the lane is about to run, and anything deliberately left out, before
+// the first Vitest invocation. A lane that silently runs nothing looks exactly
+// like a lane that passed.
+function announceProjectGroup(projects, groupName) {
+  console.log(`\n[test:run] ${groupName} covers ${projects.length} project(s): ${projects.join(", ") || "(none)"}`);
+  if (laneExcludedProjects.length > 0) {
+    console.log(`[test:run] ${laneExcludedProjects.length} declared project(s) deliberately excluded from every lane:`);
+    for (const project of laneExcludedProjects) {
+      console.log(`[test:run]   - ${project}: ${LANE_EXCLUSIONS[project]}`);
+    }
+  }
+}
+
 function runProjectGroup(projects, groupName) {
+  announceProjectGroup(projects, groupName);
+  if (projects.length === 0) {
+    fail(`${groupName} resolved to zero projects. An empty lane is a false green, not a pass.`);
+  }
+
   for (const project of projects) {
     runVitest(["--project", project], `${groupName} project ${project}`);
   }
@@ -391,6 +411,16 @@ if (options.dryRun) {
         shardCount: options.shardCount,
         group: options.group,
         availableGeneralGroups: generalGroupNames,
+        // Lane composition, derived from vitest.projects.mjs. The coverage guard
+        // in scripts/__tests__/vitest-lane-coverage.test.mjs reads these fields so
+        // it checks what CI really runs instead of reimplementing the split.
+        declaredProjects: declaredProjects.map((entry) => ({
+          dir: entry.dir,
+          project: entry.project,
+          testFileCount: entry.testFileCount,
+        })),
+        lanes,
+        laneExclusions: Object.entries(LANE_EXCLUSIONS).map(([project, reason]) => ({ project, reason })),
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
         generalServerSuiteCount: generalServerTestFiles.length,
