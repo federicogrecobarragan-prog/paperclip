@@ -2,3 +2,5 @@
 # la conversion CRLF de Windows rompe install-catalog (422 pinned hash mismatch).
 packages/skills-catalog/catalog/** text eol=lf
 packages/teams-catalog/catalog/** text eol=lf
+packages/skills-catalog/generated/catalog.json text eol=lf
+packages/teams-catalog/generated/catalog.json text eol=lf
