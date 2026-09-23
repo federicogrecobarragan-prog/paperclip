@@ -21,7 +21,9 @@ async function waitFor(read: () => boolean, timeoutMs = 8_000) {
 }
 
 describe("Windows orphaned descendant sweep", () => {
-  it("refuses a sweep it cannot prove it owns", async () => {
+  // win32-only like the rest of this file: off Windows the platform guard
+  // rejects first, which is itself the contract that keeps taskkill off Linux.
+  it.runIf(process.platform === "win32")("refuses a sweep it cannot prove it owns", async () => {
     // Without the owning run's start time we cannot rule out PID reuse, so the
     // dangerous branch must fail closed rather than guess.
     await expect(
