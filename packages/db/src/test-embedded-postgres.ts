@@ -103,7 +103,19 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
 }
 
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  try {
+    // Windows refuses to unlink a file that is still open, and Postgres keeps
+    // its data-dir handles for a moment after `stop()` returns. `maxRetries`
+    // is Node's built-in backoff for exactly that EPERM/EBUSY window.
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  } catch (error) {
+    // This is scratch space under the OS temp root: leaving it behind is
+    // harmless and the OS reclaims it. Failing teardown here would turn a
+    // suite whose assertions all passed into a red run, which is worse --
+    // so report it and move on.
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(`[test-embedded-postgres] could not remove ${dataDir}: ${reason}`);
+  }
 }
 
 function formatEmbeddedPostgresError(error: unknown): string {
