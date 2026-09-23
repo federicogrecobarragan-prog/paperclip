@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  codexStdoutHasTurnCompleted,
   extractCodexRetryNotBefore,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
@@ -137,5 +138,53 @@ describe("isCodexTransientUpstreamError", () => {
         ].join("\n"),
       }),
     ).toBe(false);
+  });
+});
+
+// LAC-1352: without this signal nothing tells the adapter that codex finished,
+// so a lingering codex.exe is only noticed by the output-inactivity monitor --
+// which by design waits its full timeout (7 min) after the work already ended.
+describe("codexStdoutHasTurnCompleted", () => {
+  it("detects the terminal turn events", () => {
+    expect(
+      codexStdoutHasTurnCompleted(
+        [
+          JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "done" } }),
+          JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10 } }),
+        ].join("\n"),
+      ),
+    ).toBe(true);
+    expect(
+      codexStdoutHasTurnCompleted(JSON.stringify({ type: "turn.failed", error: { message: "nope" } })),
+    ).toBe(true);
+  });
+
+  it("stays false while the turn is still running", () => {
+    expect(codexStdoutHasTurnCompleted("")).toBe(false);
+    expect(
+      codexStdoutHasTurnCompleted(
+        [
+          JSON.stringify({ type: "thread.started", thread_id: "thread_1" }),
+          JSON.stringify({ type: "item.started", item: { type: "command_execution" } }),
+        ].join("\n"),
+      ),
+    ).toBe(false);
+  });
+
+  it("ignores the marker quoted inside agent output", () => {
+    // The agent can print the literal event name while explaining itself; only
+    // a real JSON event may arm cleanup.
+    expect(
+      codexStdoutHasTurnCompleted(
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: 'codex emits {"type":"turn.completed"} at the end' },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("ignores a truncated line from a partial scan window", () => {
+    expect(codexStdoutHasTurnCompleted('e":"turn.completed","usage":{}}')).toBe(false);
   });
 });

@@ -133,6 +133,7 @@ import {
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
+import { terminateWindowsOrphanedDescendants } from "@paperclipai/adapter-utils/windows-process-tree";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -257,6 +258,12 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+/**
+ * How long a run may keep an in-memory process handle after every PID it
+ * recorded is dead, before the reaper treats the handle as stale. Long enough
+ * that a child whose `close` event is still in flight is never raced.
+ */
+const STALE_RUN_PROCESS_HANDLE_GRACE_MS = 60_000;
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -4374,7 +4381,10 @@ async function terminateHeartbeatRunProcess(input: {
 function buildProcessLossMessage(run: {
   processPid: number | null;
   processGroupId: number | null;
-}, options?: { descendantOnly?: boolean }) {
+}, options?: { descendantOnly?: boolean; orphanedDescendants?: number[] }) {
+  if (options?.orphanedDescendants && options.orphanedDescendants.length > 0) {
+    return `Process lost -- parent pid ${run.processPid ?? "unknown"} exited, but orphaned descendants ${options.orphanedDescendants.join(", ")} were still alive and were terminated`;
+  }
   if (options?.descendantOnly && run.processGroupId) {
     return `Process lost -- parent pid ${run.processPid ?? "unknown"} exited, but descendant process group ${run.processGroupId} was still alive and was terminated`;
   }
@@ -9212,6 +9222,56 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * An in-memory handle only proves a run is live while the process it points
+   * at is alive.
+   *
+   * On Windows the adapter's kill reaches the wrapper PID only; its
+   * descendants survive, keep our stdio pipes open, and `close` never fires --
+   * so `runningProcesses` keeps a handle to a dead PID forever and the reaper
+   * skipped the row for good (LAC-1352). Treat the handle as stale only when
+   * every PID we recorded is provably gone, and only after a grace window, so
+   * a child whose `close` is about to fire is never raced.
+   */
+  function runProcessHandleIsStale(
+    run: typeof heartbeatRuns.$inferSelect,
+    tracksLocalChild: boolean,
+    now: Date,
+  ) {
+    if (!tracksLocalChild) return false;
+    const handlePid = runningProcesses.get(run.id)?.child.pid ?? null;
+    const pids = [run.processPid, handlePid].filter(
+      (pid): pid is number => typeof pid === "number" && Number.isInteger(pid) && pid > 0,
+    );
+    // Nothing spawned yet: the execution owns the row, not the reaper.
+    if (pids.length === 0) return false;
+    if (pids.some((pid) => isProcessAlive(pid))) return false;
+    // POSIX keeps real process groups; a surviving group still owns the run.
+    if (isProcessGroupAlive(run.processGroupId)) return false;
+    const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+    return now.getTime() - refTime >= STALE_RUN_PROCESS_HANDLE_GRACE_MS;
+  }
+
+  /**
+   * Windows keeps a dead wrapper's PID on its children, so a lost run can still
+   * be traced to the `node -> codex.exe` pair it stranded. Sweep them with the
+   * run's recorded process start as proof of ownership against PID reuse.
+   */
+  async function sweepWindowsOrphanedDescendants(run: typeof heartbeatRuns.$inferSelect) {
+    if (process.platform !== "win32") return null;
+    const rootPid = run.processPid;
+    const startedAtMs = run.processStartedAt ? new Date(run.processStartedAt).getTime() : Number.NaN;
+    if (typeof rootPid !== "number" || rootPid <= 0 || !Number.isFinite(startedAtMs)) return null;
+    try {
+      const result = await terminateWindowsOrphanedDescendants({ rootPid, ownerStartedAtMs: startedAtMs });
+      return result.terminated.length > 0 || result.skipped.length > 0 ? result : null;
+    } catch {
+      // A failed sweep must not block finalizing the row: a stranded process is
+      // bad, a permanently `running` row that hides it is worse.
+      return null;
+    }
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -9230,7 +9290,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const tracked = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
+      const staleHandle = tracked && runProcessHandleIsStale(run, tracksLocalChild, now);
+      if (tracked && !staleHandle) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -9238,7 +9301,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      if (staleHandle) {
+        // Drop the handle we own. `activeRunExecutions` belongs to the
+        // execution path and is cleared by its own `finally`.
+        runningProcesses.delete(run.id);
+      }
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
@@ -9272,8 +9339,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
+      // Windows has no process group to check, so the branch above can never
+      // catch its orphans. Trace them through the dead wrapper's PID instead.
+      const windowsOrphanSweep = tracksLocalChild ? await sweepWindowsOrphanedDescendants(run) : null;
+      if (windowsOrphanSweep && windowsOrphanSweep.terminated.length > 0) {
+        descendantOnlyCleanup = true;
+      }
+
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const baseMessage = buildProcessLossMessage(run, {
+        descendantOnly: descendantOnlyCleanup,
+        orphanedDescendants: windowsOrphanSweep?.terminated,
+      });
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -9325,6 +9402,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
+          ...(staleHandle ? { staleProcessHandleCleared: true } : {}),
+          ...(windowsOrphanSweep?.terminated.length ? { orphanedDescendantsTerminated: windowsOrphanSweep.terminated } : {}),
+          ...(windowsOrphanSweep?.skipped.length ? { orphanedDescendantsSkipped: windowsOrphanSweep.skipped } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
         },
       });
