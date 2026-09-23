@@ -424,7 +424,7 @@ async function collectTeamFiles(
   files.sort((a, b) => {
     if (a.path === TEAM_ENTRYPOINT) return -1;
     if (b.path === TEAM_ENTRYPOINT) return 1;
-    return a.path.localeCompare(b.path);
+    return comparePaths(a.path, b.path);
   });
 
   if (!files.some((file) => file.path === TEAM_ENTRYPOINT && file.kind === "team")) {
@@ -920,7 +920,11 @@ function validateSlug(label: string, value: string, prefix: string, errors: stri
 }
 
 async function sortedDirEntries(dir: string) {
-  return (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+  return (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => comparePaths(a.name, b.name));
+}
+
+function comparePaths(a: string, b: string) {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function sameManifestExceptGeneratedAt(a: CatalogManifest, b: CatalogManifest) {

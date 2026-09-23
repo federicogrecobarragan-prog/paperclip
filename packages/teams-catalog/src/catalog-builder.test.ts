@@ -152,6 +152,37 @@ describe("teams catalog manifest", () => {
     );
   });
 
+  it("orders collation-sensitive paths by code point before hashing", async () => {
+    const packageDir = await createCatalogPackage();
+    await writeTeam(packageDir, "bundled", "software-development", "portable-order", {
+      frontmatter: [
+        "name: Portable Order",
+        "description: Exercises deterministic file ordering across runtimes.",
+        "schema: agentcompanies/v1",
+        "manager: agents/lead/AGENTS.md",
+      ],
+      files: {
+        "a.md": "lowercase path\n",
+        "Z.md": "uppercase path\n",
+        "agents/lead/AGENTS.md": "---\nname: Lead\nslug: lead\n---\n\nLead.\n",
+      },
+    });
+
+    const result = await buildCatalogManifest({
+      packageDir,
+      generatedAt: "2026-06-03T00:00:00.000Z",
+      catalogSkills,
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(result.manifest.teams[0]!.files.map((file) => file.path)).toEqual([
+      "TEAM.md",
+      "Z.md",
+      "a.md",
+      "agents/lead/AGENTS.md",
+    ]);
+  });
+
   it("reports frontmatter, directory, uniqueness, reference, and skill errors together", async () => {
     const packageDir = await createCatalogPackage();
     await writeTeam(packageDir, "bundled", "Bad_Category", "duplicate", {
