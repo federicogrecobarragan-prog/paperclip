@@ -248,7 +248,7 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return routeTests.filter((_, index) => index % shardCount === shardIndex);
 }
 
-function runVitest(args, label) {
+function runVitest(args, label, { exitOnFailure = true } = {}) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -273,8 +273,14 @@ function runVitest(args, label) {
     process.exit(1);
   }
   if (result.status !== 0) {
-    process.exit(result.status ?? 1);
+    if (exitOnFailure) {
+      process.exit(result.status ?? 1);
+    }
+
+    return result.status ?? 1;
   }
+
+  return 0;
 }
 
 function runGeneralSuites(routeTests) {
@@ -296,15 +302,32 @@ function announceProjectGroup(projects, groupName) {
   }
 }
 
+// A workspace lane runs every project before it gives up. Bailing out on the
+// first red project hides the state of the rest behind one fix-and-push cycle
+// each, which is how the lane ends up describing less than it actually covers.
 function runProjectGroup(projects, groupName) {
   announceProjectGroup(projects, groupName);
   if (projects.length === 0) {
     fail(`${groupName} resolved to zero projects. An empty lane is a false green, not a pass.`);
   }
 
+  const failedProjects = [];
   for (const project of projects) {
-    runVitest(["--project", project], `${groupName} project ${project}`);
+    const status = runVitest(["--project", project], `${groupName} project ${project}`, {
+      exitOnFailure: false,
+    });
+    if (status !== 0) {
+      failedProjects.push(project);
+    }
   }
+
+  if (failedProjects.length > 0) {
+    fail(
+      `${groupName}: ${failedProjects.length} of ${projects.length} project(s) failed: ${failedProjects.join(", ")}`,
+    );
+  }
+
+  console.log(`\n[test:run] ${groupName}: all ${projects.length} project(s) passed.`);
 }
 
 function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = null) {
