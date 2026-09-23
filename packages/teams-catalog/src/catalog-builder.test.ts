@@ -30,7 +30,90 @@ describe("teams catalog manifest", () => {
   it("does not use locale-sensitive comparisons in the catalog builder", async () => {
     const source = await fs.readFile(new URL("./catalog-builder.ts", import.meta.url), "utf8");
 
-    expect(source).not.toContain("localeCompare");
+    const localeSensitiveApis = [
+      "localeCompare",
+      "Intl.Collator",
+      "toLocaleUpperCase",
+      "toLocaleLowerCase",
+      "toLocaleString",
+      "Intl.Segmenter",
+    ];
+
+    for (const api of localeSensitiveApis) {
+      expect(source, `catalog-builder.ts must not use ${api}`).not.toContain(api);
+    }
+  });
+
+  it("orders teams and nested catalog collections by code unit", async () => {
+    const packageDir = await createCatalogPackage();
+    await writeTeam(packageDir, "bundled", "software-development", "a-team", {
+      frontmatter: [
+        "name: Lowercase Team",
+        "description: Locale-sensitive team ordering fixture.",
+        "schema: agentcompanies/v1",
+        "manager: agents/lead/AGENTS.md",
+      ],
+      files: {
+        "agents/lead/AGENTS.md": "---\nname: Lead\nslug: lead\n---\n\nLead.\n",
+      },
+    });
+    await writeTeam(packageDir, "bundled", "software-development", "Z-team", {
+      frontmatter: [
+        "name: Uppercase Team",
+        "description: Exercises deterministic nested collection ordering.",
+        "schema: agentcompanies/v1",
+        "manager: agents/lead/AGENTS.md",
+        "requiredSkills:",
+        "  -",
+        "    type: github",
+        "    ref: Z-skill",
+        "  -",
+        "    type: github",
+        "    ref: a-skill",
+        "includes:",
+        "  - https://Z.example/team.git#0123456789012345678901234567890123456789",
+        "  - https://a.example/team.git#0123456789012345678901234567890123456789",
+      ],
+      files: {
+        "agents/lead/AGENTS.md": [
+          "---",
+          "name: Lead",
+          "slug: lead",
+          "inputs:",
+          "  env:",
+          "    Z_ENV:",
+          "      kind: plain",
+          "      requirement: required",
+          "    a_ENV:",
+          "      kind: secret",
+          "      requirement: optional",
+          "---",
+          "",
+          "Lead.",
+        ].join("\n"),
+      },
+    });
+
+    const result = await buildCatalogManifest({
+      packageDir,
+      generatedAt: "2026-06-03T00:00:00.000Z",
+      catalogSkills,
+    });
+
+    expect(result.errors).toEqual([
+      expect.stringContaining('has invalid slug "Z-team"'),
+    ]);
+    expect(result.manifest.teams.map((team) => team.slug)).toEqual(["Z-team", "a-team"]);
+
+    const team = result.manifest.teams[0]!;
+    expect(team.requiredSkills.map((skill) => skill.ref)).toEqual(["Z-skill", "a-skill"]);
+    expect(team.envInputs.map((input) => input.key)).toEqual(["Z_ENV", "a_ENV"]);
+    expect(team.sourceRefs.map((source) => `${source.type}:${source.ref}`)).toEqual([
+      "github:Z-skill",
+      "github:a-skill",
+      "include:https://Z.example/team.git#0123456789012345678901234567890123456789",
+      "include:https://a.example/team.git#0123456789012345678901234567890123456789",
+    ]);
   });
 
   it("builds stable manifest entries from catalog team directories", async () => {
