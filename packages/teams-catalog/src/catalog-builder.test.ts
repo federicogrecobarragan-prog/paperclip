@@ -27,6 +27,12 @@ describe("teams catalog manifest", () => {
     await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
   });
 
+  it("does not use locale-sensitive comparisons in the catalog builder", async () => {
+    const source = await fs.readFile(new URL("./catalog-builder.ts", import.meta.url), "utf8");
+
+    expect(source).not.toContain("localeCompare");
+  });
+
   it("builds stable manifest entries from catalog team directories", async () => {
     const packageDir = await createCatalogPackage();
     await writeTeam(packageDir, "bundled", "software-development", "product-engineering", {
@@ -152,7 +158,7 @@ describe("teams catalog manifest", () => {
     );
   });
 
-  it("orders collation-sensitive paths by code point before hashing", async () => {
+  it("orders collation-sensitive paths by code unit before hashing", async () => {
     const packageDir = await createCatalogPackage();
     await writeTeam(packageDir, "bundled", "software-development", "portable-order", {
       frontmatter: [
