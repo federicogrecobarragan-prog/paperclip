@@ -239,6 +239,24 @@ type EnsureCodexSkillsInjectedOptions = {
   linkSkill?: (source: string, target: string) => Promise<void>;
 };
 
+async function linkCodexSkillDirectory(
+  source: string,
+  target: string,
+  customLinkSkill?: (source: string, target: string) => Promise<void>,
+): Promise<void> {
+  if (customLinkSkill) {
+    await customLinkSkill(source, target);
+    return;
+  }
+
+  if (process.platform === "win32") {
+    await fs.symlink(path.resolve(source), path.resolve(target), "junction");
+    return;
+  }
+
+  await fs.symlink(source, target);
+}
+
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -298,7 +316,8 @@ export async function ensureCodexSkillsInjected(
 
   const skillsHome = options.skillsHome ?? resolveCodexSkillsDir(resolveSharedCodexHomeDir());
   await fs.mkdir(skillsHome, { recursive: true });
-  const linkSkill = options.linkSkill;
+  const linkSkill = (source: string, target: string) =>
+    linkCodexSkillDirectory(source, target, options.linkSkill);
   for (const entry of skillsEntries) {
     const target = path.join(skillsHome, entry.runtimeName);
 
@@ -315,11 +334,7 @@ export async function ensureCodexSkillsInjected(
           (await isLikelyPaperclipRuntimeSkillPath(resolvedLinkedPath, entry.runtimeName))
         ) {
           await fs.unlink(target);
-          if (linkSkill) {
-            await linkSkill(entry.source, target);
-          } else {
-            await fs.symlink(entry.source, target);
-          }
+          await linkSkill(entry.source, target);
           await onLog(
             "stdout",
             `[paperclip] Repaired Codex skill "${entry.runtimeName}" into ${skillsHome}\n`,

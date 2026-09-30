@@ -9,6 +9,7 @@ on:
       - "server/src/services/heartbeat.ts"
       - "server/src/services/local-service-supervisor.ts"
       - "server/src/__tests__/local-service-supervisor-windows.test.ts"
+      - "server/src/__tests__/codex-local-skill-injection.test.ts"
   workflow_dispatch:
 
 permissions:
@@ -31,14 +32,14 @@ jobs:
       - name: Exercise real Windows descendants and reject skipped tests
         shell: pwsh
         run: |
-          pnpm exec vitest run packages/adapter-utils/src/windows-process-tree.test.ts packages/adapter-utils/src/windows-orphan-sweep.test.ts server/src/__tests__/local-service-supervisor-windows.test.ts packages/adapters/codex-local/src/server/output-inactivity-monitor.integration.test.ts --reporter=default --reporter=junit --outputFile.junit=windows-process-tree.junit.xml
+          pnpm exec vitest run packages/adapter-utils/src/windows-process-tree.test.ts packages/adapter-utils/src/windows-orphan-sweep.test.ts server/src/__tests__/local-service-supervisor-windows.test.ts packages/adapters/codex-local/src/server/output-inactivity-monitor.integration.test.ts server/src/__tests__/codex-local-skill-injection.test.ts --reporter=default --reporter=junit --outputFile.junit=windows-process-tree.junit.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           [xml]$report = Get-Content -LiteralPath windows-process-tree.junit.xml -Raw
           # These cases are `runIf(win32)`: on any other runner they would report
           # green by skipping. The floor is what stops the suite from silently
           # shrinking back to a gate that proves nothing. Raise it when adding
           # cases; never lower it to make a red build pass.
-          $expected = 8
+          $expected = 16
           $executed = $report.SelectNodes('//testcase').Count
           $inconclusive = $report.SelectNodes('//skipped | //failure | //error').Count
           if ($executed -lt $expected -or $inconclusive -gt 0) {
