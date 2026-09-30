@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+
+import {
+  HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE,
+  requiredJUnitGuardForSuite,
+  verifyVitestJUnitReport,
+} from "../vitest-junit-guard.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const script = path.join(repoRoot, "scripts", "run-vitest-stable.mjs");
@@ -78,6 +86,127 @@ test("a route/authz suite never leaks into the general-server shards", () => {
       `route/authz suite must stay in the serialized lane, not general-server: ${file}`,
     );
   }
+});
+
+function junitSuite({ tests = 9, failures = 0, errors = 0, skipped = 0 } = {}) {
+  const cases = Array.from({ length: tests }, (_, index) => {
+    const outcome =
+      index < failures
+        ? "<failure/>"
+        : index < failures + errors
+          ? "<error/>"
+          : index < failures + errors + skipped
+            ? "<skipped/>"
+            : "";
+    return `<testcase name="synthetic-${index + 1}">${outcome}</testcase>`;
+  }).join("");
+  return (
+    `<testsuites tests="${tests}" failures="${failures}" errors="${errors}">` +
+    `<testsuite name="${HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE}" tests="${tests}" ` +
+    `failures="${failures}" errors="${errors}" skipped="${skipped}">${cases}</testsuite>` +
+    "</testsuites>"
+  );
+}
+
+test("the durable ownership suite requires nine passing JUnit cases", () => {
+  const guard = requiredJUnitGuardForSuite(HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE);
+  assert.deepEqual(guard, {
+    suiteName: HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE,
+    minimumTests: 9,
+  });
+  assert.deepEqual(verifyVitestJUnitReport(junitSuite(), guard), {
+    tests: 9,
+    failures: 0,
+    errors: 0,
+    skipped: 0,
+  });
+  assert.equal(requiredJUnitGuardForSuite("server/src/__tests__/synthetic-posix-family.test.ts"), null);
+});
+
+test("the durable ownership JUnit guard rejects every inconclusive result", () => {
+  const guard = requiredJUnitGuardForSuite(HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE);
+  for (const report of [
+    junitSuite({ tests: 8 }),
+    junitSuite({ skipped: 9 }),
+    junitSuite({ failures: 1 }),
+    junitSuite({ errors: 1 }),
+  ]) {
+    assert.throws(() => verifyVitestJUnitReport(report, guard), /must run at least 9 passing tests/);
+  }
+});
+
+test("the durable ownership JUnit guard rejects missing, ambiguous, and malformed XML", () => {
+  const guard = requiredJUnitGuardForSuite(HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE);
+  const valid = junitSuite();
+  const suite = valid.match(/<testsuite\b[\s\S]*<\/testsuite>/)?.[0];
+  assert.ok(suite, "synthetic JUnit suite must be extractable");
+
+  assert.throws(() => verifyVitestJUnitReport("", guard), /Malformed JUnit XML/);
+  assert.throws(
+    () => verifyVitestJUnitReport(valid.replace("</testsuites>", `${suite}</testsuites>`), guard),
+    /exactly one suite/,
+  );
+  assert.throws(
+    () => verifyVitestJUnitReport(valid.replace("</testsuites>", ""), guard),
+    /Malformed JUnit XML/,
+  );
+  assert.throws(
+    () => verifyVitestJUnitReport(valid.replace("</testcase>", ""), guard),
+    /Malformed JUnit XML/,
+  );
+});
+
+test("the serialized runner executes and propagates the required JUnit guard", (t) => {
+  const fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-junit-guard-"));
+  t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
+
+  const spawnFixture = path.join(fixtureDir, "spawn-vitest-junit.mjs");
+  writeFileSync(
+    spawnFixture,
+    `import childProcess from "node:child_process";\n` +
+      `import { writeFileSync } from "node:fs";\n` +
+      `import { syncBuiltinESMExports } from "node:module";\n` +
+      `childProcess.spawnSync = (_command, args = []) => {\n` +
+      `  const output = args.find((arg) => arg.startsWith("--outputFile.junit="));\n` +
+      `  if (!output) return { status: 42, signal: null, error: undefined };\n` +
+      `  const cases = Array.from({ length: 9 }, (_, i) => \`<testcase name="control-\${i + 1}"><skipped/></testcase>\`).join("");\n` +
+      `  writeFileSync(output.slice("--outputFile.junit=".length), \`<?xml version="1.0"?><testsuites tests="9" failures="0" errors="0"><testsuite name="${HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE}" tests="9" failures="0" errors="0" skipped="9">\${cases}</testsuite></testsuites>\`);\n` +
+      `  return { status: 0, signal: null, error: undefined };\n` +
+      `};\n` +
+      `syncBuiltinESMExports();\n`,
+    "utf8",
+  );
+
+  const inventory = dryRunJson([
+    "--mode", "serialized", "--shard-index", "0", "--shard-count", "1",
+  ]);
+  const targetIndex = inventory.selectedSerializedSuites.indexOf(
+    HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE,
+  );
+  assert.notEqual(targetIndex, -1, "mandatory ownership suite must be present in the serialized lane");
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--import", pathToFileURL(spawnFixture).href,
+      script,
+      "--mode", "serialized",
+      "--shard-index", String(targetIndex),
+      "--shard-count", String(inventory.serializedSuiteCount),
+    ],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: process.env,
+    },
+  );
+
+  assert.equal(
+    result.status,
+    1,
+    `serialized runner accepted nine skipped tests; stdout=${result.stdout} stderr=${result.stderr}`,
+  );
+  assert.match(result.stderr, /required JUnit guard failed/);
 });
 
 test("shard flags are rejected for the parallel workspace groups", () => {

@@ -113,6 +113,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { hasManualOwnershipRepairHold } from "./manual-ownership-repair-hold.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
@@ -14155,6 +14156,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(heartbeatRuns.id, issue.executionRunId))
             .then((rows) => rows[0] ?? null)
           : null;
+
+        if (hasManualOwnershipRepairHold(activeExecutionRun)) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "manual_ownership_repair_pending",
+            payload: {
+              ...(payload ?? {}),
+              issueId,
+              heldRunId: activeExecutionRun!.id,
+              requiredAction: "board_admin_force_release",
+            },
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId,
+            idempotencyKey,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
 
         if (
           activeExecutionRun &&

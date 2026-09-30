@@ -94,6 +94,7 @@ import {
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { assertNoManualOwnershipRepairHold } from "./manual-ownership-repair-hold.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -4270,6 +4271,12 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!issue?.executionRunId) return false;
 
+      await assertNoManualOwnershipRepairHold(
+        tx as unknown as Db,
+        [issue.executionRunId],
+        "clear_terminal_execution_claim",
+      );
+
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
@@ -4317,6 +4324,12 @@ export function issueService(db: Db) {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue?.checkoutRunId) return false;
+
+      await assertNoManualOwnershipRepairHold(
+        tx as unknown as Db,
+        [issue.checkoutRunId, issue.executionRunId],
+        "clear_terminal_checkout_claim",
+      );
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
@@ -5647,6 +5660,28 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        const lockedExisting = await tx
+          .select({
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .for("update")
+          .then((rows: Array<Pick<typeof issues.$inferSelect, "checkoutRunId" | "executionRunId">>) => rows[0] ?? null);
+        if (!lockedExisting) return null;
+
+        if (
+          (patch.checkoutRunId === null && lockedExisting.checkoutRunId) ||
+          (patch.executionRunId === null && lockedExisting.executionRunId)
+        ) {
+          await assertNoManualOwnershipRepairHold(
+            tx as Db,
+            [lockedExisting.checkoutRunId, lockedExisting.executionRunId],
+            "issue_update",
+          );
+        }
+
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -6165,6 +6200,11 @@ export function issueService(db: Db) {
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
           throw conflict("Only assignee can release issue");
         }
+        await assertNoManualOwnershipRepairHold(
+          tx as unknown as Db,
+          [existing.checkoutRunId, existing.executionRunId],
+          "issue_release",
+        );
         if (
           actorAgentId &&
           existing.status === "in_progress" &&

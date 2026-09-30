@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -11,6 +11,7 @@ import {
   WORKSPACES_A_LANE,
   WORKSPACES_B_LANE,
 } from "./vitest-lanes.mjs";
+import { requiredJUnitGuardForSuite, verifyVitestJUnitFile } from "./vitest-junit-guard.mjs";
 
 const repoRoot = process.cwd();
 const serverRoot = path.join(repoRoot, "server");
@@ -265,7 +266,15 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return routeTests.filter((_, index) => index % shardCount === shardIndex);
 }
 
-function runVitest(args, label, { exitOnFailure = true } = {}) {
+function pnpmInvocation(args) {
+  const npmExecPath = process.env.npm_execpath;
+  if (process.platform === "win32" && npmExecPath && existsSync(npmExecPath)) {
+    return { command: process.execPath, args: [npmExecPath, ...args] };
+  }
+  return { command: "pnpm", args };
+}
+
+function runVitest(args, label, { exitOnFailure = true, junitGuard = null } = {}) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -280,7 +289,12 @@ function runVitest(args, label, { exitOnFailure = true } = {}) {
   };
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
-  const result = spawnSync("pnpm", ["exec", "vitest", "run", ...args], {
+  const reportFile = junitGuard ? path.join(testRoot, "required-suite.junit.xml") : null;
+  const reporterArgs = reportFile
+    ? ["--reporter=default", "--reporter=junit", `--outputFile.junit=${reportFile}`]
+    : [];
+  const invocation = pnpmInvocation(["exec", "vitest", "run", ...args, ...reporterArgs]);
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: repoRoot,
     env,
     stdio: "inherit",
@@ -289,12 +303,26 @@ function runVitest(args, label, { exitOnFailure = true } = {}) {
     console.error(`[test:run] Failed to start Vitest: ${result.error.message}`);
     process.exit(1);
   }
-  if (result.status !== 0) {
+  let guardFailed = false;
+  if (reportFile) {
+    try {
+      const counts = verifyVitestJUnitFile(reportFile, junitGuard);
+      console.log(
+        `[test:run] required JUnit guard passed ` +
+          `(tests=${counts.tests} failures=${counts.failures} errors=${counts.errors} skipped=${counts.skipped})`,
+      );
+    } catch (error) {
+      guardFailed = true;
+      console.error(`[test:run] required JUnit guard failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+  const status = result.status !== 0 ? (result.status ?? 1) : guardFailed ? 1 : 0;
+  if (status !== 0) {
     if (exitOnFailure) {
-      process.exit(result.status ?? 1);
+      process.exit(status);
     }
 
-    return result.status ?? 1;
+    return status;
   }
 
   return 0;
@@ -405,6 +433,7 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
   );
 
   for (const routeTest of shardTests) {
+    const junitGuard = requiredJUnitGuardForSuite(routeTest.repoPath);
     runVitest(
       [
         "--project",
@@ -414,6 +443,7 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
         "--isolate",
       ],
       routeTest.repoPath,
+      { junitGuard },
     );
   }
 }
