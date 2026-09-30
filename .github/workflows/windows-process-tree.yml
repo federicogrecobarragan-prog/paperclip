@@ -59,7 +59,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - run: pnpm install --frozen-lockfile --ignore-scripts
+      # embedded-postgres requires its platform package postinstall to hydrate
+      # the links used by the native PostgreSQL runtime.
+      - run: pnpm install --frozen-lockfile
       - name: Preserve manual ownership claims through durable replay
         shell: pwsh
         env:
