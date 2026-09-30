@@ -38,4 +38,20 @@ describe("compactRunLogChunk", () => {
     expect(compacted).not.toContain("paperclip-json-secret");
     expect(compacted).not.toContain("paperclip-flag-secret");
   });
+
+  it("replaces PostgreSQL-incompatible U+0000 before log persistence", () => {
+    const compacted = compactRunLogChunk("stdout\u0000stderr");
+
+    expect(compacted).toBe("stdout\uFFFDstderr");
+    expect(compacted).not.toContain("\u0000");
+  });
+
+  it("redacts a credential assignment split by U+0000 before log persistence", () => {
+    const opaqueCanary = "OpaqueValueQ9Z8R7M4V2";
+    const compacted = compactRunLogChunk(`token\u0000=${opaqueCanary}`);
+
+    expect(compacted).not.toContain("\u0000");
+    expect(compacted).not.toContain(opaqueCanary);
+    expect(compacted).toContain("***REDACTED***");
+  });
 });

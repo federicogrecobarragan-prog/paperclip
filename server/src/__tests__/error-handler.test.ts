@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { SAFE_HTTP_ERROR_LOG_MESSAGE } from "../middleware/http-error-log-safety.js";
 
 function makeReq(): Request {
   return {
@@ -23,7 +24,7 @@ function makeRes(): Response {
 }
 
 describe("errorHandler", () => {
-  it("attaches the original Error to res.err for 500s", () => {
+  it("attaches only a generic Error to logger context for 500s", () => {
     const req = makeReq();
     const res = makeRes() as any;
     const next = vi.fn() as unknown as NextFunction;
@@ -33,8 +34,10 @@ describe("errorHandler", () => {
 
     expect(res.status).toHaveBeenCalledWith(500);
     expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
-    expect(res.err).toBe(err);
-    expect(res.__errorContext?.error?.message).toBe("boom");
+    expect(res.err).not.toBe(err);
+    expect(res.err?.message).toBe(SAFE_HTTP_ERROR_LOG_MESSAGE);
+    expect(JSON.stringify(res.__errorContext)).not.toContain("boom");
+    expect(res.__errorContext?.error?.message).toBe(SAFE_HTTP_ERROR_LOG_MESSAGE);
   });
 
   it("exposes raw 500 messages for trusted Cloud tenant imports", () => {
@@ -59,7 +62,8 @@ describe("errorHandler", () => {
       error: "Internal server error",
       message: "portable file references missing upload id",
     });
-    expect(res.err).toBe(err);
+    expect(res.err).not.toBe(err);
+    expect(res.err?.message).toBe(SAFE_HTTP_ERROR_LOG_MESSAGE);
   });
 
   it("attaches HttpError instances for 500 responses", () => {
@@ -72,7 +76,9 @@ describe("errorHandler", () => {
 
     expect(res.status).toHaveBeenCalledWith(500);
     expect(res.json).toHaveBeenCalledWith({ error: "db exploded" });
-    expect(res.err).toBe(err);
-    expect(res.__errorContext?.error?.message).toBe("db exploded");
+    expect(res.err).not.toBe(err);
+    expect(res.err?.message).toBe(SAFE_HTTP_ERROR_LOG_MESSAGE);
+    expect(JSON.stringify(res.__errorContext)).not.toContain("db exploded");
+    expect(res.__errorContext?.error?.message).toBe(SAFE_HTTP_ERROR_LOG_MESSAGE);
   });
 });

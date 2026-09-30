@@ -897,6 +897,34 @@
       "when": 1782526500000,
       "tag": "0127_environment_custom_images_instance_scoped",
       "breakpoints": true
+    },
+    {
+      "idx": 128,
+      "version": "7",
+      "when": 1782526600000,
+      "tag": "0128_heartbeat_runtime_accounting",
+      "breakpoints": true
+    },
+    {
+      "idx": 129,
+      "version": "7",
+      "when": 1782526700000,
+      "tag": "0129_heartbeat_terminal_finalization",
+      "breakpoints": true
+    },
+    {
+      "idx": 130,
+      "version": "7",
+      "when": 1789657064750,
+      "tag": "0130_agent_task_session_run_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 131,
+      "version": "7",
+      "when": 1789657570288,
+      "tag": "0131_agent_task_session_agent_cascade",
+      "breakpoints": true
     }
   ]
 }

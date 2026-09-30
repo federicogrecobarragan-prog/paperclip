@@ -36,6 +36,34 @@ function createChildThatErrorsOnMicrotask(err: Error): ChildProcess {
   return child;
 }
 
+function createReadOnlyRpcChild(args: string[]) {
+  const child = new EventEmitter() as ChildProcess;
+  const stdout = Object.assign(new EventEmitter(), { setEncoding: () => {} });
+  const stderr = Object.assign(new EventEmitter(), { setEncoding: () => {} });
+  const methods: string[] = [];
+  const kill = vi.fn();
+  Object.assign(child, {
+    stdout, stderr, kill,
+    stdin: { write: (line: string) => {
+      const request = JSON.parse(line) as { id?: number; method: string };
+      methods.push(request.method);
+      if (request.id == null) return;
+      queueMicrotask(() => {
+        if (args.includes("untrusted")) {
+          stderr.emit("data", "invalid value 'untrusted' for '--ask-for-approval'\n");
+          child.emit("exit", 2);
+          return;
+        }
+        const result = request.method === "account/rateLimits/read"
+          ? { rateLimits: { primary: { usedPercent: 17, resetsAt: 1_800_000_000 } } }
+          : request.method === "account/read" ? { account: { type: "chatgpt", planType: "test" } } : {};
+        stdout.emit("data", JSON.stringify({ id: request.id, result }) + "\n");
+      });
+    }, end: vi.fn() },
+  });
+  return { child, methods, kill };
+}
+
 describe("CodexRpcClient spawn failures", () => {
   let previousCodexHome: string | undefined;
   let isolatedCodexHome: string | undefined;
@@ -81,5 +109,27 @@ describe("CodexRpcClient spawn failures", () => {
     expect(result.windows).toEqual([]);
     expect(result.error).toContain("Codex app-server");
     expect(result.error).toContain("spawn codex ENOENT");
+  });
+
+  it("reads quotas without prompts or model execution using the supported read-only CLI policy", async () => {
+    let rpc: ReturnType<typeof createReadOnlyRpcChild>;
+    mockSpawn.mockImplementation((_command, args: string[]) => {
+      rpc = createReadOnlyRpcChild(args);
+      return rpc.child;
+    });
+
+    const result = await getQuotaWindows();
+
+    expect(result.ok).toBe(true);
+    expect(result.source).toBe("codex-rpc");
+    expect(result.windows).toHaveLength(1);
+    expect(result.windows[0]?.usedPercent).toBe(17);
+    expect(mockSpawn.mock.calls[0]?.slice(0, 2)).toEqual([
+      "codex", ["-s", "read-only", "-a", "never", "app-server"],
+    ]);
+    expect(rpc!.methods).toEqual([
+      "initialize", "initialized", "account/rateLimits/read", "account/read",
+    ]);
+    expect(rpc!.kill).toHaveBeenCalledWith("SIGTERM");
   });
 });

@@ -124,6 +124,13 @@ These browser suites are intended for targeted local verification and CI, not th
 
 For normal issue work, start with the smallest targeted check that proves the change. Reserve repo-wide typecheck/build/test runs for PR-ready handoff or changes broad enough that narrow checks do not cover the risk.
 
+On slower Windows hosts, embedded PostgreSQL initialization can exceed its
+default 10-second probe timeout. Set
+`PAPERCLIP_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS=60000` for database integration
+tests, and verify that their output reports executed tests rather than skips.
+The setting only changes the startup timeout; test databases remain disposable
+and separate from the configured Paperclip instance.
+
 ## One-Command Local Run
 
 For a first-time local install, you can bootstrap and run in one command:

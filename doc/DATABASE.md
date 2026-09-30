@@ -143,6 +143,27 @@ The database mode is controlled by `DATABASE_URL`:
 
 Your Drizzle schema (`packages/db/src/schema/`) stays the same regardless of mode.
 
+## Heartbeat runtime accounting
+
+Migration `0128_heartbeat_runtime_accounting` adds the nullable
+`heartbeat_runs.runtime_accounted_at` marker. Terminal runtime totals, the cost
+event, monthly spend rollups, and this marker commit in one transaction. A retry
+after a failed or ambiguous write can finish finalization without charging the
+same heartbeat twice. All same-company cost writers, including manual reports,
+are serialized before cost insertion so concurrent writes preserve the complete
+company rollup.
+
+Budget enforcement runs after accounting commits, because cancelling active
+processes cannot be rolled back with a database transaction. A post-commit retry
+reloads the persisted event and completes enforcement. Existing historical runs
+are not replayed or retroactively charged by this migration.
+
+Budget incident creation takes a policy row lock and commits the approval,
+incident, and threshold activity together. Retrying audit failures leaves no
+partial incident or orphan approval. Live/plugin notification is best effort
+after commit; cancellation is also performed after commit and is safe to retry
+when its first attempt fails.
+
 ## Resource membership tables
 
 Paperclip stores current-user sidebar membership state in:

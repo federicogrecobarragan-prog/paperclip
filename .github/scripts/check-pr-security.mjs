@@ -2,11 +2,16 @@
 /**
  * check-pr-security.mjs
  * Runs 6 security checks against a PR diff. Never posts public comments.
- * Creates a draft security advisory in the repo if any check fires.
+ * Upstream app mode creates a draft advisory for findings; fork report mode
+ * stores only sanitized metadata in a durable workflow artifact.
  *
- * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Env: GH_TOKEN, GH_REPO, PR_NUMBER, SECURITY_REPORT_MODE,
+ *      SECURITY_REPORT_PATH
+ * Exit: 0 after scan/report/check-run completion. Infrastructure failures
+ *       fail closed; findings remain neutral for human review.
  */
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
 import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
@@ -30,7 +35,8 @@ export function scanSecrets(files) {
     for (const line of added) {
       for (const { name, re } of SECRET_PATTERNS) {
         if (re.test(line)) {
-          flags.push({ check: 'secret-scan', file: file.filename, pattern: name, line: line.slice(0, 120) });
+          // Never persist or log the matching line: it may contain the secret.
+          flags.push({ check: 'secret-scan', file: file.filename, pattern: name });
         }
       }
     }
@@ -150,6 +156,26 @@ export function scanSensitivePaths(files) {
       file: f.filename,
       advisoryPath: SENSITIVE_PATHS.find(p => f.filename.startsWith(p)),
     }));
+}
+
+export const SECURITY_CHECK_NAMES = Object.freeze([
+  'secret-scan',
+  'ci-tampering',
+  'build-script-change',
+  'supply-chain',
+  'suspicious-test',
+  'sensitive-path',
+]);
+
+export function scanSecurityFlags(files) {
+  return [
+    ...scanSecrets(files),
+    ...scanCITampering(files),
+    ...scanBuildScripts(files),
+    ...scanSupplyChain(files),
+    ...scanTestPatterns(files),
+    ...scanSensitivePaths(files),
+  ];
 }
 
 function buildContentsPath(repo, filename, ref) {
@@ -273,7 +299,94 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
   return null;
 }
 
-export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags) {
+const PUBLIC_METADATA_MAX_LENGTH = 240;
+const PUBLIC_SECRET_REDACTIONS = [
+  /sk-[a-zA-Z0-9]{32,}/g,
+  /AIza[0-9A-Za-z\-_]{35}/g,
+  /AKIA[0-9A-Z]{16}/g,
+  /-----BEGIN (?:RSA|EC|OPENSSH) PRIVATE KEY-----/g,
+  /((?:key|token|secret|password|credential)[^=:\r\n]{0,32}[=:]\s*)[^\s]{20,}/gi,
+];
+
+export function sanitizePublicMetadata(value) {
+  let sanitized = String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  for (const pattern of PUBLIC_SECRET_REDACTIONS) {
+    sanitized = sanitized.replace(pattern, '[REDACTED]');
+  }
+  return sanitized.slice(0, PUBLIC_METADATA_MAX_LENGTH);
+}
+
+export function buildSecurityReport({ repo, prNumber, headSha, mode, flags, checkRunCreated = false, advisorySynced = false }) {
+  if (mode !== 'advisory' && mode !== 'report') {
+    throw new Error('SECURITY_REPORT_MODE must be advisory or report.');
+  }
+
+  const checks = SECURITY_CHECK_NAMES.map(check => {
+    const matches = flags.filter(flag => flag.check === check);
+    return {
+      check,
+      count: matches.length,
+      files: [...new Set(matches.map(flag => flag.file).filter(Boolean).map(sanitizePublicMetadata))],
+      patterns: [...new Set(matches.flatMap(flag => {
+        if (flag.pattern) return [sanitizePublicMetadata(flag.pattern)];
+        if (Array.isArray(flag.packages) && flag.packages.length > 0) return ['net-new-package'];
+        return [];
+      }))],
+    };
+  });
+  const totalFindings = checks.reduce((total, check) => total + check.count, 0);
+
+  return {
+    schemaVersion: 1,
+    repository: sanitizePublicMetadata(repo),
+    pullRequest: prNumber,
+    headSha: sanitizePublicMetadata(headSha),
+    mode,
+    scanCompleted: true,
+    reportWritten: true,
+    checkRunCreated,
+    advisorySynced,
+    totalFindings,
+    conclusion: totalFindings > 0 ? 'neutral' : 'success',
+    outcome: totalFindings > 0 ? 'review_required' : 'clear',
+    checks,
+  };
+}
+
+export async function writeSecurityReport(reportPath, report) {
+  if (!reportPath) throw new Error('SECURITY_REPORT_PATH is required.');
+  await mkdir(dirname(reportPath), { recursive: true });
+  await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+}
+
+function buildReportModeCheckSummary(report) {
+  const lines = [
+    `Sanitized security report: ${report.totalFindings} finding(s) across ${SECURITY_CHECK_NAMES.length} checks.`,
+  ];
+  for (const check of report.checks.filter(item => item.count > 0)) {
+    const metadata = [];
+    if (check.files.length > 0) metadata.push(`files: ${check.files.join(', ')}`);
+    if (check.patterns.length > 0) metadata.push(`patterns: ${check.patterns.join(', ')}`);
+    lines.push(`- ${check.check}: ${check.count}${metadata.length > 0 ? ` (${metadata.join('; ')})` : ''}`);
+  }
+  lines.push('Review the commitperclip-security-report artifact; no matching source lines or secret values are included.');
+  return lines.join('\n').slice(0, 60_000);
+}
+
+export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, reportOrHasFlags) {
+  const report = typeof reportOrHasFlags === 'boolean'
+    ? { mode: 'advisory', totalFindings: reportOrHasFlags ? 1 : 0 }
+    : reportOrHasFlags;
+  const hasFlags = report.totalFindings > 0;
+  const flaggedOutput = report.mode === 'report'
+    ? {
+        title: 'Security Review Required',
+        summary: buildReportModeCheckSummary(report),
+      }
+    : {
+        title: 'Security Review Recommended',
+        summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
+      };
   await fetchImpl(`/repos/${repo}/check-runs`, token, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -287,10 +400,7 @@ export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasF
       // same head SHA, so it would hang forever.
       status: 'completed',
       conclusion: 'neutral',
-      output: {
-        title: 'Security Review Recommended',
-        summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
-      },
+      output: flaggedOutput,
     } : {
       name: 'security-review',
       head_sha: headSha,
@@ -311,83 +421,119 @@ export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasF
 // a job-level timeout — it only suppresses step failures. So if any API call
 // (e.g. security-advisories POST/PATCH) hangs, the whole job is cancelled,
 // failing the `review` check. This watchdog enforces the script's documented
-// "always exit 0" contract regardless of API behaviour.
+// fail-closed contract regardless of API behaviour.
 export const SCRIPT_WATCHDOG_MS = 90_000;
 
 export function startScriptWatchdog(timeoutMs = SCRIPT_WATCHDOG_MS, exit = process.exit) {
   const timer = setTimeout(() => {
     console.warn(
-      `[security] script exceeded ${timeoutMs}ms wall-clock budget; exiting 0 per always-exit-0 contract`
+      `[security] script exceeded ${timeoutMs}ms wall-clock budget; failing closed`
     );
-    exit(0);
+    exit(1);
   }, timeoutMs);
   // Don't keep the event loop alive solely for the watchdog.
   timer.unref?.();
   return timer;
 }
 
+export async function runSecurityReview({
+  token,
+  repo,
+  prNumber,
+  mode,
+  reportPath,
+  fetchFromGitHub = ghFetch,
+  fetchPullRequestFiles = fetchAllPullRequestFiles,
+}) {
+  if (!token || !repo || !Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error('A token, repository, and positive PR number are required.');
+  }
+  if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(repo)) {
+    throw new Error('GH_REPO must be in owner/repo format.');
+  }
+  if (mode !== 'advisory' && mode !== 'report') {
+    throw new Error('SECURITY_REPORT_MODE must be advisory or report.');
+  }
+
+  const stalePaths = await validateSensitivePaths(token, repo, prNumber, undefined, fetchFromGitHub);
+  if (stalePaths.length > 0) {
+    throw new Error('Sensitive path policy is stale.');
+  }
+
+  const [pr, files] = await Promise.all([
+    fetchFromGitHub(`/repos/${repo}/pulls/${prNumber}`, token),
+    fetchPullRequestFiles(fetchFromGitHub, repo, prNumber, token),
+  ]);
+  const flags = scanSecurityFlags(files);
+  let report = buildSecurityReport({
+    repo,
+    prNumber,
+    headSha: pr.head.sha,
+    mode,
+    flags,
+  });
+
+  // Persist the completed scan before any follow-up API writes. If advisory
+  // or check-run creation fails, the verifier sees the missing completion bit
+  // and the workflow remains red.
+  await writeSecurityReport(reportPath, report);
+
+  if (flags.length > 0 && mode === 'advisory') {
+    await syncDraftAdvisory(fetchFromGitHub, token, repo, prNumber, pr.title, flags);
+    report = { ...report, advisorySynced: true };
+    await writeSecurityReport(reportPath, report);
+  }
+
+  await postSecurityCheckRun(fetchFromGitHub, token, repo, pr.head.sha, report);
+  report = { ...report, checkRunCreated: true };
+  await writeSecurityReport(reportPath, report);
+
+  console.log(
+    flags.length > 0
+      ? `[security] ${flags.length} sanitized finding(s); human review requested`
+      : '[security] all six scan families completed with no findings',
+  );
+  return report;
+}
+
 async function main() {
   const watchdog = startScriptWatchdog();
 
-  const { GH_TOKEN, GH_REPO, PR_NUMBER } = process.env;
+  const { GH_REPO, PR_NUMBER, SECURITY_REPORT_MODE, SECURITY_REPORT_PATH } = process.env;
+  const GH_TOKEN = process.env.COMMITPERCLIP_REVIEW_TOKEN ?? process.env.GH_TOKEN;
 
-  if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
-    console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER required');
-    process.exit(1);
+  if (!GH_TOKEN || !GH_REPO || !PR_NUMBER || !SECURITY_REPORT_MODE || !SECURITY_REPORT_PATH) {
+    throw new Error('Required security workflow environment is missing.');
   }
 
   // Sanitize inputs before use in URL construction (prevents SSRF)
-  const prNumber = parseInt(PR_NUMBER, 10);
-  if (!Number.isInteger(prNumber) || prNumber <= 0) {
-    console.error('ERROR: PR_NUMBER must be a positive integer');
-    process.exit(1);
+  if (!/^[1-9]\d*$/.test(PR_NUMBER)) {
+    throw new Error('PR_NUMBER must be a positive integer.');
   }
+  const prNumber = Number(PR_NUMBER);
   if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(GH_REPO)) {
     console.error('ERROR: GH_REPO must be in owner/repo format');
     process.exit(1);
   }
 
-  // Validate SENSITIVE_PATHS — fails loudly if any have been refactored away on the PR base branch
-  const stalePaths = await validateSensitivePaths(GH_TOKEN, GH_REPO, prNumber);
-  if (stalePaths.length > 0) {
-    console.error('ERROR: Stale sensitive paths in check-pr-security.mjs:');
-    for (const p of stalePaths) console.error(`  - ${p}`);
-    console.error('');
-    console.error('These paths no longer exist on the PR base branch. The security gate will silently produce no signal for them.');
-    console.error('Update SENSITIVE_PATHS in check-pr-security.mjs to reflect the current code structure.');
-    process.exit(1);
+  try {
+    await runSecurityReview({
+      token: GH_TOKEN,
+      repo: GH_REPO,
+      prNumber,
+      mode: SECURITY_REPORT_MODE,
+      reportPath: SECURITY_REPORT_PATH,
+    });
+  } finally {
+    clearTimeout(watchdog);
   }
-
-  const [pr, files] = await Promise.all([
-    ghFetch(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
-    fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
-  ]);
-
-  const allFlags = [
-    ...scanSecrets(files),
-    ...scanCITampering(files),
-    ...scanBuildScripts(files),
-    ...scanSupplyChain(files),
-    ...scanTestPatterns(files),
-    ...scanSensitivePaths(files),
-  ];
-
-  if (allFlags.length > 0) {
-    console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
-    await Promise.all([
-      syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags),
-      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true),
-    ]);
-  } else {
-    console.log('[security] all clear');
-    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false);
-  }
-
-  // Always exit 0 — security flags are silent, never block the PR publicly
-  clearTimeout(watchdog);
-  process.exit(0);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch(e => { console.error(e.message); process.exit(1); });
+  main().catch(() => {
+    // API responses and matching source lines can contain attacker-controlled
+    // data. Keep failure logging generic and fail closed.
+    console.error('[security] processing failed; review the failed step without printing response bodies');
+    process.exitCode = 1;
+  });
 }
