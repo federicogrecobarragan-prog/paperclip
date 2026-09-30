@@ -246,15 +246,27 @@ describe("gemini remote execution", () => {
         stats: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
       }),
     ].join("\n");
-    const runnerExecute = vi.fn(async (input: { command: string; args?: string[] }) => ({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: input.command === "gemini" ? geminiOutput : "",
-      stderr: "",
-      pid: 321,
-      startedAt: new Date().toISOString(),
-    }));
+    const emptyWorkspaceTar = Buffer.alloc(1024);
+    const runnerExecute = vi.fn(async (input: { command: string; args?: string[] }) => {
+      const script = (input.args ?? []).join(" ");
+      const stdout =
+        input.command === "gemini"
+          ? geminiOutput
+          : script.includes("wc -c <") && script.includes("workspace-download.tar")
+            ? `${emptyWorkspaceTar.byteLength}\n`
+            : script.includes("dd if=") && script.includes("workspace-download.tar")
+              ? `${emptyWorkspaceTar.toString("base64")}\n`
+              : "";
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout,
+        stderr: "",
+        pid: 321,
+        startedAt: new Date().toISOString(),
+      };
+    });
 
     await execute({
       runId: "run-sandbox-1",
@@ -299,6 +311,16 @@ describe("gemini remote execution", () => {
     expect(settingsWrite).toContain("gemini-api-key");
     // The managed HOME lives under the per-run runtime root, never a real home.
     expect(settingsWrite).toContain(".paperclip-runtime");
+    expect(
+      runnerScripts.some(
+        (script) => script.includes("wc -c <") && script.includes("workspace-download.tar"),
+      ),
+    ).toBe(true);
+    expect(
+      runnerScripts.some(
+        (script) => script.includes("dd if=") && script.includes("workspace-download.tar"),
+      ),
+    ).toBe(true);
   });
 
   it("resumes saved Gemini sessions for remote SSH execution only when the identity matches", async () => {

@@ -1243,6 +1243,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           processGroupId: typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
             ? processGroupId
             : null,
+          startedAt: input.run.processStartedAt?.toISOString(),
         },
         running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
       );

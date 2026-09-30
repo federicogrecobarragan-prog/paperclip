@@ -4,6 +4,7 @@ import { HttpError } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
+import { SAFE_HTTP_ERROR_LOG_MESSAGE } from "./http-error-log-safety.js";
 
 export interface ErrorContext {
   error: { message: string; stack?: string; name?: string; details?: unknown; raw?: unknown };
@@ -17,20 +18,19 @@ export interface ErrorContext {
 function attachErrorContext(
   req: Request,
   res: Response,
-  payload: ErrorContext["error"],
-  rawError?: Error,
 ) {
   (res as any).__errorContext = {
-    error: payload,
+    error: {
+      message: SAFE_HTTP_ERROR_LOG_MESSAGE,
+      name: "RequestError",
+    },
     method: req.method,
     url: req.originalUrl,
-    reqBody: req.body,
-    reqParams: req.params,
-    reqQuery: req.query,
   } satisfies ErrorContext;
-  if (rawError) {
-    (res as any).err = rawError;
-  }
+  // pino-http automatically serializes `res.err` on 5xx responses. Never
+  // attach the original exception because its message/stack can contain an
+  // opaque provider, hook, database, or workspace diagnostic.
+  (res as any).err = new Error(SAFE_HTTP_ERROR_LOG_MESSAGE);
 }
 
 export function errorHandler(
@@ -44,12 +44,7 @@ export function errorHandler(
       ? err.details as Record<string, unknown>
       : null;
     if (err.status >= 500) {
-      attachErrorContext(
-        req,
-        res,
-        { message: err.message, stack: err.stack, name: err.name, details: err.details },
-        err,
-      );
+      attachErrorContext(req, res);
       const tc = getTelemetryClient();
       if (tc) trackErrorHandlerCrash(tc, { errorCode: err.name });
     }
@@ -67,14 +62,7 @@ export function errorHandler(
   }
 
   const rootError = err instanceof Error ? err : new Error(String(err));
-  attachErrorContext(
-    req,
-    res,
-    err instanceof Error
-      ? { message: err.message, stack: err.stack, name: err.name }
-      : { message: String(err), raw: err, stack: rootError.stack, name: rootError.name },
-    rootError,
-  );
+  attachErrorContext(req, res);
 
   const tc = getTelemetryClient();
   if (tc) trackErrorHandlerCrash(tc, { errorCode: rootError.name });

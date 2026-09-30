@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, bigint, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, bigint, integer, index } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 
@@ -9,6 +9,7 @@ export const agentRuntimeState = pgTable(
     companyId: uuid("company_id").notNull().references(() => companies.id),
     adapterType: text("adapter_type").notNull(),
     sessionId: text("session_id"),
+    sessionGeneration: integer("session_generation").notNull().default(0),
     stateJson: jsonb("state_json").$type<Record<string, unknown>>().notNull().default({}),
     lastRunId: uuid("last_run_id"),
     lastRunStatus: text("last_run_status"),

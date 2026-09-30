@@ -4,24 +4,18 @@ import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  computeLanes,
+  LANE_EXCLUSIONS,
+  SERVER_LANE,
+  WORKSPACES_A_LANE,
+  WORKSPACES_B_LANE,
+} from "./vitest-lanes.mjs";
+
 const repoRoot = process.cwd();
 const serverRoot = path.join(repoRoot, "server");
 const serverSrcDir = path.join(repoRoot, "server", "src");
 const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
-const nonServerProjects = [
-  "@paperclipai/shared",
-  "@paperclipai/skills-catalog",
-  "@paperclipai/teams-catalog",
-  "@paperclipai/db",
-  "@paperclipai/adapter-utils",
-  "@paperclipai/adapter-acpx-local",
-  "@paperclipai/adapter-codex-local",
-  "@paperclipai/adapter-opencode-local",
-  "@paperclipai/plugin-sdk",
-  "@paperclipai/create-paperclip-plugin",
-  "@paperclipai/ui",
-  "paperclipai",
-];
 const routeTestPattern = /[^/]*(?:route|routes|authz)[^/]*\.test\.ts$/;
 const additionalSerializedServerTests = new Set([
   "server/src/__tests__/approval-routes-idempotency.test.ts",
@@ -34,8 +28,11 @@ const additionalSerializedServerTests = new Set([
   "server/src/__tests__/health-dev-server-token.test.ts",
   "server/src/__tests__/health.test.ts",
   "server/src/__tests__/heartbeat-dependency-scheduling.test.ts",
+  "server/src/__tests__/heartbeat-host-pid-ownership.test.ts",
   "server/src/__tests__/heartbeat-issue-liveness-escalation.test.ts",
   "server/src/__tests__/heartbeat-process-recovery.test.ts",
+  "server/src/__tests__/heartbeat-spawn-cancellation-race.test.ts",
+  "server/src/__tests__/heartbeat-windows-ownership-repair.test.ts",
   "server/src/__tests__/invite-accept-existing-member.test.ts",
   "server/src/__tests__/invite-accept-gateway-defaults.test.ts",
   "server/src/__tests__/invite-accept-replay.test.ts",
@@ -53,11 +50,19 @@ let invocationIndex = 0;
 const serializedModeName = "serialized";
 const generalModeName = "general";
 const allModeName = "all";
-const generalServerGroupName = "general-server";
-const generalWorkspacesAGroupName = "general-workspaces-a";
-const generalWorkspacesBGroupName = "general-workspaces-b";
-const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
-const generalWorkspacesBProjects = nonServerProjects.filter((project) => !generalWorkspacesAProjects.includes(project));
+const generalServerGroupName = SERVER_LANE;
+const generalWorkspacesAGroupName = WORKSPACES_A_LANE;
+const generalWorkspacesBGroupName = WORKSPACES_B_LANE;
+// Lanes are derived from vitest.projects.mjs — the same list vitest.config.ts
+// declares — so a project can never be declared to Vitest and run in no lane.
+// See scripts/vitest-lanes.mjs (LAC-1384).
+const {
+  declaredProjects,
+  lanes,
+  laneA: generalWorkspacesAProjects,
+  laneB: generalWorkspacesBProjects,
+  excluded: laneExcludedProjects,
+} = computeLanes();
 const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, generalWorkspacesBGroupName];
 const serializedServerVitestArgs = [
   "--no-file-parallelism",
@@ -93,6 +98,20 @@ function isRouteOrAuthzTest(file) {
   }
 
   return additionalSerializedServerTests.has(file);
+}
+
+// Binary (UTF-16 code unit) order, NOT `localeCompare`. The shard split is
+// positional -- `list.filter((_, i) => i % shardCount === shardIndex)` -- so the
+// sort order IS the partition. `localeCompare` resolves against the runtime's
+// default collation, which comes from the environment (ICU/LC_ALL), so two
+// runners of the same workflow that resolved different collations would compute
+// different partitions: one suite could run twice and another never, with every
+// job still green. A silent false green, not a red. Code-unit order is a pure
+// function of the strings, so the partition is an invariant of the code instead
+// of a coincidence of the environment. Same reasoning as LAC-1380/LAC-1387 for
+// the teams-catalog manifest hash.
+function compareRepoPaths(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function fail(message) {
@@ -246,7 +265,7 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return routeTests.filter((_, index) => index % shardCount === shardIndex);
 }
 
-function runVitest(args, label) {
+function runVitest(args, label, { exitOnFailure = true } = {}) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -271,8 +290,14 @@ function runVitest(args, label) {
     process.exit(1);
   }
   if (result.status !== 0) {
-    process.exit(result.status ?? 1);
+    if (exitOnFailure) {
+      process.exit(result.status ?? 1);
+    }
+
+    return result.status ?? 1;
   }
+
+  return 0;
 }
 
 function runGeneralSuites(routeTests) {
@@ -281,10 +306,45 @@ function runGeneralSuites(routeTests) {
   }
 }
 
-function runProjectGroup(projects, groupName) {
-  for (const project of projects) {
-    runVitest(["--project", project], `${groupName} project ${project}`);
+// Print what the lane is about to run, and anything deliberately left out, before
+// the first Vitest invocation. A lane that silently runs nothing looks exactly
+// like a lane that passed.
+function announceProjectGroup(projects, groupName) {
+  console.log(`\n[test:run] ${groupName} covers ${projects.length} project(s): ${projects.join(", ") || "(none)"}`);
+  if (laneExcludedProjects.length > 0) {
+    console.log(`[test:run] ${laneExcludedProjects.length} declared project(s) deliberately excluded from every lane:`);
+    for (const project of laneExcludedProjects) {
+      console.log(`[test:run]   - ${project}: ${LANE_EXCLUSIONS[project]}`);
+    }
   }
+}
+
+// A workspace lane runs every project before it gives up. Bailing out on the
+// first red project hides the state of the rest behind one fix-and-push cycle
+// each, which is how the lane ends up describing less than it actually covers.
+function runProjectGroup(projects, groupName) {
+  announceProjectGroup(projects, groupName);
+  if (projects.length === 0) {
+    fail(`${groupName} resolved to zero projects. An empty lane is a false green, not a pass.`);
+  }
+
+  const failedProjects = [];
+  for (const project of projects) {
+    const status = runVitest(["--project", project], `${groupName} project ${project}`, {
+      exitOnFailure: false,
+    });
+    if (status !== 0) {
+      failedProjects.push(project);
+    }
+  }
+
+  if (failedProjects.length > 0) {
+    fail(
+      `${groupName}: ${failedProjects.length} of ${projects.length} project(s) failed: ${failedProjects.join(", ")}`,
+    );
+  }
+
+  console.log(`\n[test:run] ${groupName}: all ${projects.length} project(s) passed.`);
 }
 
 function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = null) {
@@ -364,7 +424,7 @@ const routeTests = walk(serverTestsDir)
     repoPath: toRepoPath(file),
     serverPath: toServerPath(file),
   }))
-  .sort((a, b) => a.repoPath.localeCompare(b.repoPath));
+  .sort((a, b) => compareRepoPaths(a.repoPath, b.repoPath));
 
 // Every server test file that the general-server group is responsible for,
 // i.e. the whole server project minus the route/authz suites that run in the
@@ -375,7 +435,7 @@ const generalServerTestFiles = walk(serverSrcDir)
   .map((file) => toRepoPath(file))
   .filter((repoPath) => repoPath.endsWith(".test.ts"))
   .filter((repoPath) => !isRouteOrAuthzTest(repoPath))
-  .sort((a, b) => a.localeCompare(b));
+  .sort(compareRepoPaths);
 
 const options = parseCliOptions(process.argv.slice(2));
 if (options.dryRun) {
@@ -391,6 +451,16 @@ if (options.dryRun) {
         shardCount: options.shardCount,
         group: options.group,
         availableGeneralGroups: generalGroupNames,
+        // Lane composition, derived from vitest.projects.mjs. The coverage guard
+        // in scripts/__tests__/vitest-lane-coverage.test.mjs reads these fields so
+        // it checks what CI really runs instead of reimplementing the split.
+        declaredProjects: declaredProjects.map((entry) => ({
+          dir: entry.dir,
+          project: entry.project,
+          testFileCount: entry.testFileCount,
+        })),
+        lanes,
+        laneExclusions: Object.entries(LANE_EXCLUSIONS).map(([project, reason]) => ({ project, reason })),
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
         generalServerSuiteCount: generalServerTestFiles.length,

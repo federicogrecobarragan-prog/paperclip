@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { terminateWindowsProcessTree } from "@paperclipai/adapter-utils/windows-process-tree";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -40,6 +41,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   parseCodexJsonl,
+  codexStdoutHasTurnCompleted,
   extractCodexRetryNotBefore,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
@@ -92,11 +94,16 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
-function signalCodexChild(
+export async function signalCodexChild(
   target: { pid: number | null; processGroupId: number | null },
   signal: NodeJS.Signals,
-): boolean {
-  if (process.platform !== "win32" && target.processGroupId && target.processGroupId > 0) {
+): Promise<boolean> {
+  if (process.platform === "win32") {
+    // The registered PID is the cmd.exe wrapper; `node codex.js -> codex.exe`
+    // hang off it. Signalling the wrapper alone orphans them (LAC-1352).
+    return target.pid ? terminateWindowsProcessTree(target.pid) : false;
+  }
+  if (target.processGroupId && target.processGroupId > 0) {
     try {
       process.kill(-target.processGroupId, signal);
       return true;
@@ -113,6 +120,17 @@ function signalCodexChild(
     }
   }
   return false;
+}
+
+export function resolveCodexHostKillTarget(
+  meta: { pid: number; processGroupId: number | null },
+  executionTargetIsSandbox: boolean,
+): { pid: number | null; processGroupId: number | null } | null {
+  // Sandbox runners report the PID inside the remote sandbox. Treating that
+  // number as a host PID can signal an unrelated local process after a numeric
+  // collision. Remote execution owns its own timeout/cancellation lifecycle.
+  if (executionTargetIsSandbox) return null;
+  return { pid: meta.pid ?? null, processGroupId: meta.processGroupId };
 }
 
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
@@ -448,6 +466,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       asNumber(config.timeoutSec, 0),
     );
     const graceSec = asNumber(config.graceSec, 20);
+    // `codex exec --json` emits `turn.completed` as its last stdout event and
+    // then may linger without exiting. Without this hook the only thing that
+    // ends the run is the output-inactivity monitor, which by design waits its
+    // full timeout (7 min by default) after work already finished (LAC-1352).
+    const terminalResultCleanupGraceMs = Math.max(
+      0,
+      asNumber(config.terminalResultCleanupGraceMs, 5_000),
+    );
     let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
     const preparedExecutionTargetRuntime = executionTargetIsRemote
       ? await (async () => {
@@ -827,6 +853,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
       let monitorLogPromise: Promise<unknown> | null = null;
+      // Windows tree termination is async; the run must not resolve before it
+      // settles or the descendants outlive the handle that tracked them.
+      let monitorTerminationPromise: Promise<void> = Promise.resolve();
+      const signalMonitorTarget = (
+        target: { pid: number | null; processGroupId: number | null },
+        signal: NodeJS.Signals,
+      ) => {
+        const termination = signalCodexChild(target, signal)
+          .then((sent) => {
+            if (sent) monitorTerminationSignal = signal;
+          })
+          .catch(() => onLog("stderr", "[paperclip] failed to terminate codex process tree\n"))
+          .then(() => undefined);
+        monitorTerminationPromise = Promise.all([monitorTerminationPromise, termination]).then(() => undefined);
+      };
 
       const monitor =
         monitorResolution.mode === "disabled"
@@ -840,11 +881,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 const message = formatOutputInactivityMonitorErrorMessage(monitorElapsedMs);
                 const elapsedSec = Math.round(monitorElapsedMs / 1000);
                 const timeoutSecLabel = Math.round(monitorResolution.timeoutMs / 1000);
+                const terminationDescription = executionTargetIsSandbox
+                  ? "host signal suppressed for remote sandbox; remote runner timeout/cancellation owns termination"
+                  : "terminating codex child via SIGTERM (5s grace, then SIGKILL)";
                 const logLine =
                   `[paperclip] adapter.invoke ${message}; ` +
                   `timeoutMs=${monitorResolution.timeoutMs} elapsedSinceLastEventMs=${monitorElapsedMs} ` +
                   `parsedEvents=${state.parsedEventCount} (timeout=${timeoutSecLabel}s elapsed=${elapsedSec}s); ` +
-                  `terminating codex child via SIGTERM (5s grace, then SIGKILL).\n`;
+                  `${terminationDescription}.\n`;
                 // Issue the log without awaiting on the kill hot path, but capture
                 // the promise so the surrounding try/finally can await flush before
                 // the run resolves. Without this the diagnostic that explains the
@@ -854,12 +898,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 if (!target || (target.pid == null && target.processGroupId == null)) {
                   return;
                 }
-                const sentSig = signalCodexChild(target, "SIGTERM");
-                if (sentSig) monitorTerminationSignal = "SIGTERM";
+                signalMonitorTarget(target, "SIGTERM");
                 sigkillTimer = setTimeout(() => {
                   sigkillTimer = null;
-                  const stillSent = signalCodexChild(target, "SIGKILL");
-                  if (stillSent) monitorTerminationSignal = "SIGKILL";
+                  signalMonitorTarget(target, "SIGKILL");
                 }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
                 if (typeof (sigkillTimer as { unref?: () => void }).unref === "function") {
                   (sigkillTimer as { unref: () => void }).unref();
@@ -868,7 +910,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             });
 
       const wrappedOnSpawn = async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => {
-        killTarget = { pid: meta.pid ?? null, processGroupId: meta.processGroupId };
+        killTarget = resolveCodexHostKillTarget(meta, executionTargetIsSandbox);
         if (onSpawn) {
           await onSpawn(meta);
         }
@@ -882,6 +924,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timeoutSec,
           graceSec,
           onSpawn: wrappedOnSpawn,
+          // A killed Codex parent can leave inherited stdio handles open in a
+          // descendant. Bound the wait for `close` so the monitor result still
+          // reaches heartbeat finalization after SIGKILL has had its grace.
+          postExitCloseTimeoutMs: CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS + 250,
           onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: async (stream, chunk) => {
             if (stream === "stdout") {
@@ -894,7 +940,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             await onLog(stream, cleaned);
           },
           runLogTail: paperclipBridge?.runLogTail,
+          terminalResultCleanup: {
+            graceMs: terminalResultCleanupGraceMs,
+            hasTerminalResult: ({ stdout }) => codexStdoutHasTurnCompleted(stdout),
+          },
         });
+        await monitorTerminationPromise;
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
           proc: {
@@ -922,6 +973,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           await monitorLogPromise;
           monitorLogPromise = null;
         }
+        await monitorTerminationPromise;
       }
     };
 

@@ -203,7 +203,7 @@ function sortTopologically(packages) {
     ordered.push(pkg);
   }
 
-  for (const pkg of [...packages].sort((a, b) => a.dir.localeCompare(b.dir))) {
+  for (const pkg of [...packages].sort((a, b) => (a.dir < b.dir ? -1 : a.dir > b.dir ? 1 : 0))) {
     visit(pkg);
   }
 
@@ -321,6 +321,7 @@ if (isDirectRun) {
 }
 
 export {
+  sortTopologically,
   buildReleasePackagePlan,
   checkConfiguration,
   discoverPublicPackages,
