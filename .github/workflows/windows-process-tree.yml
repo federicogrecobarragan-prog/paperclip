@@ -32,6 +32,8 @@ jobs:
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Exercise real Windows descendants and reject skipped tests
         shell: pwsh
+        env:
+          PAPERCLIP_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS: "60000"
         run: |
           pnpm exec vitest run packages/adapter-utils/src/windows-process-tree.test.ts packages/adapter-utils/src/windows-orphan-sweep.test.ts server/src/__tests__/heartbeat-windows-ownership-repair.test.ts server/src/__tests__/local-service-supervisor-windows.test.ts packages/adapters/codex-local/src/server/output-inactivity-monitor.integration.test.ts server/src/__tests__/codex-local-skill-injection.test.ts --reporter=default --reporter=junit --outputFile.junit=windows-process-tree.junit.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
