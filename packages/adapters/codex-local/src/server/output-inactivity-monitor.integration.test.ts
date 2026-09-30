@@ -19,17 +19,21 @@ setInterval(() => {}, 60_000);
 describe("codex inactivity monitor process ownership", () => {
   it("never maps a sandbox-reported remote pid to a host kill target", () => {
     const remotePidCollidingWithThisHost = process.pid;
+    const startedAt = new Date().toISOString();
 
     expect(resolveCodexHostKillTarget({
       pid: remotePidCollidingWithThisHost,
       processGroupId: null,
+      startedAt,
     }, true)).toBeNull();
     expect(resolveCodexHostKillTarget({
       pid: remotePidCollidingWithThisHost,
       processGroupId: null,
+      startedAt,
     }, false)).toEqual({
       pid: remotePidCollidingWithThisHost,
       processGroupId: null,
+      ownerStartedAtMs: Date.parse(startedAt),
     });
   });
 });
@@ -44,7 +48,7 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
       // default while avoiding a pre-first-event race on slower hosts.
       const timeoutMs = 2_000;
       const logs: Array<{ stream: string; chunk: string }> = [];
-      let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
+      let killTarget: ReturnType<typeof resolveCodexHostKillTarget> = null;
       let monitorFired = false;
       let terminationSignal: NodeJS.Signals | null = null;
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
@@ -86,7 +90,7 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
           timeoutSec: 30,
           graceSec: 1,
           onSpawn: async (meta) => {
-            killTarget = { pid: meta.pid, processGroupId: meta.processGroupId };
+            killTarget = resolveCodexHostKillTarget(meta, false);
           },
           onLog: async (stream, chunk) => {
             logs.push({ stream, chunk });

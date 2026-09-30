@@ -94,14 +94,22 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
+export interface CodexHostKillTarget {
+  pid: number | null;
+  processGroupId: number | null;
+  ownerStartedAtMs: number;
+}
+
 export async function signalCodexChild(
-  target: { pid: number | null; processGroupId: number | null },
+  target: CodexHostKillTarget,
   signal: NodeJS.Signals,
 ): Promise<boolean> {
   if (process.platform === "win32") {
     // The registered PID is the cmd.exe wrapper; `node codex.js -> codex.exe`
     // hang off it. Signalling the wrapper alone orphans them (LAC-1352).
-    return target.pid ? terminateWindowsProcessTree(target.pid) : false;
+    return target.pid
+      ? terminateWindowsProcessTree(target.pid, { ownerStartedAtMs: target.ownerStartedAtMs })
+      : false;
   }
   if (target.processGroupId && target.processGroupId > 0) {
     try {
@@ -123,14 +131,18 @@ export async function signalCodexChild(
 }
 
 export function resolveCodexHostKillTarget(
-  meta: { pid: number; processGroupId: number | null },
+  meta: { pid: number; processGroupId: number | null; startedAt: string },
   executionTargetIsSandbox: boolean,
-): { pid: number | null; processGroupId: number | null } | null {
+): CodexHostKillTarget | null {
   // Sandbox runners report the PID inside the remote sandbox. Treating that
   // number as a host PID can signal an unrelated local process after a numeric
   // collision. Remote execution owns its own timeout/cancellation lifecycle.
   if (executionTargetIsSandbox) return null;
-  return { pid: meta.pid ?? null, processGroupId: meta.processGroupId };
+  return {
+    pid: meta.pid ?? null,
+    processGroupId: meta.processGroupId,
+    ownerStartedAtMs: Date.parse(meta.startedAt),
+  };
 }
 
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
@@ -850,14 +862,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let monitorTerminationSignal: NodeJS.Signals | null = null;
       let monitorElapsedMs = 0;
       let monitorTimeoutMs = 0;
-      let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
+      let killTarget: CodexHostKillTarget | null = null;
       let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
       let monitorLogPromise: Promise<unknown> | null = null;
       // Windows tree termination is async; the run must not resolve before it
       // settles or the descendants outlive the handle that tracked them.
       let monitorTerminationPromise: Promise<void> = Promise.resolve();
       const signalMonitorTarget = (
-        target: { pid: number | null; processGroupId: number | null },
+        target: CodexHostKillTarget,
         signal: NodeJS.Signals,
       ) => {
         const termination = signalCodexChild(target, signal)
