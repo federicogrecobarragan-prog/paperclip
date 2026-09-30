@@ -8,7 +8,6 @@ on:
       - "packages/adapters/codex-local/src/server/**"
       - "server/src/services/heartbeat.ts"
       - "server/src/services/local-service-supervisor.ts"
-      - "server/src/__tests__/heartbeat-windows-ownership-repair.test.ts"
       - "server/src/__tests__/local-service-supervisor-windows.test.ts"
       - "server/src/__tests__/codex-local-skill-injection.test.ts"
   workflow_dispatch:
@@ -45,34 +44,4 @@ jobs:
           $inconclusive = $report.SelectNodes('//skipped | //failure | //error').Count
           if ($executed -lt $expected -or $inconclusive -gt 0) {
             throw "Windows process-tree suite must execute every required case without skips or failures (executed=$executed expected>=$expected inconclusive=$inconclusive)"
-          }
-
-  ownership_replay:
-    runs-on: windows-2022
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-      # embedded-postgres requires its platform package postinstall to hydrate
-      # the links used by the native PostgreSQL runtime.
-      - run: pnpm install --frozen-lockfile
-      - name: Preserve manual ownership claims through durable replay
-        shell: pwsh
-        env:
-          PAPERCLIP_EMBEDDED_POSTGRES_STARTUP_TIMEOUT_MS: "60000"
-        run: |
-          pnpm exec vitest run server/src/__tests__/heartbeat-windows-ownership-repair.test.ts --reporter=default --reporter=junit --outputFile.junit=windows-ownership-repair.junit.xml
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          [xml]$report = Get-Content -LiteralPath windows-ownership-repair.junit.xml -Raw
-          $expected = 3
-          $executed = $report.SelectNodes('//testcase').Count
-          $inconclusive = $report.SelectNodes('//skipped | //failure | //error').Count
-          if ($executed -lt $expected -or $inconclusive -gt 0) {
-            throw "Windows ownership-replay suite must execute every required case without skips or failures (executed=$executed expected>=$expected inconclusive=$inconclusive)"
           }

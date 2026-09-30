@@ -26,7 +26,7 @@ vi.mock("@paperclipai/adapter-utils/windows-process-tree", async () => {
 });
 const support = await getEmbeddedPostgresTestSupport();
 if (!support.supported) console.warn(`Embedded Postgres unavailable: ${support.reason}`);
-(support.supported && process.platform === "win32" ? describe : describe.skip)("unknown Windows orphan waits for manual repair",()=>{
+(support.supported ? describe : describe.skip)("unknown Windows orphan waits for manual repair",()=>{
   let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   beforeAll(async()=>{ temp=await startEmbeddedPostgresTestDatabase("synthetic-windows-repair-");db=createDb(temp.connectionString); },30000);
@@ -53,7 +53,7 @@ if (!support.supported) console.warn(`Embedded Postgres unavailable: ${support.r
       mocks.sweep.mockReset();
       if(discoveryFailed)mocks.sweep.mockRejectedValue(new Error("Synthetic snapshot unavailable"));
       else mocks.sweep.mockResolvedValue({terminated:[],skipped:[999_999_998],repairRequired:true,ownership:"root_missing"});
-      await heartbeatService(db).reapOrphanedRuns();
+      await heartbeatService(db,{hostPlatform:"win32"}).reapOrphanedRuns();
       const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,runId));
       const [issue]=await db.select().from(issues).where(eq(issues.id,issueId));
       const [agent]=await db.select().from(agents).where(eq(agents.id,agentId));

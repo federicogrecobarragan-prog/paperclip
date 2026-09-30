@@ -4947,6 +4947,8 @@ function buildTerminalFinalizationPayload(input: {
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  /** @internal Overrides host-platform branching for deterministic ownership tests. */
+  hostPlatform?: NodeJS.Platform;
   /** @internal Deterministic fault injection for post-terminal recovery tests. */
   postTerminalStepFaultInjector?: (input: {
     runId: string;
@@ -9729,7 +9731,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    */
   async function sweepWindowsOrphanedDescendants(run: typeof heartbeatRuns.$inferSelect,
     ownershipProof?: NonNullable<ReturnType<typeof runningProcesses.get>>["windowsOwnershipProof"]) {
-    if (process.platform !== "win32") return null;
+    if ((options.hostPlatform ?? process.platform) !== "win32") return null;
     const rootPid = run.processPid;
     const startedAtMs = run.processStartedAt ? new Date(run.processStartedAt).getTime() : Number.NaN;
     if (typeof rootPid !== "number" || rootPid <= 0 || !Number.isFinite(startedAtMs)) return null;
