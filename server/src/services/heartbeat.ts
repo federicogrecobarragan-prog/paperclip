@@ -13081,10 +13081,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
-      const durableRun = await tx.select({ payload: heartbeatRuns.terminalFinalizationJson, finishedAt: heartbeatRuns.finishedAt })
+      const durableRun = await tx.select({
+        payload: heartbeatRuns.terminalFinalizationJson,
+        finishedAt: heartbeatRuns.finishedAt,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+      })
         .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).then((rows) => rows[0] ?? null);
       const durableFinalization = options.durableFinalization || durableRun?.payload?.version === 1;
       if (durableFinalization && !await claimTerminalPhase(tx as unknown as Db, run.id, "issueExecution")) return null;
+      const manualOwnershipRepairPending =
+        durableRun?.errorCode === "process_ownership_unverified" &&
+        parseObject(durableRun.resultJson).manualRepairRequired === true;
+      if (manualOwnershipRepairPending) {
+        // Unknown Windows process ownership is a fail-closed hold. Completing the
+        // durable phase is safe, but releasing either claim or promoting deferred
+        // work is not: only the audited admin repair flow may clear this hold.
+        return { kind: "manual_ownership_repair_pending" as const };
+      }
       // Lock the context issue (if any) AND every issue that still references this run.
       //
       // A single run can hold execution locks on multiple issues: the caller's context
