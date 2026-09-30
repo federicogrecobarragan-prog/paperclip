@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -303,6 +303,10 @@ test("empty workspace lanes fail in the actual runner; deleting its guard produc
     `);
     const source = readFileSync(script, "utf8").replace(/\r\n/g, "\n");
     const target = path.join(fixture, "scripts", "run-vitest-stable.mjs");
+    copyFileSync(
+      path.join(repoRoot, "scripts", "vitest-junit-guard.mjs"),
+      path.join(fixture, "scripts", "vitest-junit-guard.mjs"),
+    );
     const run = (group) => spawnSync(process.execPath, [target, "--mode", "general", "--group", group], {
       cwd: fixture, encoding: "utf8",
     });
