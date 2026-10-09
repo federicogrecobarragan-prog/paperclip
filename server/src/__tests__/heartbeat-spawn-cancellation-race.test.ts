@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { terminalProcessCandidatePage, TERMINAL_PROCESS_BATCH_SIZE } from "../services/terminal-process-candidates.js";
 
 const mocks = vi.hoisted(() => ({ execute: vi.fn(), terminate: vi.fn(async () => {}), birth: vi.fn() }));
 vi.mock("../services/run-spawn-guard.js", async () => {
@@ -117,5 +118,67 @@ if (!support.supported) console.warn(`Embedded Postgres unavailable: ${support.r
       expect(mocks.terminate).not.toHaveBeenCalled();
       expect(kill).not.toHaveBeenCalled();
     } finally { kill.mockRestore(); }
+  });
+
+  it("keeps large historical payloads in PostgreSQL and visits every terminal page", async () => {
+    const companyId = randomUUID(), agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Synthetic history", issuePrefix: "HIST" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Synthetic history owner", role: "engineer",
+      status: "paused", adapterType: "claude_local", adapterConfig: {}, permissions: {} });
+    const ids = Array.from({ length: TERMINAL_PROCESS_BATCH_SIZE + 11 }, () => randomUUID());
+    const payload = "HISTORY_MUST_STAY_IN_POSTGRES".repeat(80_000);
+    await db.insert(heartbeatRuns).values(ids.map((id, index) => ({
+      id, companyId, agentId, status: "cancelled", processPid: 424242,
+      processStartedAt: new Date("2026-01-01T00:00:00Z"),
+      contextSnapshot: { paperclipEnvironment: { driver: index % 2 ? "ssh" : "local" }, prompt: index ? "small" : payload },
+      resultJson: index ? {} : { transcript: payload },
+    })));
+    const visited: string[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    for (;;) {
+      expect(++pages).toBeLessThanOrEqual(4);
+      const page = await terminalProcessCandidatePage(db, ["queued", "running", "scheduled_retry"], cursor);
+      expect(page.length).toBeLessThanOrEqual(TERMINAL_PROCESS_BATCH_SIZE);
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(110_000);
+      for (const candidate of page) {
+        if (ids.includes(candidate.run.id)) {
+          visited.push(candidate.run.id);
+          expect(candidate.run.contextSnapshot).toEqual({ paperclipEnvironment: { driver: expect.stringMatching(/^(local|ssh)$/) } });
+        }
+      }
+      if (!page.length) break;
+      cursor = page[page.length - 1]!.run.id;
+    }
+    expect(new Set(visited).size).toBe(ids.length);
+    expect(visited.length).toBe(ids.length);
+    const [stored] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, ids[0]!));
+    expect(stored.result).toEqual({ transcript: payload });
+    // Clear this test's candidates only; subsequent guards retain their own fixtures.
+    await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.companyId, companyId));
+  });
+
+  it("coalesces overlapping reapers and admits a new sweep after failure", async () => {
+    await terminalRun();
+    const entered = deferred(), release = deferred();
+    mocks.birth.mockReset();
+    mocks.birth.mockImplementationOnce(async () => {
+      entered.resolve(); await release.promise; throw new Error("synthetic birth probe failure");
+    });
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    try {
+      const heartbeat = heartbeatService(db);
+      const first = heartbeat.reapOrphanedRuns();
+      await entered.promise;
+      const second = heartbeat.reapOrphanedRuns();
+      const settled = Promise.allSettled([first, second]);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(mocks.birth).toHaveBeenCalledTimes(1);
+      release.resolve();
+      expect((await settled).map(result => result.status)).toEqual(["rejected", "rejected"]);
+      mocks.birth.mockResolvedValue(null);
+      await heartbeat.reapOrphanedRuns();
+      expect(mocks.birth.mock.calls.length).toBeGreaterThan(1);
+    } finally { release.resolve(); kill.mockRestore(); }
   });
 });

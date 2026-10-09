@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { createServiceTaskScope } from "./service-task-scope.js";
 import { createRunSpawnGuard, matchesRecordedProcessBirth, readProcessBirth } from "./run-spawn-guard.js";
+import { terminalProcessCandidatePage, TERMINAL_PROCESS_BATCH_SIZE } from "./terminal-process-candidates.js";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -9746,31 +9747,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function reapOrphanedRuns(opts?: {
+  type OrphanReapOptions = {
     staleThresholdMs?: number;
     activeExecutionDeadProcessGraceMs?: number;
-  }) {
+  };
+  let orphanReapInFlight: Promise<{ reaped: number; runIds: string[] }> | null = null;
+  async function reapOrphanedRuns(opts?: OrphanReapOptions) {
+    // A slow sweep must not accumulate another complete scan on every timer tick.
+    if (orphanReapInFlight) return orphanReapInFlight;
+    const operation = reapOrphanedRunsOnce(opts);
+    orphanReapInFlight = operation;
+    try { return await operation; }
+    finally { if (orphanReapInFlight === operation) orphanReapInFlight = null; }
+  }
+  async function reapOrphanedRunsOnce(opts?: OrphanReapOptions) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
     // A cancelled run can have spawned after cancellation in an older server.
     // Never terminate a terminal PID merely because it is alive: verify its birth.
-    const terminalRuns = await db.select({ run: heartbeatRuns, adapterType: agents.adapterType }).from(heartbeatRuns)
-      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(and(notInArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-        isNotNull(heartbeatRuns.processPid)));
-    for (const { run: terminal, adapterType } of terminalRuns) {
-      if (!heartbeatRunTracksHostLocalChildProcess({ adapterType, contextSnapshot: terminal.contextSnapshot })) continue;
-      if (!terminal.processPid || !terminal.processStartedAt || !isProcessAlive(terminal.processPid)) continue;
-      const birth = await readProcessBirth(terminal.processPid);
-      if (!matchesRecordedProcessBirth(terminal.processStartedAt, birth)) continue;
-      await terminateHeartbeatRunProcess({ pid: terminal.processPid, startedAt: terminal.processStartedAt, processGroupId: terminal.processGroupId });
-      // Successful cleanup is idempotent; compare metadata to avoid clearing a replacement.
-      await db.update(heartbeatRuns)
-        .set({ processPid: null, processGroupId: null, updatedAt: new Date() })
-        .where(and(eq(heartbeatRuns.id, terminal.id), eq(heartbeatRuns.processPid, terminal.processPid),
-          eq(heartbeatRuns.processStartedAt, terminal.processStartedAt),
-          notInArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES])));
+    let terminalCursor: string | undefined;
+    for (;;) {
+      const terminalRuns = await terminalProcessCandidatePage(db, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES], terminalCursor);
+      if (terminalRuns.length === 0) break;
+      for (const { run: terminal, adapterType } of terminalRuns) {
+        if (!heartbeatRunTracksHostLocalChildProcess({ adapterType, contextSnapshot: terminal.contextSnapshot })) continue;
+        if (!terminal.processPid || !terminal.processStartedAt || !isProcessAlive(terminal.processPid)) continue;
+        const birth = await readProcessBirth(terminal.processPid);
+        if (!matchesRecordedProcessBirth(terminal.processStartedAt, birth)) continue;
+        await terminateHeartbeatRunProcess({ pid: terminal.processPid, startedAt: terminal.processStartedAt, processGroupId: terminal.processGroupId });
+        // Successful cleanup is idempotent; compare metadata to avoid clearing a replacement.
+        await db.update(heartbeatRuns)
+          .set({ processPid: null, processGroupId: null, updatedAt: new Date() })
+          .where(and(eq(heartbeatRuns.id, terminal.id), eq(heartbeatRuns.processPid, terminal.processPid),
+            eq(heartbeatRuns.processStartedAt, terminal.processStartedAt),
+            notInArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES])));
+      }
+      terminalCursor = terminalRuns[terminalRuns.length - 1]!.run.id;
+      if (terminalRuns.length < TERMINAL_PROCESS_BATCH_SIZE) break;
     }
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
