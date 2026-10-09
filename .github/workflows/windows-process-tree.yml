@@ -4,6 +4,13 @@ on:
   pull_request:
     paths:
       - ".github/workflows/windows-process-tree.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".npmrc"
+      - "pnpmfile.*"
+      - "packages/**/package.json"
+      - "server/package.json"
       - "packages/adapter-utils/src/**"
       - "packages/adapters/codex-local/src/server/**"
       - "server/src/services/heartbeat.ts"
@@ -28,6 +35,10 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      # CI owns lockfile updates; manifest-only PRs intentionally do not commit
+      # pnpm-lock.yaml. This standalone workflow cannot consume PR's job artifact.
+      - name: Prepare CI-owned lockfile for the checked-out manifests
+        run: pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Exercise real Windows descendants and reject skipped tests
         shell: pwsh
