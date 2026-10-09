@@ -24,6 +24,16 @@ test('stable verify waits for every CI family and always reports', () => {
   assert.match(block, /if: \$\{\{ always\(\) \}\}/);
   assert.match(block, /name: verify/);
 });
+test('required typecheck job runs shard and JUnit validation after installing dependencies', () => {
+  const job = yaml.split('\n  typecheck_release_registry:\n')[1]?.split(/\n  [a-z][a-z_]*:\n/)[0];
+  const command = 'run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs';
+  assert.ok(job, 'the required typecheck job must exist');
+  assert.ok(job.indexOf('run: pnpm install --frozen-lockfile') >= 0, 'the parser dependency must be installed');
+  assert.ok(job.indexOf(command) > job.indexOf('run: pnpm install --frozen-lockfile'),
+    'the required job must run JUnit validation after installing its parser');
+  const step = job.slice(0, job.indexOf(command)).split('      - name:').at(-1);
+  assert.doesNotMatch(step, /\bif:|continue-on-error:/, 'JUnit validation must not be skipped or allowed to fail');
+});
 test('actual aggregator shell passes when every dependency succeeds', () => {
   assert.equal(execute(Object.fromEntries(families.map(f => [f, 'success']))), 0);
 });

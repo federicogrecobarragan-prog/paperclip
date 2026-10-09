@@ -156,27 +156,60 @@ test("the durable ownership JUnit guard rejects missing, ambiguous, and malforme
   );
 });
 
+test("the JUnit guard rejects malformed character references and XML syntax", () => {
+  const guard = requiredJUnitGuardForSuite(HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE);
+  const valid = junitSuite();
+  const corruptions = {
+    closingWhitespace: valid.replace("</testsuite>", "</ testsuite>"),
+    zeroReference: valid.replace("synthetic-1", "synthetic-1&#0;"),
+    literalNul: valid.replace("synthetic-1", "synthetic-1\u0000"),
+    surrogateReference: valid.replace("synthetic-1", "synthetic-1&#xD800;"),
+    outOfRangeReference: valid.replace("synthetic-1", "synthetic-1&#x110000;"),
+    forbiddenNoncharacter: valid.replace("synthetic-1", "synthetic-1&#xFFFF;"),
+    literalSurrogate: valid.replace("synthetic-1", "synthetic-1\uD800"),
+    nulInText: valid.replace("</testcase>", "\u0000</testcase>"),
+    nulInComment: `<!--\u0000-->${valid}`,
+    nulInCdata: valid.replace("</testcase>", "<![CDATA[\u0000]]></testcase>"),
+    selfClosingWhitespace: valid.replace("</testcase>", "<output / ></testcase>"),
+    invalidAttributeWhitespace: valid.replace(' tests="9"', '\u00a0tests="9"'),
+    duplicateAttribute: valid.replace('tests="9"', 'tests="9" tests="9"'),
+    invalidProcessingInstruction: `<??>${valid}`,
+    repeatedDeclaration: `<?xml version="1.0"?><?xml version="1.0"?>${valid}`,
+    strayCdataClose: valid.replace("</testcase>", "]]></testcase>"),
+    invalidEntity: valid.replace("synthetic-1", "synthetic-1&unknown;"),
+    internalDoctype: `<!DOCTYPE testsuites [<!ENTITY value "synthetic">]>${valid}`,
+    externalDoctype: `<!DOCTYPE testsuites SYSTEM "https://example.invalid/junit.dtd">${valid}`,
+  };
+  for (const [name, report] of Object.entries(corruptions)) {
+    assert.throws(
+      () => verifyVitestJUnitReport(report, guard),
+      /Malformed JUnit XML/,
+      `${name} must be rejected even when all nine test cases appear to pass`,
+    );
+  }
+});
+
+test("the JUnit guard preserves valid entities, Unicode, comments, and CDATA", () => {
+  const suiteName = "synthetic & résumé 🧪";
+  const guard = { suiteName, minimumTests: 9 };
+  const report = junitSuite()
+    .replace(HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE, "synthetic &amp; r&#233;sum&#xE9; &#x1F9EA;")
+    .replace("synthetic-1", "valid-&#9;&#10;&#13;&#32;&#xD7FF;&#xE000;&#xFFFD;&#x10000;&#x10FFFF;&amp;&quot;&apos;&lt;&gt;résumé 🧪")
+    .replace("</testcase>", "<![CDATA[<failure/> & 🧪]]></testcase>");
+  const decorated = `\uFEFF<?xml version="1.0"?>\n<!-- valid 🧪 --><?audit ready?>${report}`;
+  assert.deepEqual(verifyVitestJUnitReport(decorated, guard), {
+    tests: 9,
+    failures: 0,
+    errors: 0,
+    skipped: 0,
+  });
+});
+
 test("the serialized runner executes and propagates the required JUnit guard", (t) => {
   const fixtureDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-junit-guard-"));
   t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
 
   const spawnFixture = path.join(fixtureDir, "spawn-vitest-junit.mjs");
-  writeFileSync(
-    spawnFixture,
-    `import childProcess from "node:child_process";\n` +
-      `import { writeFileSync } from "node:fs";\n` +
-      `import { syncBuiltinESMExports } from "node:module";\n` +
-      `childProcess.spawnSync = (_command, args = []) => {\n` +
-      `  const output = args.find((arg) => arg.startsWith("--outputFile.junit="));\n` +
-      `  if (!output) return { status: 42, signal: null, error: undefined };\n` +
-      `  const cases = Array.from({ length: 9 }, (_, i) => \`<testcase name="control-\${i + 1}"><skipped/></testcase>\`).join("");\n` +
-      `  writeFileSync(output.slice("--outputFile.junit=".length), \`<?xml version="1.0"?><testsuites tests="9" failures="0" errors="0"><testsuite name="${HEARTBEAT_WINDOWS_OWNERSHIP_REPAIR_SUITE}" tests="9" failures="0" errors="0" skipped="9">\${cases}</testsuite></testsuites>\`);\n` +
-      `  return { status: 0, signal: null, error: undefined };\n` +
-      `};\n` +
-      `syncBuiltinESMExports();\n`,
-    "utf8",
-  );
-
   const inventory = dryRunJson([
     "--mode", "serialized", "--shard-index", "0", "--shard-count", "1",
   ]);
@@ -185,28 +218,54 @@ test("the serialized runner executes and propagates the required JUnit guard", (
   );
   assert.notEqual(targetIndex, -1, "mandatory ownership suite must be present in the serialized lane");
 
-  const result = spawnSync(
-    process.execPath,
-    [
-      "--import", pathToFileURL(spawnFixture).href,
-      script,
-      "--mode", "serialized",
-      "--shard-index", String(targetIndex),
-      "--shard-count", String(inventory.serializedSuiteCount),
-    ],
-    {
-      cwd: repoRoot,
-      encoding: "utf8",
-      env: process.env,
-    },
-  );
+  const valid = junitSuite();
+  const reports = {
+    skipped: junitSuite({ skipped: 9 }),
+    closingWhitespace: valid.replace("</testsuite>", "</ testsuite>"),
+    zeroReference: valid.replace("synthetic-1", "synthetic-1&#0;"),
+    literalNul: valid.replace("synthetic-1", "synthetic-1\u0000"),
+    selfClosingWhitespace: valid.replace("</testcase>", "<output / ></testcase>"),
+    invalidAttributeWhitespace: valid.replace(' tests="9"', '\u00a0tests="9"'),
+    strayCdataClose: valid.replace("</testcase>", "]]></testcase>"),
+  };
+  for (const [name, report] of Object.entries(reports)) {
+    writeFileSync(
+      spawnFixture,
+      `import childProcess from "node:child_process";\n` +
+        `import { writeFileSync } from "node:fs";\n` +
+        `import { syncBuiltinESMExports } from "node:module";\n` +
+        `childProcess.spawnSync = (_command, args = []) => {\n` +
+        `  const output = args.find((arg) => arg.startsWith("--outputFile.junit="));\n` +
+        `  if (!output) return { status: 42, signal: null, error: undefined };\n` +
+        `  writeFileSync(output.slice("--outputFile.junit=".length), ${JSON.stringify(report)});\n` +
+        `  return { status: 0, signal: null, error: undefined };\n` +
+        `};\n` +
+        `syncBuiltinESMExports();\n`,
+      "utf8",
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--import", pathToFileURL(spawnFixture).href,
+        script,
+        "--mode", "serialized",
+        "--shard-index", String(targetIndex),
+        "--shard-count", String(inventory.serializedSuiteCount),
+      ],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: process.env,
+      },
+    );
 
-  assert.equal(
-    result.status,
-    1,
-    `serialized runner accepted nine skipped tests; stdout=${result.stdout} stderr=${result.stderr}`,
-  );
-  assert.match(result.stderr, /required JUnit guard failed/);
+    assert.equal(
+      result.status,
+      1,
+      `serialized runner accepted ${name}; stdout=${result.stdout} stderr=${result.stderr}`,
+    );
+    assert.match(result.stderr, /required JUnit guard failed/);
+  }
 });
 
 test("shard flags are rejected for the parallel workspace groups", () => {
