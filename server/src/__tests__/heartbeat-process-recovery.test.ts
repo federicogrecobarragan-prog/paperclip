@@ -96,9 +96,11 @@ vi.mock("../adapters/index.ts", async () => {
 
 import {
   heartbeatService,
+  isHeartbeatRunTrackedInMemory,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
 import { secretService } from "../services/secrets.ts";
+import { readProcessBirth } from "../services/run-spawn-guard.js";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
@@ -150,6 +152,15 @@ async function waitForRunToSettle(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
+}
+
+async function waitForRunToLeaveMemory(runId: string, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isHeartbeatRunTrackedInMemory(runId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isHeartbeatRunTrackedInMemory(runId);
 }
 
 async function waitForValue<T>(
@@ -448,6 +459,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     agentStatus?: "paused" | "idle" | "running";
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
+    processStartedAt?: Date | null;
     processGroupId?: number | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
@@ -462,6 +474,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issueId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const contextSnapshot = {
+      paperclipEnvironment: { driver: "local" },
+      ...(input?.contextSnapshot ?? {}),
+    };
 
     await db.insert(companies).values({
       id: companyId,
@@ -504,9 +520,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: input?.runStatus ?? "running",
       wakeupRequestId,
       contextSnapshot: input?.includeIssue === false
-        ? input?.contextSnapshot ?? {}
-        : { ...(input?.contextSnapshot ?? {}), issueId },
+        ? contextSnapshot
+        : { ...contextSnapshot, issueId },
       processPid: input?.processPid ?? null,
+      processStartedAt: input?.processStartedAt ??
+        (input?.processPid && isPidAlive(input.processPid) ? await readProcessBirth(input.processPid) : null),
       processGroupId: input?.processGroupId ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
@@ -639,6 +657,251 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     releaseAdapter();
     const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
     expect(settledRun?.status).toBe("succeeded");
+  });
+
+  it("does not reap a dead pid while an adapter execution still owns the run", async () => {
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async (context: {
+        runId: string;
+        onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+      }) => {
+        const deadPid = 999_999_999;
+        await context.onSpawn?.({
+          pid: deadPid,
+          processGroupId: null,
+          startedAt: new Date().toISOString(),
+        });
+        runningProcesses.set(context.runId, {
+          child: { pid: deadPid } as ChildProcess,
+          graceSec: 1,
+          processGroupId: null,
+        });
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "The active adapter remained authoritative through process close.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      runStatus: "queued",
+      processLossRetryCount: 1,
+      includeIssue: false,
+    });
+    const executorHeartbeat = heartbeatService(db);
+    const reaperHeartbeat = heartbeatService(db);
+
+    await executorHeartbeat.resumeQueuedRuns();
+    await adapterStarted;
+    try {
+      expect(isHeartbeatRunTrackedInMemory(runId)).toBe(true);
+
+      // A dead pid can be the bounded exit-to-close window. While executeRun
+      // still owns the run, the reaper must not fabricate process_lost.
+      await db
+        .update(heartbeatRuns)
+        .set({ updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const result = await reaperHeartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60_000 });
+      expect(result).toEqual({ reaped: 0, runIds: [] });
+
+      const activeRun = await reaperHeartbeat.getRun(runId);
+      expect(activeRun?.status).toBe("running");
+      expect(activeRun?.errorCode).toBeNull();
+      expect(isHeartbeatRunTrackedInMemory(runId)).toBe(true);
+
+      // A fallback child in the same executeRun gets its own grace window.
+      // If the old PID's observation timestamp leaked across this update, the
+      // 10 ms grace below would immediately and falsely terminalize the run.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await db
+        .update(heartbeatRuns)
+        .set({ processPid: 999_999_998, updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+      const afterReplacement = await reaperHeartbeat.reapOrphanedRuns({
+        staleThresholdMs: 5 * 60_000,
+        activeExecutionDeadProcessGraceMs: 10,
+      });
+      expect(afterReplacement).toEqual({ reaped: 0, runIds: [] });
+    } finally {
+      releaseAdapter?.();
+    }
+    const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
+    expect(settledRun?.status).toBe("succeeded");
+    expect(settledRun?.errorCode).toBeNull();
+    // The database terminal transition occurs before executeRun's finally
+    // releases its in-memory ownership. Assert eventual cleanup rather than
+    // racing that bounded publication/finalization tail.
+    expect(await waitForRunToLeaveMemory(runId)).toBe(true);
+  });
+
+  it("reaps a dead local pid after the active execution grace expires", async () => {
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async (context: {
+        runId: string;
+        onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+      }) => {
+        const deadPid = 999_999_997;
+        await context.onSpawn?.({
+          pid: deadPid,
+          processGroupId: null,
+          startedAt: new Date().toISOString(),
+        });
+        runningProcesses.set(context.runId, {
+          child: { pid: deadPid } as ChildProcess,
+          graceSec: 1,
+          processGroupId: null,
+        });
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Late adapter result must not overwrite process_lost.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      runStatus: "queued",
+      processLossRetryCount: 1,
+      includeIssue: false,
+    });
+    const executorHeartbeat = heartbeatService(db);
+    const reaperHeartbeat = heartbeatService(db);
+
+    await executorHeartbeat.resumeQueuedRuns();
+    await adapterStarted;
+    try {
+      const protectedResult = await reaperHeartbeat.reapOrphanedRuns({
+        staleThresholdMs: 5 * 60_000,
+      });
+      expect(protectedResult).toEqual({ reaped: 0, runIds: [] });
+
+      const result = await reaperHeartbeat.reapOrphanedRuns({
+        staleThresholdMs: 5 * 60_000,
+        activeExecutionDeadProcessGraceMs: 0,
+      });
+      expect(result).toEqual({ reaped: 1, runIds: [runId] });
+      const reapedRun = await reaperHeartbeat.getRun(runId);
+      expect(reapedRun?.status).toBe("failed");
+      expect(reapedRun?.errorCode).toBe("process_lost");
+      expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
+    } finally {
+      releaseAdapter?.();
+    }
+    const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
+    expect(settledRun?.status).toBe("failed");
+    expect(settledRun?.errorCode).toBe("process_lost");
+  });
+
+  it("does not probe a sandbox pid in the host process namespace while the remote execution is tracked", async () => {
+    const remotePid = 999_999_999;
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      runStatus: "running",
+      processPid: remotePid,
+      processLossRetryCount: 1,
+      includeIssue: false,
+      contextSnapshot: {
+        paperclipEnvironment: {
+          driver: "sandbox",
+        },
+      },
+    });
+    runningProcesses.set(runId, {
+      child: { pid: remotePid } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    try {
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 1 });
+
+      expect(result).toEqual({ reaped: 0, runIds: [] });
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "running",
+        errorCode: null,
+        processPid: remotePid,
+      });
+    } finally {
+      runningProcesses.delete(runId);
+    }
+  });
+
+  it("persists a codex inactivity monitor failure and clears both in-memory trackers", async () => {
+    mockAdapterExecute.mockImplementationOnce(async (context: { runId: string }) => {
+      runningProcesses.set(context.runId, {
+        child: { pid: 999_999_999 } as ChildProcess,
+        graceSec: 1,
+        processGroupId: null,
+      });
+      return {
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: false,
+        errorMessage: "monitor: no codex output for 7m 0s",
+        errorCode: "codex_output_inactivity_monitor",
+        summary: null,
+        provider: "openai",
+        model: "gpt-5",
+        resultJson: {
+          outputInactivityMonitor: {
+            kind: "output_inactivity",
+            timeoutMs: 420_000,
+            elapsedMsSinceLastEvent: 420_005,
+            terminationSignal: "SIGTERM",
+          },
+        },
+      };
+    });
+
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      runStatus: "queued",
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const terminalRun = await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    expect(terminalRun?.status).toBe("failed");
+    expect(terminalRun?.errorCode).toBe("codex_output_inactivity_monitor");
+    expect(terminalRun?.error).toBe("monitor: no codex output for 7m 0s");
+    expect(terminalRun?.finishedAt).toBeTruthy();
+    expect(terminalRun?.signal).toBe("SIGTERM");
+    expect(terminalRun?.resultJson).toMatchObject({
+      outputInactivityMonitor: {
+        kind: "output_inactivity",
+        timeoutMs: 420_000,
+      },
+    });
+    expect(await waitForRunToLeaveMemory(runId)).toBe(true);
   });
 
   async function seedStrandedIssueFixture(input: {
@@ -1118,6 +1381,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
 
+  it("does not persist an opaque exception thrown by an untrusted adapter", async () => {
+    const canary = `opaque-adapter-canary-${randomUUID()}`;
+    mockAdapterExecute.mockRejectedValueOnce(new Error(canary));
+    const { agentId, runId, wakeupRequestId, issueId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    const failedRun = await heartbeat.getRun(runId);
+    expect(failedRun).toMatchObject({
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: "Adapter execution failed; raw provider diagnostic omitted",
+    });
+
+    const [events, operations, comments, wakeup, runtimeState] = await Promise.all([
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)),
+      db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, runId)),
+      db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+      db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select()
+        .from(agentRuntimeState)
+        .where(eq(agentRuntimeState.agentId, agentId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    const persistedEvidence = JSON.stringify({
+      failedRun,
+      events,
+      operations,
+      comments,
+      wakeup,
+      runtimeState,
+    });
+
+    expect(persistedEvidence).not.toContain(canary);
+    expect(operations).toContainEqual(expect.objectContaining({
+      phase: "workspace_finalize",
+      status: "failed",
+      metadata: expect.objectContaining({
+        errorMessage: "Adapter execution failed; raw provider diagnostic omitted",
+      }),
+    }));
+  });
+
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
@@ -1143,6 +1456,120 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("keeps an SSH run active after restart while its host ssh pid is still alive", async () => {
+    const sshChild = spawnAliveProcess();
+    childProcesses.add(sshChild);
+    expect(sshChild.pid).toBeTypeOf("number");
+
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      processPid: sshChild.pid ?? null,
+      includeIssue: false,
+      contextSnapshot: {
+        paperclipEnvironment: { driver: "ssh" },
+      },
+    });
+    // This run is deliberately absent from both in-memory trackers, matching
+    // the state a newly restarted Paperclip process sees.
+    expect(isHeartbeatRunTrackedInMemory(runId)).toBe(false);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect(isPidAlive(sshChild.pid)).toBe(true);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "running",
+      errorCode: "process_detached",
+      processPid: sshChild.pid,
+    });
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("claimed");
+  });
+
+  // LAC-1352: on Windows the adapter's kill reaches only the wrapper pid. Its
+  // descendants survive holding our stdio pipes, `close` never fires, the
+  // in-memory handle is never released, and the reaper skipped the row for
+  // good -- leaving the agent `running` over a dead process forever.
+  it("finalizes a tracked run whose in-memory handle points at a dead pid", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    const heartbeat = heartbeatService(db);
+    runningProcesses.set(runId, {
+      child: { pid: 999_999_999 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    // The stale handle must be dropped, or the next pass skips the row again.
+    expect(runningProcesses.has(runId)).toBe(false);
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(
+      events.some((event) => (event.payload as Record<string, unknown> | null)?.staleProcessHandleCleared === true),
+    ).toBe(true);
+  });
+
+  it("keeps a tracked run untouched while the handle's pid is still alive", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+    runningProcesses.set(runId, {
+      child: { pid: child.pid } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    // A live process still owns the run: the handle must survive untouched.
+    expect(runningProcesses.has(runId)).toBe(true);
+  });
+
+  it("keeps a tracked run untouched before it has recorded any pid", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: null,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+    // The window between claiming a run and spawning its child: no pid exists
+    // yet, so "no live pid" is not evidence that the run died.
+    runningProcesses.set(runId, {
+      child: {} as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    expect(runningProcesses.has(runId)).toBe(true);
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {
@@ -1662,8 +2089,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             consumerId: agentId,
             configPath: "env.UNBOUND_API_KEY",
             envKey: "UNBOUND_API_KEY",
-            secretId: secret.id,
-            secretName,
+            // The persistence boundary deliberately redacts secret metadata;
+            // operators still receive the actionable binding path above.
+            secretId: "***REDACTED***",
+            secretName: "***REDACTED***",
           },
         ],
       },

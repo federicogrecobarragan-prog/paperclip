@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -41,6 +41,41 @@ const mockAdapterExecute = vi.hoisted(() =>
     model: "test-model",
   })),
 );
+
+const delayedWriter = vi.hoisted(() => ({
+  current: null as null | { entered: (status: unknown) => void; release: Promise<void>; wrote: boolean },
+}));
+
+vi.mock("../services/environment-run-orchestrator.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/environment-run-orchestrator.js")>();
+  return {
+    ...actual,
+    environmentRunOrchestrator: (...args: Parameters<typeof actual.environmentRunOrchestrator>) => {
+      const orchestrator = actual.environmentRunOrchestrator(...args);
+      return {
+        ...orchestrator,
+        releaseForRun: async (input: Parameters<typeof orchestrator.releaseForRun>[0]) => {
+          const delayed = delayedWriter.current;
+          if (delayed) {
+            delayed.entered(input.status);
+            await delayed.release;
+            // A real FK-backed write after the run has reached a terminal status.
+            await args[0].insert(activityLog).values({
+              companyId: input.companyId,
+              actorType: "system",
+              actorId: "test-drain",
+              action: "test.delayed_cleanup",
+              entityType: "heartbeat_run",
+              entityId: input.heartbeatRunId,
+            });
+            delayed.wrote = true;
+          }
+          return orchestrator.releaseForRun(input);
+        },
+      };
+    },
+  };
+});
 
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
@@ -95,11 +130,16 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-dependency-scheduling-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
     await ensureIssueRelationsTable(db);
   }, 20_000);
 
+  beforeEach(() => {
+    heartbeat = heartbeatService(db);
+  });
+
   afterEach(async () => {
+    await heartbeat.stopAndDrain();
+    delayedWriter.current = null;
     mockAdapterExecute.mockReset();
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -111,21 +151,6 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       model: "test-model",
     }));
     runningProcesses.clear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(companySkills);
@@ -153,6 +178,48 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("drains a late FK writer after terminal status before teardown may delete its company", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Drain fixture",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Fixture", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {}, permissions: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+    });
+    let release!: () => void;
+    let entered!: (status: unknown) => void;
+    const terminal = new Promise<unknown>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const delayed = { entered, release: gate, wrote: false };
+    delayedWriter.current = delayed;
+    let drain: Promise<void> | undefined;
+    try {
+      const run = await heartbeat.wakeup(agentId);
+      expect(run).not.toBeNull();
+      await terminal;
+      const [persistedRun] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+      expect(["succeeded", "failed", "cancelled", "timed_out"]).toContain(persistedRun?.status);
+      let drained = false;
+      drain = heartbeat.stopAndDrain().then(() => { drained = true; });
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      expect(() => heartbeat.wakeup(agentId)).toThrow("Service is stopped");
+      expect(await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId))).toHaveLength(1);
+      release();
+      await drain;
+      expect(delayed.wrote).toBe(true);
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, "test.delayed_cleanup"))).toHaveLength(1);
+    } finally {
+      release();
+      await drain;
+    }
   });
 
   it("keeps blocked descendants idle until their blockers resolve", async () => {

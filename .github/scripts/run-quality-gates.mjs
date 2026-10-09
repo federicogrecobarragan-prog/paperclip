@@ -18,6 +18,11 @@ import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
+const COMMENT_AUTHORS = new Set([
+  'commitperclip[bot]',
+  'commitperclip',
+  'github-actions[bot]',
+]);
 
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
@@ -47,7 +52,8 @@ function buildComment(author, failures, informational) {
   return lines.join('\n');
 }
 
-export async function findExistingComment(fetchFromGitHub, token, repo, prNumber) {
+export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, allowedAuthors = COMMENT_AUTHORS) {
+  const allowed = allowedAuthors instanceof Set ? allowedAuthors : new Set(allowedAuthors);
   for (let page = 1; ; page += 1) {
     const comments = await fetchFromGitHub(
       `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
@@ -55,7 +61,8 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
+      c => allowed.has(c.user?.login) &&
+           typeof c.body === 'string' &&
            c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
@@ -81,7 +88,8 @@ async function upsertComment(token, repo, prNumber, body, existing) {
 }
 
 async function main() {
-  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
+  const { GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH, QUALITY_COMMENT_AUTHORS } = process.env;
+  const GH_TOKEN = process.env.COMMITPERCLIP_REVIEW_TOKEN ?? process.env.GH_TOKEN;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER env vars required');
@@ -89,11 +97,11 @@ async function main() {
   }
 
   // Sanitize inputs before use in URL construction (prevents SSRF)
-  const prNumber = parseInt(PR_NUMBER, 10);
-  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+  if (!/^[1-9]\d*$/.test(PR_NUMBER)) {
     console.error('ERROR: PR_NUMBER must be a positive integer');
     process.exit(1);
   }
+  const prNumber = Number(PR_NUMBER);
   if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(GH_REPO)) {
     console.error('ERROR: GH_REPO must be in owner/repo format');
     process.exit(1);
@@ -134,7 +142,10 @@ async function main() {
   const commentBody = buildComment(author, allFailures, informational);
 
   // Post comment if there are failures/informational, or update existing comment
-  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
+  const allowedCommentAuthors = QUALITY_COMMENT_AUTHORS
+    ? QUALITY_COMMENT_AUTHORS.split(',').map(value => value.trim()).filter(Boolean)
+    : COMMENT_AUTHORS;
+  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber, allowedCommentAuthors);
   if (allFailures.length > 0 || informational.length > 0 || existing) {
     await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
   }

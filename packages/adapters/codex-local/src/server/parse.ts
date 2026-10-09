@@ -72,6 +72,30 @@ export function parseCodexJsonl(stdout: string) {
   };
 }
 
+const CODEX_TERMINAL_TURN_TYPES = new Set(["turn.completed", "turn.failed"]);
+
+/**
+ * True once `codex exec --json` has emitted the event that ends the turn.
+ *
+ * Measured on this repo's run logs: `turn.completed` is the last stdout line
+ * codex writes. It is NOT a guarantee that codex exits -- it frequently lingers
+ * -- so callers use this to arm cleanup, not to assume a clean exit.
+ *
+ * The cheap substring test only gates the parse: the decision is made on a real
+ * JSON event, so an agent message quoting the string cannot trigger cleanup.
+ */
+export function codexStdoutHasTurnCompleted(stdout: string): boolean {
+  if (!stdout.includes("turn.")) return false;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("{") || !line.includes("turn.")) continue;
+    const event = parseJson(line);
+    if (!event) continue;
+    if (CODEX_TERMINAL_TURN_TYPES.has(asString(event.type, ""))) return true;
+  }
+  return false;
+}
+
 export function isCodexUnknownSessionError(stdout: string, stderr: string): boolean {
   const haystack = `${stdout}\n${stderr}`
     .split(/\r?\n/)

@@ -22,6 +22,7 @@ import {
   type IssueTreePreviewWarning,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { assertNoManualOwnershipRepairHold } from "./manual-ownership-repair-hold.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -868,40 +869,58 @@ export function issueTreeControlService(db: Db) {
       .map((member) => member.issueId))];
     if (issueIds.length === 0) return { updatedIssueIds: [], updatedIssues: [] };
 
-    const now = new Date();
-    const updated = await db
-      .update(issues)
-      .set({
-        status: "cancelled",
-        cancelledAt: now,
-        completedAt: null,
-        checkoutRunId: null,
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, companyId),
-          inArray(issues.id, issueIds),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      )
-      .returning({
-        id: issues.id,
-        status: issues.status,
-        assigneeAgentId: issues.assigneeAgentId,
-      });
+    return db.transaction(async (tx) => {
+      const claimRows = await tx
+        .select({
+          id: issues.id,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)))
+        .orderBy(issues.id)
+        .for("update");
+      await assertNoManualOwnershipRepairHold(
+        tx as unknown as Db,
+        claimRows.flatMap((issue) => [issue.checkoutRunId, issue.executionRunId]),
+        "issue_tree_cancel",
+      );
 
-    return {
-      updatedIssueIds: updated.map((issue) => issue.id),
-      updatedIssues: updated.map((issue) => ({
-        id: issue.id,
-        status: coerceIssueStatus(issue.status),
-        assigneeAgentId: issue.assigneeAgentId,
-      })),
-    };
+      const now = new Date();
+      const updated = await tx
+        .update(issues)
+        .set({
+          status: "cancelled",
+          cancelledAt: now,
+          completedAt: null,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, issueIds),
+            notInArray(issues.status, ["done", "cancelled"]),
+          ),
+        )
+        .returning({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+        });
+
+      return {
+        updatedIssueIds: updated.map((issue) => issue.id),
+        updatedIssues: updated.map((issue) => ({
+          id: issue.id,
+          status: coerceIssueStatus(issue.status),
+          assigneeAgentId: issue.assigneeAgentId,
+        })),
+      };
+    });
   }
 
   async function restoreIssueStatusesForHold(
@@ -957,6 +976,24 @@ export function issueTreeControlService(db: Db) {
     const now = new Date();
     const releasedCancelHoldIds = activeCancelHolds.map((hold) => hold.id);
     const updatedIssues = await db.transaction(async (tx) => {
+      if (restoreIssueIds.length > 0) {
+        const claimRows = await tx
+          .select({
+            id: issues.id,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, restoreIssueIds)))
+          .orderBy(issues.id)
+          .for("update");
+        await assertNoManualOwnershipRepairHold(
+          tx as unknown as Db,
+          claimRows.flatMap((issue) => [issue.checkoutRunId, issue.executionRunId]),
+          "issue_tree_restore",
+        );
+      }
+
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
       for (const [status, issueIdsForStatus] of issueIdsByStatus) {
         if (issueIdsForStatus.length === 0) continue;

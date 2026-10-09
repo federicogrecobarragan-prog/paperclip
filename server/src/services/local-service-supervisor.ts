@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { terminateWindowsProcessTree } from "@paperclipai/adapter-utils/windows-process-tree";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -348,11 +349,17 @@ export async function touchLocalServiceRegistryRecord(
 }
 
 export async function terminateLocalService(
-  record: Pick<LocalServiceRegistryRecord, "pid" | "processGroupId">,
+  record: Pick<LocalServiceRegistryRecord, "pid" | "processGroupId"> & Partial<Pick<LocalServiceRegistryRecord, "startedAt">>,
   opts?: { signal?: NodeJS.Signals; forceAfterMs?: number },
 ) {
   const signal = opts?.signal ?? "SIGTERM";
-  const targetProcessGroup = process.platform !== "win32" && record.processGroupId && record.processGroupId > 0;
+  if (process.platform === "win32") {
+    // Windows cannot signal a group; terminate the whole tree while the
+    // wrapper is still alive and Windows can still resolve ownership.
+    await terminateWindowsProcessTree(record.pid, { ownerStartedAtMs: record.startedAt ? Date.parse(record.startedAt) : undefined });
+    return;
+  }
+  const targetProcessGroup = record.processGroupId && record.processGroupId > 0;
   try {
     if (targetProcessGroup) {
       process.kill(-record.processGroupId!, signal);

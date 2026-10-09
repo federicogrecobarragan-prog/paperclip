@@ -68,6 +68,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { lockManualOwnershipRepairHoldRunIds } from "../manual-ownership-repair-hold.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -1243,6 +1244,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           processGroupId: typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
             ? processGroupId
             : null,
+          startedAt: input.run.processStartedAt?.toISOString(),
         },
         running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
       );
@@ -4395,79 +4397,99 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         sql`(${issues.checkoutRunId} is not null or ${issues.executionRunId} is not null)`,
       );
 
-    const referencedRunIds = [
-      ...new Set(
-        candidates
-          .flatMap((issue) => [issue.checkoutRunId, issue.executionRunId])
-          .filter((id): id is string => !!id),
-      ),
-    ];
-    const runRows =
-      referencedRunIds.length > 0
-        ? await db
-            .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
-            .from(heartbeatRuns)
-            .where(inArray(heartbeatRuns.id, referencedRunIds))
-        : [];
-    const runStatusById = new Map<string, string>();
-    for (const row of runRows) runStatusById.set(row.id, row.status);
-
-    const isCleanable = (runId: string | null) => {
-      if (!runId) return true;
-      const status = runStatusById.get(runId);
-      if (!status) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
-    };
-
     for (const issue of candidates) {
-      if (!isCleanable(issue.checkoutRunId) || !isCleanable(issue.executionRunId)) {
-        continue;
-      }
+      const updated = await db.transaction(async (tx) => {
+        const currentIssue = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, issue.id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!currentIssue || (!currentIssue.checkoutRunId && !currentIssue.executionRunId)) return null;
 
-      const updated = await db
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issue.id),
-            issue.checkoutRunId
-              ? eq(issues.checkoutRunId, issue.checkoutRunId)
-              : isNull(issues.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
+        const referencedRunIds = [
+          ...new Set(
+            [currentIssue.checkoutRunId, currentIssue.executionRunId]
+              .filter((id): id is string => Boolean(id)),
           ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+        ];
+        const heldRunIds = await lockManualOwnershipRepairHoldRunIds(
+          tx as unknown as Db,
+          referencedRunIds,
+        );
+        if (heldRunIds.length > 0) return null;
+
+        const runRows = referencedRunIds.length > 0
+          ? await tx
+              .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(inArray(heartbeatRuns.id, referencedRunIds))
+          : [];
+        const runStatusById = new Map(runRows.map((run) => [run.id, run.status]));
+        const isCleanable = (runId: string | null) => {
+          if (!runId) return true;
+          const status = runStatusById.get(runId);
+          if (!status) return true; // missing run row → no real claim
+          return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+        };
+        if (!isCleanable(currentIssue.checkoutRunId) || !isCleanable(currentIssue.executionRunId)) {
+          return null;
+        }
+
+        const cleared = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, currentIssue.id),
+              currentIssue.checkoutRunId
+                ? eq(issues.checkoutRunId, currentIssue.checkoutRunId)
+                : isNull(issues.checkoutRunId),
+              currentIssue.executionRunId
+                ? eq(issues.executionRunId, currentIssue.executionRunId)
+                : isNull(issues.executionRunId),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
+        if (!cleared) return null;
+
+        await logActivity(tx as unknown as Db, {
+          companyId: currentIssue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.stale_lock_cleared",
+          entityType: "issue",
+          entityId: cleared.id,
+          details: {
+            source: "recovery.sweep_stale_issue_locks",
+            clearedCheckoutRunId: currentIssue.checkoutRunId,
+            clearedExecutionRunId: currentIssue.executionRunId,
+            referencedRunStatuses: Object.fromEntries(runStatusById),
+          },
+        });
+
+        return cleared;
+      });
 
       if (!updated) continue;
 
       result.cleared += 1;
       result.issueIds.push(updated.id);
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: "issue.stale_lock_cleared",
-        entityType: "issue",
-        entityId: updated.id,
-        details: {
-          source: "recovery.sweep_stale_issue_locks",
-          clearedCheckoutRunId: issue.checkoutRunId,
-          clearedExecutionRunId: issue.executionRunId,
-          referencedRunStatuses: Object.fromEntries(runStatusById),
-        },
-      });
     }
 
     if (result.cleared > 0) {

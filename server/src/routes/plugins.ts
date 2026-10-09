@@ -63,6 +63,7 @@ import type { PluginStreamBus } from "../services/plugin-stream-bus.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import type { PluginPerformActionActorContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import { SAFE_HTTP_ERROR_LOG_MESSAGE } from "../middleware/http-error-log-safety.js";
 import {
   assertAuthenticated,
   assertBoard,
@@ -1205,29 +1206,19 @@ export function pluginRoutes(
   function attachPluginBridgeErrorContext(
     req: Request,
     res: Response,
-    err: unknown,
-    bridgeError: PluginBridgeErrorResponse,
-    metadata: Record<string, unknown>,
+    _err: unknown,
+    _bridgeError: PluginBridgeErrorResponse,
+    _metadata: Record<string, unknown>,
   ): void {
-    const rootError = err instanceof Error ? err : new Error(String(err));
     (res as any).__errorContext = {
       error: {
-        message: bridgeError.message,
-        stack: rootError.stack,
-        name: rootError.name,
-        details: {
-          ...metadata,
-          bridgeCode: bridgeError.code,
-          bridgeDetails: bridgeError.details,
-        },
+        message: SAFE_HTTP_ERROR_LOG_MESSAGE,
+        name: "RequestError",
       },
       method: req.method,
       url: req.originalUrl,
-      reqBody: req.body,
-      reqParams: req.params,
-      reqQuery: req.query,
     };
-    (res as any).err = rootError;
+    (res as any).err = new Error(SAFE_HTTP_ERROR_LOG_MESSAGE);
   }
 
   /**

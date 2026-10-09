@@ -74,9 +74,9 @@ for (const pkgPath of workspacePaths) {
 }
 
 // Sort alphabetically
-const sortedDeps = Object.fromEntries(Object.entries(allDeps).sort(([a], [b]) => a.localeCompare(b)));
+const sortedDeps = Object.fromEntries(Object.entries(allDeps).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 const sortedOptDeps = Object.fromEntries(
-  Object.entries(allOptionalDeps).sort(([a], [b]) => a.localeCompare(b)),
+  Object.entries(allOptionalDeps).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
 );
 
 // Read the CLI package metadata — prefer the dev backup if it exists

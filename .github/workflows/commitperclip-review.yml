@@ -3,9 +3,16 @@ name: commitperclip PR Review
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review (strict positive integer)
+        required: true
+        type: string
 
-# Always runs from base branch context — never executes PR code.
-# pull_request_target gives access to secrets for untrusted fork PRs.
+# pull_request_target checks out only the immutable base SHA. A manual canary
+# runs the workflow revision selected by the operator, never the reviewed PR.
+# No step checks out or executes pull-request head code.
 
 permissions:
   pull-requests: write
@@ -18,57 +25,93 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout base branch (never PR code)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout trusted workflow source (never PR code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: master
-
-      - name: Dependency Review
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
-        with:
-          base-ref: ${{ github.event.pull_request.base.sha }}
-          head-ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '20'
 
-      - name: Generate commitperclip token
-        id: token
-        run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
-          echo "::add-mask::$TOKEN"
-          echo "value=$TOKEN" >> $GITHUB_OUTPUT
+      - name: Resolve strict PR context
+        id: context
+        run: node .github/scripts/resolve-review-context.mjs
         env:
-          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+
+      - name: Dependency Review
+        id: dependency
+        if: always() && steps.context.outcome == 'success'
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          base-ref: ${{ steps.context.outputs.base_sha }}
+          head-ref: ${{ steps.context.outputs.head_sha }}
+
+      - name: Select explicit review token mode
+        id: token
+        if: always() && steps.context.outcome == 'success'
+        continue-on-error: true
+        run: node .github/scripts/get-bot-token.mjs
+        env:
+          COMMITPERCLIP_TOKEN_MODE: ${{ github.event_name == 'pull_request_target' && github.repository == 'paperclipai/paperclip' && 'app' || 'github-token' }}
+          COMMITPERCLIP_KEY: ${{ github.event_name == 'pull_request_target' && github.repository == 'paperclipai/paperclip' && secrets.COMMITPERCLIP_KEY || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: >-
+          always() &&
+          steps.context.outcome == 'success' &&
+          steps.token.outcome == 'success' &&
+          steps.context.outputs.author != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.token.outputs.value }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ steps.context.outputs.number }}
+          PR_AUTHOR: ${{ steps.context.outputs.author }}
+          PR_BRANCH: ${{ steps.context.outputs.head_ref }}
+          QUALITY_COMMENT_AUTHORS: ${{ steps.token.outputs.mode == 'github-token' && 'github-actions[bot]' || 'commitperclip[bot],commitperclip' }}
 
-      - name: Run security gates
+      - name: Run security gates and write sanitized report
+        id: security
+        if: >-
+          always() &&
+          steps.context.outcome == 'success' &&
+          steps.token.outcome == 'success'
         run: node .github/scripts/check-pr-security.mjs
         continue-on-error: true
         timeout-minutes: 3
         env:
-          GH_TOKEN: ${{ steps.token.outputs.value }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ steps.context.outputs.number }}
+          SECURITY_REPORT_MODE: ${{ steps.token.outputs.security_mode }}
+          SECURITY_REPORT_PATH: ${{ runner.temp }}/commitperclip-security-report/security-report.json
 
-      - name: Fail if quality gates failed
-        if: >-
-          github.event.pull_request.user.login != 'dependabot[bot]' &&
-          steps.quality.outcome == 'failure'
-        run: |
-          echo "One or more quality gates failed. See commitperclip comment on the PR for details."
-          exit 1
+      - name: Upload durable sanitized security report
+        id: security-artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: commitperclip-security-report-pr-${{ steps.context.outputs.number || 'unknown' }}-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/commitperclip-security-report/security-report.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Verify every review control completed
+        if: always()
+        run: node .github/scripts/verify-review-artifacts.mjs
+        env:
+          SECURITY_REPORT_PATH: ${{ runner.temp }}/commitperclip-security-report/security-report.json
+          DEPENDENCY_OUTCOME: ${{ steps.dependency.outcome }}
+          QUALITY_OUTCOME: ${{ steps.quality.outcome }}
+          QUALITY_REQUIRED: ${{ steps.context.outcome == 'success' && steps.context.outputs.author != 'dependabot[bot]' }}
+          SECURITY_OUTCOME: ${{ steps.security.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.security-artifact.outcome }}

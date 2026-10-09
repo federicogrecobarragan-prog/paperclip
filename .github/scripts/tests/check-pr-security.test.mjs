@@ -1,9 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   buildAdvisoryPayload,
+  buildSecurityReport,
   findExistingDraftAdvisory,
   postSecurityCheckRun,
+  runSecurityReview,
+  scanSecurityFlags,
   scanSecrets,
   scanCITampering,
   scanBuildScripts,
@@ -334,14 +340,116 @@ test('scanSensitivePaths: ignores removed files even on sensitive paths', () => 
   assert.equal(scanSensitivePaths(files).length, 0);
 });
 
+test('fork report: preserves all six scan families and removes matching secret values', () => {
+  const secretLure = `sk-${'x'.repeat(40)}`;
+  const files = [
+    { filename: 'src/config.ts', status: 'modified', patch: `+const token = "${secretLure}"` },
+    { filename: '.github/workflows/changed.yml', status: 'modified', patch: '+name: changed' },
+    { filename: 'scripts/release.sh', status: 'modified', patch: '+echo build' },
+    { filename: 'pnpm-lock.yaml', status: 'modified', patch: "+new-package@1.0.0:\n" },
+    { filename: 'src/network.test.ts', status: 'modified', patch: "+await fetch('https://example.test')" },
+    { filename: 'server/src/routes/agents.ts', status: 'modified', patch: '+export {}' },
+  ];
+  const flags = scanSecurityFlags(files);
+  const report = buildSecurityReport({
+    repo: 'fork-owner/paperclip',
+    prNumber: 13,
+    headSha: 'deadbeef',
+    mode: 'report',
+    flags,
+  });
+  const serialized = JSON.stringify(report);
+
+  assert.equal(report.checks.length, 6);
+  assert.ok(report.checks.every(check => check.count > 0));
+  assert.equal(report.conclusion, 'neutral');
+  assert.equal(serialized.includes(secretLure), false);
+  assert.equal(serialized.includes('const token'), false);
+});
+
+test('fork report: neutral check-run contains only sanitized counts, filenames, and patterns', async () => {
+  const calls = [];
+  const secretLure = `sk-${'y'.repeat(40)}`;
+  const flags = scanSecurityFlags([
+    { filename: `src/${secretLure}.ts`, status: 'modified', patch: `+const secret = "${secretLure}"` },
+  ]);
+  const report = buildSecurityReport({
+    repo: 'fork-owner/paperclip',
+    prNumber: 13,
+    headSha: 'deadbeef',
+    mode: 'report',
+    flags,
+  });
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, token, options });
+    return { ok: true };
+  }, 'token', 'fork-owner/paperclip', 'deadbeef', report);
+
+  const body = calls[0].options.body;
+  const payload = JSON.parse(body);
+  assert.equal(payload.conclusion, 'neutral');
+  assert.match(payload.output.summary, /secret-scan: [1-9]/);
+  assert.equal(body.includes(secretLure), false);
+});
+
+test('runSecurityReview: API errors reject instead of producing a false all-clear', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'commitperclip-api-error-'));
+  await assert.rejects(
+    runSecurityReview({
+      token: 'token',
+      repo: 'fork-owner/paperclip',
+      prNumber: 13,
+      mode: 'report',
+      reportPath: join(dir, 'report.json'),
+      fetchFromGitHub: async () => { throw new Error('simulated API failure'); },
+      fetchPullRequestFiles: async () => [],
+    }),
+    /simulated API failure/,
+  );
+});
+
+test('runSecurityReview: a missing check-run fails red and remains visible in the report', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'commitperclip-check-run-'));
+  const reportPath = join(dir, 'report.json');
+  const fakePr = {
+    title: 'Test PR',
+    base: { ref: 'main' },
+    head: { sha: 'deadbeef' },
+  };
+  const fetchFromGitHub = async (path) => {
+    if (path.includes('/check-runs')) throw new Error('simulated check-run failure');
+    if (path.includes('/pulls/13')) return fakePr;
+    if (path.includes('/contents/')) return { ok: true };
+    throw new Error(`unexpected path: ${path}`);
+  };
+
+  await assert.rejects(
+    runSecurityReview({
+      token: 'token',
+      repo: 'fork-owner/paperclip',
+      prNumber: 13,
+      mode: 'report',
+      reportPath,
+      fetchFromGitHub,
+      fetchPullRequestFiles: async () => [],
+    }),
+    /simulated check-run failure/,
+  );
+
+  const report = JSON.parse(await readFile(reportPath, 'utf8'));
+  assert.equal(report.scanCompleted, true);
+  assert.equal(report.checkRunCreated, false);
+});
+
 // ── startScriptWatchdog ──────────────────────────────────────────────────────
 
-test('startScriptWatchdog: fires exit(0) when the wall-clock budget is exceeded', async () => {
+test('startScriptWatchdog: fails closed when the wall-clock budget is exceeded', async () => {
   let exitCode = null;
   const fakeExit = (code) => { exitCode = code; };
   startScriptWatchdog(20, fakeExit);
   await new Promise((resolve) => setTimeout(resolve, 60));
-  assert.equal(exitCode, 0, 'watchdog should have exited with code 0 by now');
+  assert.equal(exitCode, 1, 'watchdog should have failed with code 1 by now');
 });
 
 test('startScriptWatchdog: cleared timer never fires', async () => {
